@@ -1,6 +1,6 @@
 # PyTap — Implementation Document
 
-> Version 0.1.0 · Last updated: July 2025
+> Version 0.1.0 · Last updated: February 2026
 
 This document captures the current implementation state of the PyTap Home Assistant custom component. It describes what has been built, how each module works, the design decisions made during development, and the test coverage in place.
 
