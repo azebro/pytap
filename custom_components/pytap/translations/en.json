@@ -1,0 +1,89 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Tigo Gateway",
+        "description": "Provide the connection details for your Tigo gateway.",
+        "data": {
+          "host": "Host",
+          "port": "Port"
+        },
+        "data_description": {
+          "host": "The hostname or IP address of your Tigo gateway.",
+          "port": "The port number (default: 502)."
+        }
+      },
+      "modules_menu": {
+        "title": "Configure Modules",
+        "description": "{modules_list}\n\n{error}",
+        "menu_options": {
+          "add_module": "Add a module",
+          "finish": "Finish setup"
+        }
+      },
+      "add_module": {
+        "title": "Add Module",
+        "description": "{modules_list}",
+        "data": {
+          "string": "String group",
+          "name": "Name",
+          "barcode": "Barcode"
+        },
+        "data_description": {
+          "string": "Optional string/group label (e.g. A, B).",
+          "name": "A friendly name for this optimizer (e.g. Panel_01).",
+          "barcode": "The Tigo optimizer barcode (e.g. A-1234567B)."
+        }
+      },
+      "finish": {
+        "title": "Finish Setup"
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the Tigo gateway. Check host and port.",
+      "invalid_auth": "Invalid authentication",
+      "invalid_barcode": "Invalid barcode format. Expected format like A-1234567B.",
+      "missing_name": "Module name is required.",
+      "missing_barcode": "Barcode is required.",
+      "duplicate_barcode": "This barcode has already been added.",
+      "no_modules": "At least one module must be added.",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "This gateway is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "PyTap Options",
+        "description": "{modules_list}",
+        "menu_options": {
+          "add_module": "Add a module",
+          "remove_module": "Remove a module",
+          "done": "Save and close"
+        }
+      },
+      "add_module": {
+        "title": "Add Module",
+        "description": "{modules_list}",
+        "data": {
+          "string": "String group",
+          "name": "Name",
+          "barcode": "Barcode"
+        },
+        "data_description": {
+          "string": "Optional string/group label (e.g. A, B).",
+          "name": "A friendly name for this optimizer (e.g. Panel_01).",
+          "barcode": "The Tigo optimizer barcode (e.g. A-1234567B)."
+        }
+      },
+      "remove_module": {
+        "title": "Remove Module",
+        "data": {
+          "remove_barcode": "Select module to remove"
+        }
+      }
+    }
+  }
+}

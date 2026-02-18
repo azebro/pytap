@@ -1,0 +1,741 @@
+# PyTap — Implementation Document
+
+> Version 0.1.0 · Last updated: July 2025
+
+This document captures the current implementation state of the PyTap Home Assistant custom component. It describes what has been built, how each module works, the design decisions made during development, and the test coverage in place.
+
+For the high-level architecture and design rationale, see [architecture.md](architecture.md).
+
+---
+
+## Table of Contents
+
+1. [Implementation Summary](#implementation-summary)
+2. [File Inventory](#file-inventory)
+3. [Module Details](#module-details)
+   - [const.py — Constants](#constpy--constants)
+   - [manifest.json — Integration Metadata](#manifestjson--integration-metadata)
+   - [config_flow.py — Configuration Flow](#config_flowpy--configuration-flow)
+   - [coordinator.py — Data Coordinator](#coordinatorpy--data-coordinator)
+   - [sensor.py — Sensor Platform](#sensorpy--sensor-platform)
+   - [\_\_init\_\_.py — Integration Lifecycle](#__init__py--integration-lifecycle)
+   - [strings.json / translations — UI Strings](#stringsjson--translations--ui-strings)
+4. [Config Flow UX Design](#config-flow-ux-design)
+5. [Data Flow](#data-flow)
+6. [Testing](#testing)
+7. [Design Decisions & Trade-offs](#design-decisions--trade-offs)
+8. [Known Deviations from Architecture](#known-deviations-from-architecture)
+9. [Development History](#development-history)
+10. [Future Work](#future-work)
+
+---
+
+## Implementation Summary
+
+PyTap is a Home Assistant custom component that passively monitors Tigo TAP solar energy systems. It connects to a Tigo gateway over TCP, parses the proprietary RS-485 bus protocol in real time using an embedded Python parser library, and exposes per-optimizer sensor entities in Home Assistant.
+
+**Key characteristics of the current implementation:**
+
+| Aspect | Implementation |
+|--------|---------------|
+| Integration type | Hub (`integration_type: "hub"`) |
+| Data delivery | Push-based streaming (`iot_class: "local_push"`) |
+| Entity creation | Deterministic from user-configured barcode list (no auto-discovery) |
+| Config flow | Menu-driven: add modules one at a time via individual form fields |
+| Threading model | Blocking parser in executor thread, bridged to async event loop |
+| External dependencies | None — parser library embedded, stdlib only |
+| Sensor types | 7 per optimizer: power, voltage in/out, current, temperature, duty cycle, RSSI |
+| Test coverage | 16 tests (9 config flow + 7 sensor platform) |
+
+---
+
+## File Inventory
+
+```
+custom_components/pytap/
+├── __init__.py          # 68 lines   — Integration lifecycle (setup, teardown, options listener)
+├── config_flow.py       # 369 lines  — Menu-driven config & options flows
+├── const.py             # 23 lines   — Domain, config keys, default values
+├── coordinator.py       # 324 lines  — Push-based DataUpdateCoordinator
+├── manifest.json        # 13 lines   — HA integration metadata
+├── sensor.py            # ~220 lines — 7 sensor entity types, CoordinatorEntity pattern
+├── strings.json         # ~100 lines — UI strings (source of truth)
+├── translations/
+│   └── en.json          # ~100 lines — English translations (mirrors strings.json)
+└── pytap/               # Embedded protocol parser library (not modified)
+    ├── api.py           # Public API: connect(), create_parser(), observe()
+    └── core/
+        ├── parser.py    # Protocol parser: bytes → events
+        ├── types.py     # Protocol constants & frame types
+        ├── events.py    # Event dataclasses (PowerReportEvent, etc.)
+        ├── state.py     # SlotClock, NodeTable, PersistentState
+        ├── source.py    # TcpSource, SerialSource
+        ├── crc.py       # CRC-16-CCITT
+        └── barcode.py   # Tigo barcode encode/decode
+
+tests/
+├── conftest.py          # 14 lines  — Auto-enable custom integrations fixture
+├── test_config_flow.py  # 343 lines — 9 config flow tests
+└── test_sensor.py       # ~210 lines — 7 sensor platform tests
+
+docs/
+├── architecture.md      # 656 lines — Architecture & design document
+└── implementation.md    # This file
+```
+
+---
+
+## Module Details
+
+### `const.py` — Constants
+
+Defines all integration-wide constants in a single location:
+
+```python
+DOMAIN = "pytap"
+DEFAULT_PORT = 502                # Tigo gateway default TCP port
+
+# Config entry data keys
+CONF_MODULES = "modules"          # List of module dicts in ConfigEntry.data
+CONF_MODULE_STRING = "string"     # Optional string/group label
+CONF_MODULE_NAME = "name"         # User-friendly optimizer name
+CONF_MODULE_BARCODE = "barcode"   # Tigo hardware barcode (stable ID)
+
+# Reconnection tuning
+RECONNECT_TIMEOUT = 60            # Seconds of silence → reconnect
+RECONNECT_DELAY = 5               # Pause between reconnection attempts
+RECONNECT_RETRIES = 0             # 0 = infinite retries
+UNAVAILABLE_TIMEOUT = 120         # Seconds without data → entity unavailable
+```
+
+These constants are imported by every other module in the integration.
+
+---
+
+### `manifest.json` — Integration Metadata
+
+```json
+{
+  "domain": "pytap",
+  "name": "PyTap",
+  "codeowners": ["@azebro"],
+  "config_flow": true,
+  "documentation": "https://github.com/azebro/pytap",
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/azebro/pytap/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}
+```
+
+Key choices:
+- **`integration_type: "hub"`** — One gateway entry manages multiple downstream optimizer devices.
+- **`iot_class: "local_push"`** — Data streams from the gateway in real time; no polling interval.
+- **`requirements: []`** — The pytap parser library is embedded, not installed from PyPI.
+
+---
+
+### `config_flow.py` — Configuration Flow
+
+**369 lines** implementing a menu-driven config flow and a full options flow.
+
+#### Config Flow Steps
+
+```
+┌─────────────┐     ┌──────────────────┐     ┌──────────────┐
+│  Step: user │────►│ Step: modules_   │────►│ Step: add_   │
+│  (host/port)│     │ menu (menu)      │◄────│ module (form)│
+└─────────────┘     │                  │     └──────────────┘
+                    │  ► Add module    │
+                    │  ► Finish setup  │──── CREATE_ENTRY
+                    └──────────────────┘
+```
+
+1. **`async_step_user`** — Collects `host` (required) and `port` (default 502). Sets a unique ID of `host:port` and aborts if already configured. Performs a non-blocking TCP connection test — warns on failure but always proceeds to the modules menu.
+
+2. **`async_step_modules_menu`** — Shows a menu with two options: "Add a module" and "Finish setup". Displays the current module list via `_modules_description()`. If the user selects "Finish" with no modules added, the menu re-displays (guard against empty config).
+
+3. **`async_step_add_module`** — Form with three fields:
+   - **String group** (`string`) — Optional grouping label (e.g., "A", "East").
+   - **Name** (`name`) — Required user-friendly label (e.g., "Panel_01").
+   - **Barcode** (`barcode`) — Required Tigo hardware barcode.
+
+   Validation:
+   - Name must be non-empty → `missing_name` error on the name field.
+   - Barcode must be non-empty → `missing_barcode` error on the barcode field.
+   - Barcode must match pattern `^[0-9A-Fa-f]-[0-9A-Fa-f]{1,7}[A-Za-z]$` → `invalid_barcode` error.
+   - Barcode must not duplicate an already-added module → `duplicate_barcode` error.
+   - On success, appends the module dict and returns to the modules menu.
+
+4. **`async_step_finish`** — Creates the config entry with `{host, port, modules: [...]}`.
+
+#### Options Flow Steps
+
+```
+┌──────────────┐     ┌──────────────┐
+│  Step: init  │────►│ add_module   │
+│  (menu)      │◄────│ (form)       │
+│              │     └──────────────┘
+│  ► Add       │     ┌──────────────┐
+│  ► Remove    │────►│ remove_module│
+│  ► Save      │◄────│ (dropdown)   │
+└──────────────┘     └──────────────┘
+       │
+       ▼ (done)
+  UPDATE_ENTRY
+```
+
+- **`async_step_init`** — Menu with "Add a module", "Remove a module", "Save and close".
+- **`async_step_add_module`** — Same form and validation as the config flow version.
+- **`async_step_remove_module`** — Dropdown (`vol.In`) built dynamically from the current module list showing `"Name (Barcode)"` labels. Selecting one removes it and returns to the menu.
+- **"Save and close"** — Updates `ConfigEntry.data` with the modified module list, triggering an integration reload.
+
+#### Helper Functions
+
+- **`validate_barcode(barcode)`** — Regex validation against `_BARCODE_PATTERN`.
+- **`validate_connection(hass, data)`** — Runs `TcpSource.connect()` in the executor. Used for advisory connection testing only.
+- **`_modules_description(modules)`** — Builds a Markdown-formatted summary of the module list for display in menu descriptions.
+
+#### Error Classes
+
+Four custom `HomeAssistantError` subclasses: `CannotConnect`, `InvalidAuth`, `InvalidModuleFormat`, `InvalidBarcodeFormat`.
+
+---
+
+### `coordinator.py` — Data Coordinator
+
+**324 lines** implementing `PyTapDataUpdateCoordinator`, the core runtime engine.
+
+#### Class: `PyTapDataUpdateCoordinator`
+
+Inherits from `DataUpdateCoordinator[dict[str, Any]]`. Despite using the coordinator pattern, this is a **push-based** integration — `_async_update_data()` simply returns the current data dict without polling.
+
+#### Initialization
+
+```python
+def __init__(self, hass, entry):
+    # Extract config
+    self._host = entry.data[CONF_HOST]
+    self._port = entry.data.get(CONF_PORT, DEFAULT_PORT)
+    self._modules = entry.data.get(CONF_MODULES, [])
+
+    # Build barcode allowlist and lookup table
+    self._configured_barcodes = {m[CONF_MODULE_BARCODE] for m in self._modules ...}
+    self._module_lookup = {m[CONF_MODULE_BARCODE]: m for m in self._modules ...}
+
+    # Barcode ↔ node_id mapping (learned at runtime)
+    self._barcode_to_node = {}
+    self._node_to_barcode = {}
+
+    # Discovery tracking for unconfigured barcodes
+    self._discovered_barcodes = set()
+
+    # Initialize data structure
+    self.data = {
+        "gateways": {},
+        "nodes": {},        # barcode → {power, voltage_in, ...}
+        "counters": {},     # parser frame counters
+        "discovered_barcodes": [],
+    }
+```
+
+#### Listener Lifecycle
+
+```
+async_start_listener()
+    └── creates background task → _async_listen()
+                                       └── executor job → _listen()
+
+async_stop_listener()
+    └── sets _stop_event
+    └── closes _source (unblocks socket.read)
+    └── cancels task
+```
+
+- **`_async_listen()`** — Async wrapper that calls `hass.async_add_executor_job(self._listen)`. This is necessary because `async_create_background_task` expects a coroutine, not a Future.
+
+- **`_listen()`** — Blocking loop running in the executor thread:
+  1. Creates a `Parser` and connects a `TcpSource`.
+  2. Reads 4096-byte chunks in a loop.
+  3. Feeds bytes to the parser, getting back a list of `Event` objects.
+  4. Calls `_process_event()` for each event.
+  5. Pushes updated data to HA via `hass.loop.call_soon_threadsafe(self.async_set_updated_data, ...)`.
+  6. Monitors for silence timeouts (`RECONNECT_TIMEOUT`).
+  7. On error/timeout, closes the source, waits `RECONNECT_DELAY` seconds, and retries.
+  8. Sleep during reconnect delay uses 0.1s increments to respond quickly to stop requests.
+
+#### Event Processing
+
+```python
+def _process_event(self, event):
+    if isinstance(event, PowerReportEvent):
+        self._handle_power_report(event)
+    elif isinstance(event, InfrastructureEvent):
+        self._handle_infrastructure(event)
+    elif isinstance(event, TopologyEvent):
+        self._handle_topology(event)
+    elif isinstance(event, StringEvent):
+        # Logged at DEBUG, not stored
+```
+
+**`_handle_power_report(event)`:**
+1. Resolves `barcode` — directly from event, or via `_node_to_barcode` mapping.
+2. If barcode is unknown, logs at DEBUG and returns.
+3. If barcode is not in `_configured_barcodes` (allowlist), logs discovery at INFO and returns.
+4. Upserts into `self.data["nodes"][barcode]` with all power fields plus `last_update` timestamp.
+
+The data dict stored per node:
+```python
+{
+    "gateway_id": int,
+    "node_id": int,
+    "barcode": str,
+    "name": str,           # from user config
+    "string": str,         # from user config
+    "voltage_in": float,
+    "voltage_out": float,
+    "current": float,
+    "power": float,
+    "temperature": float,
+    "dc_dc_duty_cycle": float,  # 0.0–1.0
+    "rssi": int,
+    "last_update": str,    # ISO 8601
+}
+```
+
+**`_handle_infrastructure(event)`:**
+- Replaces `self.data["gateways"]` with the event's gateway dict.
+- Builds the `barcode ↔ node_id` bidirectional mapping from the node table.
+- Logs newly discovered unconfigured barcodes at INFO level.
+
+**`_handle_topology(event)`:**
+- Attaches topology data to the matching node (by resolving `node_id` → barcode).
+
+#### Discovery Logging
+
+When an unconfigured barcode is seen for the first time, the coordinator logs:
+
+```
+INFO: Discovered unconfigured Tigo optimizer barcode: A-9999999Z
+      (gateway=1, node=55). Add it to your PyTap module list to start tracking.
+```
+
+The `_discovered_barcodes` set ensures each barcode is logged only once. The sorted list is also exposed in `self.data["discovered_barcodes"]` for potential diagnostics use.
+
+#### Live Reconfiguration
+
+```python
+def reload_modules(self, modules):
+    """Rebuild allowlist and lookup from updated module config."""
+    self._configured_barcodes = {m[CONF_MODULE_BARCODE] for m in modules ...}
+    self._module_lookup = {m[CONF_MODULE_BARCODE]: m for m in modules ...}
+```
+
+Called when the options flow updates the module list.
+
+---
+
+### `sensor.py` — Sensor Platform
+
+**~220 lines** implementing 7 sensor entity types using the `CoordinatorEntity` pattern.
+
+#### Sensor Descriptions
+
+```python
+SENSOR_DESCRIPTIONS = (
+    PyTapSensorEntityDescription(key="power",             value_key="power",
+        unit=UnitOfPower.WATT,            device_class=POWER),
+    PyTapSensorEntityDescription(key="voltage_in",        value_key="voltage_in",
+        unit=UnitOfElectricPotential.VOLT, device_class=VOLTAGE),
+    PyTapSensorEntityDescription(key="voltage_out",       value_key="voltage_out",
+        unit=UnitOfElectricPotential.VOLT, device_class=VOLTAGE),
+    PyTapSensorEntityDescription(key="current",           value_key="current",
+        unit=UnitOfElectricCurrent.AMPERE, device_class=CURRENT),
+    PyTapSensorEntityDescription(key="temperature",       value_key="temperature",
+        unit=UnitOfTemperature.CELSIUS,    device_class=TEMPERATURE),
+    PyTapSensorEntityDescription(key="dc_dc_duty_cycle",  value_key="dc_dc_duty_cycle",
+        unit="%",                          state_class=MEASUREMENT),
+    PyTapSensorEntityDescription(key="rssi",              value_key="rssi",
+        unit=SIGNAL_STRENGTH_DECIBELS_MILLIWATT, device_class=SIGNAL_STRENGTH),
+)
+```
+
+Each uses `SensorStateClass.MEASUREMENT` for HA history tracking.
+
+#### Entity Creation
+
+`async_setup_entry()` creates entities **deterministically** from the config:
+
+```python
+for module_config in modules:
+    barcode = module_config.get(CONF_MODULE_BARCODE, "")
+    if not barcode:
+        continue  # Skip modules without barcode
+    for description in SENSOR_DESCRIPTIONS:
+        entities.append(PyTapSensor(coordinator, description, module_config, entry))
+```
+
+Two modules × 7 descriptions = 14 sensor entities.
+
+#### `PyTapSensor` Class
+
+Inherits `CoordinatorEntity[PyTapDataUpdateCoordinator]` and `SensorEntity`.
+
+**Identity:**
+- `unique_id`: `"{DOMAIN}_{barcode}_{sensor_key}"` (e.g., `pytap_A-1234567B_power`)
+- `has_entity_name = True`
+
+**Device grouping:**
+```python
+DeviceInfo(
+    identifiers={(DOMAIN, barcode)},
+    name=f"Tigo TS4 {module_name}",
+    manufacturer="Tigo Energy",
+    model="TS4",
+    serial_number=barcode,
+)
+```
+
+All 7 sensors for the same barcode are grouped under one device.
+
+**Availability:**
+Returns `True` only when `coordinator.data["nodes"][barcode]` exists (i.e., at least one `PowerReportEvent` has been received for this optimizer).
+
+**Value updates** (`_handle_coordinator_update`):
+- Reads from `coordinator.data["nodes"][barcode][value_key]`.
+- Special case: `dc_dc_duty_cycle` is converted from 0.0–1.0 to percentage (`* 100`).
+- Calls `self.async_write_ha_state()` to push the update.
+
+**Extra state attributes:**
+- `string_group` — from user config (if set).
+- `last_update` — ISO timestamp from coordinator data.
+- `gateway_id` — the gateway this optimizer communicates through.
+
+---
+
+### `__init__.py` — Integration Lifecycle
+
+**68 lines** handling the three lifecycle phases:
+
+#### `async_setup_entry(hass, entry) → bool`
+
+1. Creates `PyTapDataUpdateCoordinator(hass, entry)`.
+2. Calls `coordinator.async_config_entry_first_refresh()` — validates initialization (does not block on data since this is push-based).
+3. Calls `coordinator.async_start_listener()` — launches the background streaming task.
+4. Stores coordinator in `hass.data[DOMAIN][entry.entry_id]`.
+5. Forwards platform setup (`Platform.SENSOR`).
+6. Registers `_async_update_options` as an update listener.
+
+#### `_async_update_options(hass, entry)`
+
+Reloads the entire integration when options change, causing a full teardown/setup cycle that picks up the modified module list.
+
+#### `async_unload_entry(hass, entry) → bool`
+
+1. Unloads platforms.
+2. Stops the coordinator's background listener.
+3. Removes the coordinator from `hass.data`.
+
+---
+
+### `strings.json` / Translations — UI Strings
+
+Defines all user-facing text for the config flow and options flow in structured JSON.
+
+**Config flow steps:**
+- `user` — "Connect to Tigo Gateway" with host/port fields and descriptions.
+- `modules_menu` — "Configure Modules" menu with `{modules_list}` and `{error}` placeholders.
+- `add_module` — "Add Module" form with string/name/barcode fields and detailed descriptions.
+- `finish` — "Finish Setup" (terminal step).
+
+**Options flow steps:**
+- `init` — "PyTap Options" menu with add/remove/done options.
+- `add_module` — Same fields as config flow.
+- `remove_module` — Dropdown with `remove_barcode` selector.
+
+**Error strings:** `cannot_connect`, `invalid_barcode`, `missing_name`, `missing_barcode`, `duplicate_barcode`, `no_modules`, `unknown`.
+
+**Abort reasons:** `already_configured`.
+
+`translations/en.json` mirrors `strings.json` exactly.
+
+---
+
+## Config Flow UX Design
+
+The config flow uses a **menu-driven approach** where users add optimizer modules one at a time through individual form fields, rather than typing comma-separated text.
+
+### Rationale
+
+The initial implementation used a comma-separated text field where users entered all modules as `STRING:NAME:BARCODE` triplets in a single textarea. This was replaced because:
+
+1. **Error-prone** — Easy to misplace colons, commas, or spaces.
+2. **No per-field validation** — Errors couldn't be attributed to a specific module or field.
+3. **Poor discoverability** — Users had to know the format without guidance.
+4. **No inline help** — Individual fields can have their own descriptions.
+
+### Current UX Flow
+
+```
+1. User enters host and port
+   → Non-blocking connection test (warns but proceeds if unreachable)
+
+2. Modules menu appears:
+   "Modules (0): No modules added yet."
+   [Add a module]  [Finish setup]
+
+3. User clicks "Add a module" → form appears:
+   String group: [___________]  (optional)
+   Name:         [___________]  (required)
+   Barcode:      [___________]  (required)
+
+4. On submit, if valid:
+   → Returns to menu with updated list
+   "Modules (1):
+     1. string=A / Panel_01 / A-1234567B"
+   [Add a module]  [Finish setup]
+
+5. User repeats step 3-4 as needed, then clicks "Finish setup"
+   → Config entry created
+```
+
+### Connection Validation
+
+The TCP connection test in step 1 is **non-blocking**: if the gateway is unreachable (common during initial setup when the gateway may not be powered on), the flow logs a warning and proceeds to the modules menu. This prevents the common frustration of being unable to complete configuration when the gateway is temporarily offline.
+
+---
+
+## Data Flow
+
+```
+Tigo Gateway (TCP port 502)
+    │
+    │  Raw bytes (RS-485 protocol frames)
+    ▼
+TcpSource.read(4096)                       [executor thread]
+    │
+    ▼
+Parser.feed(bytes) → list[Event]           [executor thread]
+    │
+    ├── PowerReportEvent
+    ├── InfrastructureEvent
+    ├── TopologyEvent
+    └── StringEvent
+    │
+    ▼
+coordinator._process_event(event)          [executor thread]
+    │
+    ├── Barcode in allowlist? YES → merge into data["nodes"][barcode]
+    │                         NO  → log discovery, discard
+    │
+    ▼
+hass.loop.call_soon_threadsafe(            [→ main event loop]
+    coordinator.async_set_updated_data, data
+)
+    │
+    ▼
+CoordinatorEntity._handle_coordinator_update()  [main event loop]
+    │
+    ├── Read from data["nodes"][barcode][value_key]
+    ├── Convert duty cycle → percentage (if applicable)
+    └── async_write_ha_state()
+    │
+    ▼
+Home Assistant frontend / automations / history
+```
+
+---
+
+## Testing
+
+### Test Configuration
+
+- **Framework:** pytest with `pytest-homeassistant-custom-component`
+- **Async mode:** `asyncio_mode = auto` (in `pytest.ini`)
+- **Fixture:** `auto_enable_custom_integrations` (in `conftest.py`) enables loading from `custom_components/`.
+
+### Config Flow Tests (9 tests)
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_step_user_shows_form` | Initial step renders host/port form with no errors |
+| `test_user_step_proceeds_to_menu` | Submitting host/port advances to modules_menu |
+| `test_user_step_proceeds_even_without_connection` | Failed TCP test still proceeds (non-blocking) |
+| `test_full_flow_add_one_module` | Complete flow: user → menu → add → menu → finish = CREATE_ENTRY |
+| `test_full_flow_add_two_modules` | Two add_module cycles produce entry with 2 modules |
+| `test_add_module_invalid_barcode` | Invalid barcode format shows error on barcode field |
+| `test_add_module_missing_name` | Empty name shows error on name field |
+| `test_add_module_duplicate_barcode` | Duplicate barcode shows error on barcode field |
+| `test_already_configured` | Second flow with same host:port aborts with "already_configured" |
+
+All tests mock `validate_connection` to avoid real TCP connections.
+
+### Sensor Platform Tests (7 tests)
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_sensor_entities_created` | 2 modules × 7 sensors = 14 entities |
+| `test_sensor_unique_ids` | IDs follow `{DOMAIN}_{barcode}_{key}` pattern |
+| `test_sensor_available_with_data` | Sensor available when node data exists |
+| `test_sensor_unavailable_without_data` | Sensor unavailable when data dict is empty |
+| `test_sensor_skips_modules_without_barcode` | Modules with empty barcode don't create entities |
+| `test_sensor_device_info` | Device identifiers, manufacturer, model, serial_number |
+| `test_sensor_descriptions_count` | Exactly 7 sensor descriptions defined |
+
+Tests use `MagicMock(spec=PyTapDataUpdateCoordinator)` to avoid real coordinator initialization.
+
+### Parser Library Tests (in `custom_components/pytap/pytap/tests/`)
+
+The embedded parser library has its own test suite:
+
+| Test File | Coverage |
+|-----------|----------|
+| `test_parser.py` | Byte-level protocol parsing with captured data |
+| `test_types.py` | Protocol type construction and field validation |
+| `test_crc.py` | CRC-16 calculation against known vectors |
+| `test_barcode.py` | Barcode encode/decode round-trips |
+| `test_api.py` | Public API function surface tests |
+
+### Running Tests
+
+```bash
+# Run all integration tests
+python3 -m pytest tests/ -vv --tb=short
+
+# Run parser library tests
+python3 -m pytest custom_components/pytap/pytap/tests/ -vv
+
+# Lint
+python3 -m ruff check custom_components/pytap/
+```
+
+---
+
+## Design Decisions & Trade-offs
+
+### 1. Menu-Driven Module Input (vs. Comma-Separated Text)
+
+**Chosen:** Individual form-per-module with a menu loop.
+
+**Trade-off:** More config flow steps for users with many modules, but significantly better UX:
+- Per-field validation with targeted error messages.
+- Optional field (string group) is clearly labeled.
+- No need to remember `STRING:NAME:BARCODE` format.
+- Matches HA's native form conventions.
+
+### 2. Non-Blocking Connection Test
+
+**Chosen:** TCP connection test warns on failure but does not block the flow.
+
+**Rationale:** Users often configure integrations when the target device is offline (e.g., solar gateway powered off at night). Blocking on connection would prevent saving a valid configuration. The integration will connect when the gateway becomes available.
+
+### 3. Push-Based Coordinator (Not Poll-Based)
+
+**Chosen:** Background streaming task with `call_soon_threadsafe` dispatch.
+
+**Trade-off:** More complex than a simple `update_interval`-based coordinator, but:
+- Sub-second latency vs. polling interval latency.
+- No redundant requests — only new data is processed.
+- Matches the bus protocol's inherent push nature.
+
+### 4. Executor Thread Bridging
+
+**Chosen:** Run blocking `_listen()` in HA's executor via `async_add_executor_job`, wrapped in an `_async_listen()` coroutine.
+
+**Rationale:** The pytap library uses blocking `socket.recv()`. Rewriting the library for asyncio would add complexity without benefit. The executor bridge is clean: the library remains portable and testable outside HA.
+
+### 5. Barcode as Primary Key (Not node_id)
+
+**Chosen:** All entity IDs, device identifiers, and data dict keys use the Tigo barcode.
+
+**Rationale:** `node_id` is a transient 16-bit integer that can change across gateway restarts. Barcodes are hardware-burned identifiers that never change, making them suitable as stable unique IDs.
+
+### 6. Deterministic Entity Creation (No Auto-Discovery)
+
+**Chosen:** Entities are created at setup from the configured module list. No dynamic entity creation from bus events.
+
+**Rationale:**
+- Prevents phantom entities from neighboring installations on the same RS-485 bus.
+- Enables dashboard/automation setup before first data arrives.
+- User-defined names instead of opaque IDs.
+- Consistent with the taptap HA add-on approach.
+
+### 7. Integration Reload on Options Change
+
+**Chosen:** `_async_update_options` triggers a full `async_reload` rather than incremental entity updates.
+
+**Trade-off:** Brief disruption during reload, but guarantees entities match the new config exactly. Adding/removing modules changes the entity set, which is simplest to handle via full reload.
+
+---
+
+## Known Deviations from Architecture
+
+The architecture document (`architecture.md`) was written during initial design and has not been fully updated for the menu-driven config flow. Notable differences:
+
+| Aspect | Architecture Doc | Actual Implementation |
+|--------|-----------------|----------------------|
+| Config flow modules step | Two-step: host/port → comma-separated modules text | Menu-driven: host/port → modules_menu → add_module loop → finish |
+| Module input format | `STRING:NAME:BARCODE` comma-separated text blob | Individual form fields per module |
+| Options flow | Described as text-based reconfiguration | Menu with add/remove/done actions |
+| Gateway device registration | Described as separate DeviceInfo | Not yet implemented (sensors have device info per optimizer only) |
+| `via_device` on nodes | Linked to gateway device | Not implemented (no gateway device yet) |
+| Unavailable timeout entity | Described as configurable via options | Constant `UNAVAILABLE_TIMEOUT = 120` (not yet in options UI) |
+| State file persistence | Mentioned in options flow design | Not implemented |
+| Diagnostics platform | Mentioned for discovered barcodes | Not implemented yet (data stored in coordinator) |
+
+---
+
+## Development History
+
+### Phase 1 — Architecture
+
+Created `docs/architecture.md` capturing the full design: system context, module responsibilities, data flow, threading model, entity model, and configuration schema.
+
+### Phase 2 — Barcode-Driven Design
+
+Updated the architecture to remove auto-discovery in favor of user-configured barcodes, inspired by the [taptap HA add-on](https://github.com/litinoveweedle/hassio-addons). Added the `STRING:NAME:BARCODE` triplet pattern.
+
+### Phase 3 — Initial Implementation
+
+Implemented all core files:
+- `const.py`, `manifest.json` — Constants and metadata.
+- `config_flow.py` — Two-step flow (host/port → comma-separated modules).
+- `coordinator.py` — Push-based streaming with barcode filtering.
+- `sensor.py` — 7 sensor types with CoordinatorEntity.
+- `__init__.py` — Lifecycle management.
+- `strings.json`, `translations/en.json` — UI strings.
+- Test suite — 14 tests passing.
+
+### Phase 4 — Connection Test Fix
+
+Discovered that the TCP connection test in step 1 blocked the flow when no gateway was available (the common case during development). Changed the connection test to non-blocking: it warns but always proceeds to the modules step.
+
+### Phase 5 — Menu-Driven Config Flow
+
+Rewrote the config flow from a comma-separated text input to a menu-driven approach:
+- Individual `add_module` form with string/name/barcode fields.
+- Menu loop for adding multiple modules.
+- Options flow with add/remove/done menu.
+- Per-field error reporting (errors shown on the specific field).
+- Dropdown-based module removal in options flow.
+- All tests rewritten for the new flow pattern (16 tests passing).
+
+### Phase 6 — Documentation
+
+Created this implementation document capturing all development work to date.
+
+---
+
+## Future Work
+
+Items identified but not yet implemented:
+
+1. **Gateway device registration** — Create a device per gateway for the `via_device` hierarchy.
+2. **Diagnostics platform** — Expose `discovered_barcodes`, parser counters, and connection state as a diagnostics download.
+3. **Configurable unavailable timeout** — Add `UNAVAILABLE_TIMEOUT` to the options flow.
+4. **Energy dashboard integration** — Ensure power sensors work with HA's energy dashboard (may need `SensorDeviceClass.ENERGY` with Riemann sum).
+5. **Binary sensors** — Node connectivity and gateway online status.
+6. **Persistent state** — Save infrastructure state to disk to survive HA restarts without waiting for gateway enumeration.
+7. **HACS distribution** — Package with `hacs.json` for one-click installation.
+8. **Update architecture.md** — Align the architecture document with the current menu-driven config flow.

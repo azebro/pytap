@@ -1,0 +1,33 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Run Home Assistant",
+      "type": "shell",
+      "command": "python3 -m homeassistant --config ${workspaceFolder}/config --debug",
+      "problemMatcher": [],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      }
+    },
+    {
+      "label": "Run Tests",
+      "type": "shell",
+      "command": "python3 -m pytest tests/ -vv --tb=short",
+      "problemMatcher": [],
+      "group": "test"
+    },
+    {
+      "label": "Lint (Ruff)",
+      "type": "shell",
+      "command": "python3 -m ruff check custom_components/pytap/",
+      "problemMatcher": [],
+      "group": "test"
+    }
+  ]
+}
