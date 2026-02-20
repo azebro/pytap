@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
@@ -28,7 +31,6 @@ from .const import (
     RECONNECT_DELAY,
     RECONNECT_RETRIES,
     RECONNECT_TIMEOUT,
-    UNAVAILABLE_TIMEOUT,
 )
 from .pytap.core.events import (
     Event,
@@ -39,6 +41,9 @@ from .pytap.core.events import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+STORE_VERSION = 1
+SAVE_DELAY_SECONDS = 10
 
 
 class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -83,10 +88,23 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Listener task handle
         self._listener_task: asyncio.Task | None = None
-        self._stop_event = asyncio.Event()
+        self._stop_event = threading.Event()
 
-        # Source handle for cancellation
+        # Source handle for cancellation — accessed from both threads
         self._source: Any = None
+        self._source_lock = threading.Lock()
+
+        # --- Persistence ---
+        # Parser-level state file (gateway identities, versions, node tables)
+        self._state_file_path: Path = Path(
+            hass.config.path(f".storage/pytap_{entry.entry_id}_parser_state.json")
+        )
+        # Coordinator-level HA Store (barcode mappings, discovered barcodes)
+        self._store: Store = Store(
+            hass, STORE_VERSION, f"pytap_{entry.entry_id}_coordinator"
+        )
+        self._unsaved_changes: bool = False
+        self._save_task: asyncio.TimerHandle | None = None
 
         # Initialize data structure
         self.data: dict[str, Any] = {
@@ -102,6 +120,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_start_listener(self) -> None:
         """Start the background listener task."""
+        await self._async_load_coordinator_state()
         self._stop_event.clear()
         self._listener_task = self.config_entry.async_create_background_task(
             self.hass,
@@ -116,17 +135,25 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_stop_listener(self) -> None:
         """Stop the background listener task."""
         self._stop_event.set()
-        # Close source to unblock the read() call
-        if self._source is not None:
-            try:
-                self._source.close()
-            except Exception:
-                pass
+        # Flush any pending state save
+        if self._save_task is not None:
+            self._save_task.cancel()
+            self._save_task = None
+        if self._unsaved_changes:
+            await self._async_save_coordinator_state()
+        # Close source to unblock the read()/connect() call in the executor
+        with self._source_lock:
+            if self._source is not None:
+                try:
+                    self._source.close()
+                except Exception:
+                    pass
         if self._listener_task is not None:
             self._listener_task.cancel()
             try:
-                await self._listener_task
-            except (asyncio.CancelledError, Exception):
+                async with asyncio.timeout(5):
+                    await self._listener_task
+            except (asyncio.CancelledError, TimeoutError, Exception):
                 pass
             self._listener_task = None
 
@@ -141,12 +168,19 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         retries = 0
 
         while not self._stop_event.is_set():
-            parser = create_parser()
-            self._source = None
+            parser = create_parser(state_file=str(self._state_file_path))
+            self._init_mappings_from_parser(parser)
+            with self._source_lock:
+                self._source = None
 
             try:
                 source_config = {"tcp": self._host, "port": self._port}
-                self._source = connect(source_config)
+                source = connect(source_config)
+                with self._source_lock:
+                    if self._stop_event.is_set():
+                        source.close()
+                        return
+                    self._source = source
                 _LOGGER.info(
                     "Connected to Tigo gateway at %s:%s", self._host, self._port
                 )
@@ -159,13 +193,14 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         last_data_time = time.monotonic()
                         events = parser.feed(data)
                         for event in events:
-                            self._process_event(event)
-                        # Update counters
-                        self.data["counters"] = parser.counters
-                        # Push updated data to HA event loop
-                        self.hass.loop.call_soon_threadsafe(
-                            self.async_set_updated_data, dict(self.data)
-                        )
+                            data_changed = self._process_event(event)
+                            if data_changed:
+                                # Push each event individually to HA
+                                self.data["counters"] = parser.counters
+                                self.hass.loop.call_soon_threadsafe(
+                                    self.async_set_updated_data,
+                                    dict(self.data),
+                                )
                     elif (
                         RECONNECT_TIMEOUT > 0
                         and (time.monotonic() - last_data_time) > RECONNECT_TIMEOUT
@@ -177,14 +212,17 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         break
 
             except Exception as err:
+                if self._stop_event.is_set():
+                    return
                 _LOGGER.error("Connection error: %s", err)
             finally:
-                if self._source is not None:
-                    try:
-                        self._source.close()
-                    except Exception:
-                        pass
-                    self._source = None
+                with self._source_lock:
+                    if self._source is not None:
+                        try:
+                            self._source.close()
+                        except Exception:
+                            pass
+                        self._source = None
 
             if self._stop_event.is_set():
                 break
@@ -206,15 +244,41 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     return
                 time.sleep(0.1)
 
-    def _process_event(self, event: Event) -> None:
-        """Process a parsed event, filtering by configured barcodes."""
+    def _init_mappings_from_parser(self, parser: Any) -> None:
+        """Pre-populate barcode/node mappings from the parser's persistent state.
+
+        Called after parser creation to restore mappings learned in previous
+        sessions (loaded from the parser's state file).
+        """
+        try:
+            infra = parser.infrastructure
+            restored = 0
+            for node_id, node_info in infra.get("nodes", {}).items():
+                barcode = node_info.get("barcode")
+                if barcode:
+                    self._barcode_to_node[barcode] = node_id
+                    self._node_to_barcode[node_id] = barcode
+                    restored += 1
+            if restored:
+                _LOGGER.info(
+                    "Restored %d barcode↔node mappings from parser state",
+                    restored,
+                )
+        except Exception:
+            _LOGGER.debug("Could not read parser infrastructure for pre-population")
+
+    def _process_event(self, event: Event) -> bool:
+        """Process a parsed event, filtering by configured barcodes.
+
+        Returns True if coordinator data was modified (triggers HA update).
+        """
         if isinstance(event, PowerReportEvent):
-            self._handle_power_report(event)
-        elif isinstance(event, InfrastructureEvent):
-            self._handle_infrastructure(event)
-        elif isinstance(event, TopologyEvent):
-            self._handle_topology(event)
-        elif isinstance(event, StringEvent):
+            return self._handle_power_report(event)
+        if isinstance(event, InfrastructureEvent):
+            return self._handle_infrastructure(event)
+        if isinstance(event, TopologyEvent):
+            return self._handle_topology(event)
+        if isinstance(event, StringEvent):
             _LOGGER.debug(
                 "String event (gw=%d, node=%d, %s): %s",
                 event.gateway_id,
@@ -222,9 +286,10 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 event.direction,
                 event.content,
             )
+        return False
 
-    def _handle_power_report(self, event: PowerReportEvent) -> None:
-        """Handle a power report event."""
+    def _handle_power_report(self, event: PowerReportEvent) -> bool:
+        """Handle a power report event. Returns True if data was modified."""
         barcode = event.barcode
 
         # Try to resolve barcode from node_id if not directly available
@@ -237,13 +302,14 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 event.node_id,
                 event.gateway_id,
             )
-            return
+            return False
 
         # Check if this barcode is in our configured allowlist
         if barcode not in self._configured_barcodes:
             if barcode not in self._discovered_barcodes:
                 self._discovered_barcodes.add(barcode)
                 self.data["discovered_barcodes"] = sorted(self._discovered_barcodes)
+                self._schedule_save()
                 _LOGGER.info(
                     "Discovered unconfigured Tigo optimizer barcode: %s "
                     "(gateway=%d, node=%d). Add it to your PyTap module "
@@ -252,7 +318,8 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     event.gateway_id,
                     event.node_id,
                 )
-            return
+                return True
+            return False
 
         # Get module metadata
         module_meta = self._module_lookup.get(barcode, {})
@@ -265,23 +332,34 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "string": module_meta.get(CONF_MODULE_STRING, ""),
             "voltage_in": event.voltage_in,
             "voltage_out": event.voltage_out,
-            "current": event.current,
+            "current_in": event.current_in,
+            "current_out": event.current_out,
             "power": event.power,
             "temperature": event.temperature,
             "dc_dc_duty_cycle": event.dc_dc_duty_cycle,
             "rssi": event.rssi,
             "last_update": datetime.now().isoformat(),
         }
+        return True
 
-    def _handle_infrastructure(self, event: InfrastructureEvent) -> None:
-        """Handle an infrastructure event — update gateway/node mappings."""
+    def _handle_infrastructure(self, event: InfrastructureEvent) -> bool:
+        """Handle an infrastructure event — update gateway/node mappings.
+
+        Returns True (always modifies gateway data).
+        """
         # Update gateways
         self.data["gateways"] = event.gateways
 
         # Update barcode ↔ node_id mapping from node table
+        mappings_changed = False
         for node_id, node_info in event.nodes.items():
             barcode = node_info.get("barcode")
             if barcode:
+                if (
+                    self._barcode_to_node.get(barcode) != node_id
+                    or self._node_to_barcode.get(node_id) != barcode
+                ):
+                    mappings_changed = True
                 self._barcode_to_node[barcode] = node_id
                 self._node_to_barcode[node_id] = barcode
 
@@ -300,13 +378,88 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             node_id,
                         )
 
-    def _handle_topology(self, event: TopologyEvent) -> None:
-        """Handle a topology event for matched nodes."""
+        if mappings_changed:
+            self._schedule_save()
+
+        return True
+
+    def _handle_topology(self, event: TopologyEvent) -> bool:
+        """Handle a topology event for matched nodes.
+
+        Returns True if node data was updated.
+        """
         barcode = self._node_to_barcode.get(event.node_id)
         if barcode and barcode in self._configured_barcodes:
             node_data = self.data["nodes"].get(barcode)
             if node_data:
                 node_data["topology"] = event.to_dict()
+                return True
+        return False
+
+    # -------------------------------------------------------------------
+    #  Persistence helpers
+    # -------------------------------------------------------------------
+
+    async def _async_load_coordinator_state(self) -> None:
+        """Load coordinator-level state (barcode mappings, discovered barcodes) from HA Store."""
+        try:
+            stored = await self._store.async_load()
+        except Exception:
+            _LOGGER.debug("No stored coordinator state found")
+            stored = None
+
+        if stored is None:
+            return
+
+        # Restore barcode ↔ node_id mappings
+        barcode_to_node = stored.get("barcode_to_node", {})
+        for barcode, node_id in barcode_to_node.items():
+            self._barcode_to_node[barcode] = int(node_id)
+            self._node_to_barcode[int(node_id)] = barcode
+
+        # Restore discovered barcodes
+        discovered = stored.get("discovered_barcodes", [])
+        self._discovered_barcodes = set(discovered)
+        self.data["discovered_barcodes"] = sorted(self._discovered_barcodes)
+
+        _LOGGER.info(
+            "Restored coordinator state: %d barcode mappings, %d discovered barcodes",
+            len(barcode_to_node),
+            len(discovered),
+        )
+
+    async def _async_save_coordinator_state(self) -> None:
+        """Save coordinator-level state to HA Store."""
+        self._unsaved_changes = False
+        data = {
+            "barcode_to_node": {
+                barcode: node_id for barcode, node_id in self._barcode_to_node.items()
+            },
+            "discovered_barcodes": sorted(self._discovered_barcodes),
+        }
+        try:
+            await self._store.async_save(data)
+        except Exception:
+            _LOGGER.warning("Failed to save coordinator state")
+
+    def _schedule_save(self) -> None:
+        """Schedule a debounced save of coordinator state.
+
+        Safe to call from the executor thread — dispatches to the HA event loop.
+        """
+        self._unsaved_changes = True
+
+        def _do_schedule() -> None:
+            if self._save_task is not None:
+                self._save_task.cancel()
+            self._save_task = self.hass.loop.call_later(
+                SAVE_DELAY_SECONDS,
+                lambda: self.hass.async_create_task(
+                    self._async_save_coordinator_state()
+                ),
+            )
+
+        self.hass.loop.call_soon_threadsafe(_do_schedule)
 
     def reload_modules(self, modules: list[dict[str, str]]) -> None:
         """Reload the module configuration (called from options flow)."""

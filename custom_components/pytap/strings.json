@@ -53,6 +53,34 @@
       "already_configured": "This gateway is already configured."
     }
   },
+  "entity": {
+    "sensor": {
+      "power": {
+        "name": "Power"
+      },
+      "voltage_in": {
+        "name": "Voltage in"
+      },
+      "voltage_out": {
+        "name": "Voltage out"
+      },
+      "current_in": {
+        "name": "Current in"
+      },
+      "current_out": {
+        "name": "Current out"
+      },
+      "temperature": {
+        "name": "Temperature"
+      },
+      "dc_dc_duty_cycle": {
+        "name": "DC-DC duty cycle"
+      },
+      "rssi": {
+        "name": "RSSI"
+      }
+    }
+  },
   "options": {
     "step": {
       "init": {

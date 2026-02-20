@@ -30,16 +30,21 @@ class TcpSource:
         self._socket.connect((self._host, self._port))
 
     def read(self, size: int = 1024) -> bytes:
-        """Read bytes from the socket."""
+        """Read bytes from the socket.
+
+        Returns empty bytes on timeout. Raises OSError if the socket has been
+        closed (e.g. from another thread to signal shutdown).
+        """
         if self._socket is None:
-            return b''
+            raise OSError("Socket is closed")
         try:
             data = self._socket.recv(size)
+            if not data:
+                # Peer closed connection
+                raise ConnectionResetError("Connection closed by peer")
             return data
         except socket.timeout:
-            return b''
-        except (ConnectionResetError, BrokenPipeError, OSError):
-            return b''
+            return b""
 
     def close(self):
         """Close the socket connection."""

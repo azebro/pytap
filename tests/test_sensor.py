@@ -42,7 +42,8 @@ MOCK_NODE_DATA = {
         "string": "A",
         "voltage_in": 35.2,
         "voltage_out": 34.8,
-        "current": 8.5,
+        "current_in": 8.5,
+        "current_out": 8.5977,
         "power": 299.2,
         "temperature": 42.0,
         "dc_dc_duty_cycle": 0.95,
@@ -96,8 +97,8 @@ async def test_sensor_entities_created(hass: HomeAssistant) -> None:
 
     await async_setup_entry(hass, entry, capture_entities)
 
-    # 2 modules × 7 sensors = 14 entities
-    assert len(entities) == 14
+    # 2 modules × 8 sensors = 16 entities
+    assert len(entities) == 16
 
 
 async def test_sensor_unique_ids(hass: HomeAssistant) -> None:
@@ -180,8 +181,8 @@ async def test_sensor_skips_modules_without_barcode(hass: HomeAssistant) -> None
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
-    # Only the 2 valid modules should create entities: 2 × 7 = 14
-    assert len(entities) == 14
+    # Only the 2 valid modules should create entities: 2 × 8 = 16
+    assert len(entities) == 16
 
 
 async def test_sensor_device_info(hass: HomeAssistant) -> None:
@@ -207,4 +208,4 @@ async def test_sensor_device_info(hass: HomeAssistant) -> None:
 
 async def test_sensor_descriptions_count() -> None:
     """Test that we have the expected number of sensor descriptions."""
-    assert len(SENSOR_DESCRIPTIONS) == 7
+    assert len(SENSOR_DESCRIPTIONS) == 8

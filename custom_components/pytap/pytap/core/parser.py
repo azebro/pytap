@@ -15,14 +15,24 @@ from typing import Optional
 from .barcode import barcode_from_address
 from .crc import crc
 from .events import (
-    Event, PowerReportEvent, InfrastructureEvent,
-    TopologyEvent, StringEvent,
+    Event,
+    PowerReportEvent,
+    InfrastructureEvent,
+    TopologyEvent,
+    StringEvent,
 )
 from .state import SlotClock, NodeTableBuilder, PersistentState
 from .types import (
-    Address, FrameType, Frame, GatewayID,
-    NodeAddress, LongAddress, SlotCounter,
-    PacketType, ReceivedPacketHeader, PowerReport,
+    Address,
+    FrameType,
+    Frame,
+    GatewayID,
+    NodeAddress,
+    LongAddress,
+    SlotCounter,
+    PacketType,
+    ReceivedPacketHeader,
+    PowerReport,
     iter_received_packets,
 )
 
@@ -32,6 +42,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 #  Frame State Machine
 # ---------------------------------------------------------------------------
+
 
 class _FrameState(Enum):
     IDLE = auto()
@@ -61,6 +72,7 @@ _UNESCAPE_MAP: dict[int, int] = {
 #  Counters
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class _Counters:
     frames_received: int = 0
@@ -74,6 +86,7 @@ class _Counters:
 #  Enumeration State
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class _EnumerationState:
     enumeration_gateway_id: int
@@ -84,6 +97,7 @@ class _EnumerationState:
 # ---------------------------------------------------------------------------
 #  Helper Functions
 # ---------------------------------------------------------------------------
+
 
 def _interpret_packet_number_lo(new_lo: int, old: int) -> int:
     """Expand a 1-byte packet number using the previous full number."""
@@ -96,6 +110,7 @@ def _interpret_packet_number_lo(new_lo: int, old: int) -> int:
 # ---------------------------------------------------------------------------
 #  Parser
 # ---------------------------------------------------------------------------
+
 
 class Parser:
     """Core protocol parser.
@@ -160,20 +175,22 @@ class Parser:
     def infrastructure(self) -> dict:
         """Current infrastructure snapshot."""
         gateways = {}
-        for gw in set(self._persistent_state.gateway_identities) | set(self._persistent_state.gateway_versions):
+        for gw in set(self._persistent_state.gateway_identities) | set(
+            self._persistent_state.gateway_versions
+        ):
             addr = self._persistent_state.gateway_identities.get(gw)
             gateways[gw] = {
-                'address': str(addr) if addr else None,
-                'version': self._persistent_state.gateway_versions.get(gw),
+                "address": str(addr) if addr else None,
+                "version": self._persistent_state.gateway_versions.get(gw),
             }
         nodes = {}
         for gw_table in self._persistent_state.gateway_node_tables.values():
             for nid, addr in gw_table.items():
                 nodes[nid] = {
-                    'address': str(addr),
-                    'barcode': barcode_from_address(addr.data),
+                    "address": str(addr),
+                    "barcode": barcode_from_address(addr.data),
                 }
-        return {'gateways': gateways, 'nodes': nodes}
+        return {"gateways": gateways, "nodes": nodes}
 
     @property
     def counters(self) -> dict:
@@ -265,7 +282,10 @@ class Parser:
         # Track noise and giant transitions
         if next_state == _FrameState.NOISE and old_state != _FrameState.NOISE:
             self._counters.noise_bytes += 1
-        if next_state == _FrameState.GIANT and old_state not in (_FrameState.GIANT, _FrameState.GIANT_ESCAPE):
+        if next_state == _FrameState.GIANT and old_state not in (
+            _FrameState.GIANT,
+            _FrameState.GIANT_ESCAPE,
+        ):
             self._buffer.clear()
             self._counters.giants += 1
 
@@ -279,13 +299,13 @@ class Parser:
             return None
 
         body = bytes(buffer[:-2])
-        expected_crc = int.from_bytes(buffer[-2:], 'little')
+        expected_crc = int.from_bytes(buffer[-2:], "little")
         if crc(body) != expected_crc:
             self._counters.crc_errors += 1
             return None
 
         address = Address.from_bytes(bytes(buffer[0:2]))
-        frame_type = int.from_bytes(bytes(buffer[2:4]), 'big')
+        frame_type = int.from_bytes(bytes(buffer[2:4]), "big")
         payload = bytes(buffer[4:-2])
         return Frame(address, frame_type, payload)
 
@@ -334,7 +354,7 @@ class Parser:
         if len(payload) < 5:
             return []
         gw_id = frame.address.gateway_id.value
-        packet_number = int.from_bytes(payload[2:4], 'big')
+        packet_number = int.from_bytes(payload[2:4], "big")
         self._rx_packet_numbers[gw_id] = packet_number
         self._captured_slot_times[gw_id] = datetime.now()
         return []
@@ -353,7 +373,7 @@ class Parser:
             return []
 
         # Parse variable-length receive response header
-        status_type = int.from_bytes(payload[0:2], 'big')
+        status_type = int.from_bytes(payload[0:2], "big")
         if (status_type & 0x00E0) != 0x00E0:
             return []
 
@@ -374,7 +394,7 @@ class Parser:
             # Full packet number (2 bytes)
             if offset + 2 > len(payload):
                 return []
-            packet_number = int.from_bytes(payload[offset:offset + 2], 'big')
+            packet_number = int.from_bytes(payload[offset : offset + 2], "big")
             offset += 2
         else:
             # Abbreviated packet number (1 byte)
@@ -386,7 +406,7 @@ class Parser:
 
         if offset + 2 > len(payload):
             return []
-        slot_counter = SlotCounter.from_bytes(payload[offset:offset + 2])
+        slot_counter = SlotCounter.from_bytes(payload[offset : offset + 2])
         offset += 2
 
         # Update stored packet number
@@ -453,13 +473,23 @@ class Parser:
         )
 
     def _handle_command_pair(
-        self, gw_id: int, req_type: int, req_payload: bytes,
-        resp_type: int, resp_payload: bytes,
+        self,
+        gw_id: int,
+        req_type: int,
+        req_payload: bytes,
+        resp_type: int,
+        resp_payload: bytes,
     ) -> list[Event]:
         """Handle a correlated command request/response pair."""
-        if req_type == PacketType.NODE_TABLE_REQUEST and resp_type == PacketType.NODE_TABLE_RESPONSE:
+        if (
+            req_type == PacketType.NODE_TABLE_REQUEST
+            and resp_type == PacketType.NODE_TABLE_RESPONSE
+        ):
             return self._handle_node_table_command(gw_id, req_payload, resp_payload)
-        elif req_type == PacketType.STRING_REQUEST and resp_type == PacketType.STRING_RESPONSE:
+        elif (
+            req_type == PacketType.STRING_REQUEST
+            and resp_type == PacketType.STRING_RESPONSE
+        ):
             return self._handle_string_command(gw_id, req_payload, resp_payload)
         return []
 
@@ -522,7 +552,7 @@ class Parser:
         if not frame.address.is_from:
             return []
         try:
-            version = frame.payload.decode('utf-8', errors='replace')
+            version = frame.payload.decode("utf-8", errors="replace")
         except Exception:
             return []
         if not version:
@@ -556,7 +586,10 @@ class Parser:
     # -------------------------------------------------------------------
 
     def _parse_pv_packet(
-        self, gw_id: int, header: ReceivedPacketHeader, data: bytes,
+        self,
+        gw_id: int,
+        header: ReceivedPacketHeader,
+        data: bytes,
     ) -> list[Event]:
         """Parse a PV application packet and generate events."""
         node_addr = header.node_address
@@ -577,7 +610,10 @@ class Parser:
         return []
 
     def _handle_power_report(
-        self, gw_id: int, node_id: int, data: bytes,
+        self,
+        gw_id: int,
+        node_id: int,
+        data: bytes,
     ) -> list[Event]:
         """Parse a power report and generate PowerReportEvent."""
         try:
@@ -614,7 +650,7 @@ class Parser:
             barcode=barcode,
             voltage_in=report.voltage_in,
             voltage_out=report.voltage_out,
-            current=report.current,
+            current_in=report.current_in,
             temperature=report.temperature,
             dc_dc_duty_cycle=report.duty_cycle,
             rssi=report.rssi,
@@ -623,27 +659,44 @@ class Parser:
         return [event]
 
     def _handle_string_response(
-        self, gw_id: int, node_id: int, data: bytes,
+        self,
+        gw_id: int,
+        node_id: int,
+        data: bytes,
     ) -> list[Event]:
         """Parse string response from a PV node."""
-        content = data.decode('utf-8', errors='replace')
-        return [StringEvent(
-            gateway_id=gw_id, node_id=node_id,
-            direction='response', content=content,
-            timestamp=datetime.now(),
-        )]
+        content = data.decode("utf-8", errors="replace")
+        return [
+            StringEvent(
+                gateway_id=gw_id,
+                node_id=node_id,
+                direction="response",
+                content=content,
+                timestamp=datetime.now(),
+            )
+        ]
 
     def _handle_topology_report(
-        self, gw_id: int, node_id: int, data: bytes,
+        self,
+        gw_id: int,
+        node_id: int,
+        data: bytes,
     ) -> list[Event]:
         """Generate TopologyEvent from raw topology report."""
-        return [TopologyEvent(
-            gateway_id=gw_id, node_id=node_id, data=data,
-            timestamp=datetime.now(),
-        )]
+        return [
+            TopologyEvent(
+                gateway_id=gw_id,
+                node_id=node_id,
+                data=data,
+                timestamp=datetime.now(),
+            )
+        ]
 
     def _handle_node_table_command(
-        self, gw_id: int, req_payload: bytes, resp_payload: bytes,
+        self,
+        gw_id: int,
+        req_payload: bytes,
+        resp_payload: bytes,
     ) -> list[Event]:
         """Handle NODE_TABLE command pair: accumulate pages."""
         if len(req_payload) < 2:
@@ -658,13 +711,11 @@ class Parser:
         entries = []
         for i in range(entries_count):
             off = i * 10
-            node_addr = NodeAddress.from_bytes(entries_data[off:off + 2])
-            long_addr = LongAddress(entries_data[off + 2:off + 10])
+            node_addr = NodeAddress.from_bytes(entries_data[off : off + 2])
+            long_addr = LongAddress(entries_data[off + 2 : off + 10])
             entries.append((node_addr, long_addr))
 
-        builder = self._node_table_builders.setdefault(
-            gw_id, NodeTableBuilder()
-        )
+        builder = self._node_table_builders.setdefault(gw_id, NodeTableBuilder())
         result = builder.push(start_address, entries)
         if result is not None:
             self._persistent_state.gateway_node_tables[gw_id] = result
@@ -673,18 +724,25 @@ class Parser:
         return []
 
     def _handle_string_command(
-        self, gw_id: int, req_payload: bytes, resp_payload: bytes,
+        self,
+        gw_id: int,
+        req_payload: bytes,
+        resp_payload: bytes,
     ) -> list[Event]:
         """Handle STRING command pair: emit StringEvent for request."""
         if len(req_payload) < 2:
             return []
         node_addr = NodeAddress.from_bytes(req_payload[0:2])
-        request_str = req_payload[2:].decode('utf-8', errors='replace')
-        return [StringEvent(
-            gateway_id=gw_id, node_id=node_addr.value,
-            direction='request', content=request_str,
-            timestamp=datetime.now(),
-        )]
+        request_str = req_payload[2:].decode("utf-8", errors="replace")
+        return [
+            StringEvent(
+                gateway_id=gw_id,
+                node_id=node_addr.value,
+                direction="request",
+                content=request_str,
+                timestamp=datetime.now(),
+            )
+        ]
 
     # -------------------------------------------------------------------
     #  Infrastructure Event Helper
@@ -695,26 +753,30 @@ class Parser:
         gateways: dict = {}
         for gw_id, addr in self._persistent_state.gateway_identities.items():
             gateways[gw_id] = {
-                'address': str(addr),
-                'version': self._persistent_state.gateway_versions.get(gw_id),
+                "address": str(addr),
+                "version": self._persistent_state.gateway_versions.get(gw_id),
             }
         for gw_id, ver in self._persistent_state.gateway_versions.items():
             if gw_id not in gateways:
-                gateways[gw_id] = {'address': None, 'version': ver}
+                gateways[gw_id] = {"address": None, "version": ver}
 
         nodes: dict = {}
         for gw_id_key, table in self._persistent_state.gateway_node_tables.items():
             for node_id_val, long_addr in table.items():
                 barcode = barcode_from_address(long_addr.data)
                 nodes[node_id_val] = {
-                    'address': str(long_addr),
-                    'barcode': barcode,
+                    "address": str(long_addr),
+                    "barcode": barcode,
                 }
 
         self._save_persistent_state()
-        return [InfrastructureEvent(
-            gateways=gateways, nodes=nodes, timestamp=datetime.now(),
-        )]
+        return [
+            InfrastructureEvent(
+                gateways=gateways,
+                nodes=nodes,
+                timestamp=datetime.now(),
+            )
+        ]
 
     def _save_persistent_state(self):
         """Save persistent state if a state file is configured."""

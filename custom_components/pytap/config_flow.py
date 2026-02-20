@@ -33,7 +33,6 @@ from .const import (
     CONF_MODULES,
     DEFAULT_PORT,
     DOMAIN,
-    UNAVAILABLE_TIMEOUT,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -104,7 +103,7 @@ def _modules_description(modules: list[dict[str, str]]) -> str:
 class PyTapConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for PyTap."""
 
-    VERSION = 1
+    VERSION = 2
 
     def __init__(self) -> None:
         """Initialize the config flow."""

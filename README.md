@@ -133,6 +133,9 @@ pytap/
 │   ├── strings.json             # UI strings
 │   ├── translations/en.json     # English translations
 │   └── pytap/                   # Embedded protocol parser library
+├── deploy/                      # Deployment tooling
+│   ├── deploy.sh                # Deploy script (SSH-based)
+│   └── .deploy.env.example      # Example credentials config
 ├── tests/                       # Integration tests
 ├── docs/
 │   ├── architecture.md          # Architecture & design document
@@ -163,6 +166,37 @@ python3 -m pytest custom_components/pytap/pytap/tests/ -vv
 ```bash
 python3 -m ruff check custom_components/pytap/
 ```
+
+### Deploying to a Home Assistant Instance
+
+A deployment script is provided in `deploy/` to push the component to a remote HA OS installation via SSH.
+
+**Setup:**
+
+```bash
+# Copy the example config and fill in your credentials
+cp deploy/.deploy.env.example deploy/.deploy.env
+# Edit deploy/.deploy.env with your host, username, and password
+```
+
+> **Note:** `deploy/.deploy.env` is gitignored — credentials are never committed.
+
+**Deploy:**
+
+```bash
+# Using the config file
+./deploy/deploy.sh
+
+# Or pass credentials directly
+./deploy/deploy.sh --host 192.168.1.184 --user adam --password 'yourpass'
+
+# Deploy without restarting HA
+./deploy/deploy.sh --no-restart
+```
+
+The script uploads the component via tar-over-SSH (compatible with HA OS SSH add-on), verifies the deployment, and optionally restarts Home Assistant Core.
+
+Run `./deploy/deploy.sh --help` for all options.
 
 ### Documentation
 

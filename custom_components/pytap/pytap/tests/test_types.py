@@ -3,15 +3,27 @@
 import struct
 import pytest
 from pytap.core.types import (
-    GatewayID, Address, FrameType, Frame,
-    NodeID, NodeAddress, LongAddress, RSSI, SlotCounter,
-    PacketType, ReceivedPacketHeader, U12Pair, PowerReport,
-    SLOTS_PER_EPOCH, MAX_SLOT_NUMBER,
+    GatewayID,
+    Address,
+    FrameType,
+    Frame,
+    NodeID,
+    NodeAddress,
+    LongAddress,
+    RSSI,
+    SlotCounter,
+    PacketType,
+    ReceivedPacketHeader,
+    U12Pair,
+    PowerReport,
+    SLOTS_PER_EPOCH,
+    MAX_SLOT_NUMBER,
     iter_received_packets,
 )
 
 
 # ---- GatewayID ----
+
 
 def test_gateway_id_valid():
     assert GatewayID(0).value == 0
@@ -27,9 +39,10 @@ def test_gateway_id_invalid():
 
 # ---- Address ----
 
+
 def test_address_from_bytes_controller_to_gateway():
     """Bit 15 = 0 → is_from = False (controller→gateway)."""
-    data = struct.pack('>H', 0x1201)  # 0001 0010 0000 0001
+    data = struct.pack(">H", 0x1201)  # 0001 0010 0000 0001
     addr = Address.from_bytes(data)
     assert addr.is_from is False
     assert addr.gateway_id.value == 0x1201
@@ -37,13 +50,14 @@ def test_address_from_bytes_controller_to_gateway():
 
 def test_address_from_bytes_gateway_to_controller():
     """Bit 15 = 1 → is_from = True (gateway→controller)."""
-    data = struct.pack('>H', 0x9201)  # 1001 0010 0000 0001
+    data = struct.pack(">H", 0x9201)  # 1001 0010 0000 0001
     addr = Address.from_bytes(data)
     assert addr.is_from is True
     assert addr.gateway_id.value == 0x1201
 
 
 # ---- FrameType ----
+
 
 def test_frame_type_values():
     """Verify key FrameType enum values."""
@@ -59,6 +73,7 @@ def test_frame_type_values():
 
 
 # ---- SlotCounter ----
+
 
 def test_slot_counter_epoch():
     # epoch=2, slot_number=1000
@@ -91,6 +106,7 @@ def test_slot_counter_slots_since_wrapping():
 
 # ---- U12Pair ----
 
+
 def test_u12_pair_from_bytes():
     data = bytes([0xAB, 0xCD, 0xEF])
     pair = U12Pair.from_bytes(data)
@@ -99,6 +115,7 @@ def test_u12_pair_from_bytes():
 
 
 # ---- ReceivedPacketHeader ----
+
 
 def test_received_packet_header_from_bytes():
     data = bytes([0x31, 0x00, 0x10, 0x00, 0x20, 0x05, 0x0D])
@@ -112,10 +129,11 @@ def test_received_packet_header_from_bytes():
 
 def test_received_packet_header_too_short():
     with pytest.raises(ValueError):
-        ReceivedPacketHeader.from_bytes(b'\x00\x01\x02')
+        ReceivedPacketHeader.from_bytes(b"\x00\x01\x02")
 
 
 # ---- PowerReport ----
+
 
 def test_power_report_from_bytes():
     """Test power report with known values."""
@@ -138,7 +156,7 @@ def test_power_report_from_bytes():
     pr = PowerReport.from_bytes(data)
     assert pr.voltage_in == pytest.approx(40.0)
     assert pr.voltage_out == pytest.approx(40.0)
-    assert pr.current == pytest.approx(2.5)
+    assert pr.current_in == pytest.approx(2.5)
     assert pr.duty_cycle == pytest.approx(128 / 255)
     assert pr.rssi == 0x80
 
@@ -147,31 +165,42 @@ def test_power_report_negative_temp():
     """Test sign extension for negative temperature."""
     # current_temp second = 0xFFF → sign extend → -1 → -0.1°C
     # bytes: first=0 → b4=0x00, b5 combined: (0 << 4 | 0xF) = 0x0F, b6=0xFF
-    data = bytes([
-        0x00, 0x00, 0x00,  # voltage_in_out
-        0x00,               # duty cycle
-        0x00, 0x0F, 0xFF,  # current_temp: first=0, second=0xFFF
-        0x00, 0x00, 0x00,  # unknown
-        0x00, 0x00,          # slot_counter
-        0x00,               # rssi
-    ])
+    data = bytes(
+        [
+            0x00,
+            0x00,
+            0x00,  # voltage_in_out
+            0x00,  # duty cycle
+            0x00,
+            0x0F,
+            0xFF,  # current_temp: first=0, second=0xFFF
+            0x00,
+            0x00,
+            0x00,  # unknown
+            0x00,
+            0x00,  # slot_counter
+            0x00,  # rssi
+        ]
+    )
     pr = PowerReport.from_bytes(data)
     assert pr.temperature == pytest.approx(-0.1)
 
 
 # ---- LongAddress ----
 
+
 def test_long_address_str():
     addr = LongAddress(bytes([0x04, 0xC0, 0x5B, 0x30, 0x00, 0x02, 0xBE, 0x16]))
-    assert str(addr) == '04:C0:5B:30:00:02:BE:16'
+    assert str(addr) == "04:C0:5B:30:00:02:BE:16"
 
 
 def test_long_address_from_str():
-    addr = LongAddress.from_str('04:C0:5B:30:00:02:BE:16')
+    addr = LongAddress.from_str("04:C0:5B:30:00:02:BE:16")
     assert addr.data == bytes([0x04, 0xC0, 0x5B, 0x30, 0x00, 0x02, 0xBE, 0x16])
 
 
 # ---- NodeID ----
+
 
 def test_node_id_valid():
     assert NodeID(1).value == 1
@@ -186,6 +215,7 @@ def test_node_id_invalid():
 
 
 # ---- iter_received_packets ----
+
 
 def test_iter_received_packets():
     """Pack two packets and iterate over them."""

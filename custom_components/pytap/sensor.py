@@ -75,12 +75,20 @@ SENSOR_DESCRIPTIONS: tuple[PyTapSensorEntityDescription, ...] = (
         value_key="voltage_out",
     ),
     PyTapSensorEntityDescription(
-        key="current",
-        translation_key="current",
+        key="current_in",
+        translation_key="current_in",
         native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
         device_class=SensorDeviceClass.CURRENT,
         state_class=SensorStateClass.MEASUREMENT,
-        value_key="current",
+        value_key="current_in",
+    ),
+    PyTapSensorEntityDescription(
+        key="current_out",
+        translation_key="current_out",
+        native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
+        device_class=SensorDeviceClass.CURRENT,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_key="current_out",
     ),
     PyTapSensorEntityDescription(
         key="temperature",
@@ -116,7 +124,7 @@ async def async_setup_entry(
     """Set up PyTap sensors from a config entry.
 
     Creates sensor entities deterministically from the configured module list.
-    Each configured module gets the full set of 7 sensor entities.
+    Each configured module gets the full set of 8 sensor entities.
     """
     coordinator: PyTapDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
     modules: list[dict[str, str]] = entry.data.get(CONF_MODULES, [])

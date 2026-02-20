@@ -412,11 +412,10 @@ def _handle_coordinator_update(self) -> None:
 
 #### Entity Availability
 
-Entities are marked unavailable when:
-- The node's barcode has **never** been seen on the bus (not yet identified by the gateway).
-- No `PowerReportEvent` has been received for the node within `UNAVAILABLE_TIMEOUT` seconds (default: 120s, configurable via Options Flow).
+Entities are marked unavailable only when:
+- The node's barcode has **never** been seen on the bus (no `PowerReportEvent` received yet for this barcode).
 
-This prevents stale values from persisting indefinitely during nighttime or when an optimizer goes offline.
+Once a sensor receives its first value, it remains available and holds the last received value indefinitely. This is intentional: solar optimizers stop reporting overnight, and displaying the last known values (rather than marking entities unavailable) provides a better user experience for dashboards and history.
 
 ### 6. `manifest.json` — Integration Metadata
 
@@ -588,7 +587,7 @@ Example: `A:Panel_01:S-1234567A, A:Panel_02:S-1234568B, B:Panel_03:S-2345678C`
 Configurable at runtime without removing the integration:
 
 - **Module list** — Add or remove optimizer barcodes as the installation evolves.
-- **Unavailable timeout** — Seconds without data before marking entities unavailable (default: 120s).
+
 - **State file path** — Enable/disable persistent infrastructure state.
 - **Log unknown barcodes** — Toggle discovery logging for unconfigured nodes (default: on).
 
@@ -603,7 +602,7 @@ Configurable at runtime without removing the integration:
 | CRC error in protocol data | Parser increments `counters["crc_errors"]`, skips frame |
 | Malformed frame (runt/giant) | Parser increments counter, resumes at next frame boundary |
 | No data for `RECONNECT_TIMEOUT` | Coordinator reconnects (stale connection detection) |
-| Node stops reporting | Entity marked unavailable after `UNAVAILABLE_TIMEOUT` (default 120s) |
+| Node stops reporting | Entity holds last received value and remains available |
 | Barcode not yet identified | Entity stays unavailable until gateway enumeration resolves the barcode |
 | Unconfigured barcode seen | Logged at INFO level for discovery; event data discarded |
 

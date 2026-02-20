@@ -1,6 +1,6 @@
 # PyTap — Implementation Document
 
-> Version 0.1.0 · Last updated: February 2026
+> Version 0.2.0 · Last updated: February 2026
 
 This document captures the current implementation state of the PyTap Home Assistant custom component. It describes what has been built, how each module works, the design decisions made during development, and the test coverage in place.
 
@@ -44,8 +44,8 @@ PyTap is a Home Assistant custom component that passively monitors Tigo TAP sola
 | Config flow | Menu-driven: add modules one at a time via individual form fields |
 | Threading model | Blocking parser in executor thread, bridged to async event loop |
 | External dependencies | None — parser library embedded, stdlib only |
-| Sensor types | 7 per optimizer: power, voltage in/out, current, temperature, duty cycle, RSSI |
-| Test coverage | 16 tests (9 config flow + 7 sensor platform) |
+| Sensor types | 8 per optimizer: power, voltage in/out, current in/out, temperature, duty cycle, RSSI |
+| Test coverage | 38 tests (9 config flow + 17 coordinator persistence + 5 migration + 7 sensor platform) |
 
 ---
 
@@ -53,12 +53,12 @@ PyTap is a Home Assistant custom component that passively monitors Tigo TAP sola
 
 ```
 custom_components/pytap/
-├── __init__.py          # 68 lines   — Integration lifecycle (setup, teardown, options listener)
+├── __init__.py          # ~135 lines — Integration lifecycle (setup, teardown, migration, options listener)
 ├── config_flow.py       # 369 lines  — Menu-driven config & options flows
 ├── const.py             # 23 lines   — Domain, config keys, default values
-├── coordinator.py       # 324 lines  — Push-based DataUpdateCoordinator
+├── coordinator.py       # ~477 lines — Push-based DataUpdateCoordinator
 ├── manifest.json        # 13 lines   — HA integration metadata
-├── sensor.py            # ~220 lines — 7 sensor entity types, CoordinatorEntity pattern
+├── sensor.py            # ~225 lines — 8 sensor entity types, CoordinatorEntity pattern
 ├── strings.json         # ~100 lines — UI strings (source of truth)
 ├── translations/
 │   └── en.json          # ~100 lines — English translations (mirrors strings.json)
@@ -74,9 +74,11 @@ custom_components/pytap/
         └── barcode.py   # Tigo barcode encode/decode
 
 tests/
-├── conftest.py          # 14 lines  — Auto-enable custom integrations fixture
-├── test_config_flow.py  # 343 lines — 9 config flow tests
-└── test_sensor.py       # ~210 lines — 7 sensor platform tests
+├── conftest.py                    # 14 lines  — Auto-enable custom integrations fixture
+├── test_config_flow.py            # 343 lines — 9 config flow tests
+├── test_coordinator_persistence.py # ~350 lines — 17 coordinator & persistence tests
+├── test_migration.py              # ~120 lines — 5 entity migration tests
+└── test_sensor.py                 # ~210 lines — 7 sensor platform tests
 
 docs/
 ├── architecture.md      # 656 lines — Architecture & design document
@@ -105,7 +107,6 @@ CONF_MODULE_BARCODE = "barcode"   # Tigo hardware barcode (stable ID)
 RECONNECT_TIMEOUT = 60            # Seconds of silence → reconnect
 RECONNECT_DELAY = 5               # Pause between reconnection attempts
 RECONNECT_RETRIES = 0             # 0 = infinite retries
-UNAVAILABLE_TIMEOUT = 120         # Seconds without data → entity unavailable
 ```
 
 These constants are imported by every other module in the integration.
@@ -125,7 +126,7 @@ These constants are imported by every other module in the integration.
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/azebro/pytap/issues",
   "requirements": [],
-  "version": "0.1.0"
+  "version": "0.2.0"
 }
 ```
 
@@ -205,7 +206,7 @@ Four custom `HomeAssistantError` subclasses: `CannotConnect`, `InvalidAuth`, `In
 
 ### `coordinator.py` — Data Coordinator
 
-**324 lines** implementing `PyTapDataUpdateCoordinator`, the core runtime engine.
+**~477 lines** implementing `PyTapDataUpdateCoordinator`, the core runtime engine.
 
 #### Class: `PyTapDataUpdateCoordinator`
 
@@ -248,42 +249,48 @@ async_start_listener()
                                        └── executor job → _listen()
 
 async_stop_listener()
-    └── sets _stop_event
-    └── closes _source (unblocks socket.read)
-    └── cancels task
+    └── sets _stop_event (threading.Event)
+    └── acquires _source_lock, closes _source (unblocks socket.read)
+    └── awaits task with asyncio.timeout(5)
 ```
+
+- **`_stop_event`** — A `threading.Event` (not `asyncio.Event`) so it can be set from the main thread and checked from the executor thread without cross-loop issues.
+
+- **`_source_lock`** — A `threading.Lock` protecting `_source` access. Both `_listen()` (executor) and `async_stop_listener()` (main loop via executor) need to touch `_source`; the lock prevents races.
 
 - **`_async_listen()`** — Async wrapper that calls `hass.async_add_executor_job(self._listen)`. This is necessary because `async_create_background_task` expects a coroutine, not a Future.
 
 - **`_listen()`** — Blocking loop running in the executor thread:
-  1. Creates a `Parser` and connects a `TcpSource`.
-  2. Reads 4096-byte chunks in a loop.
-  3. Feeds bytes to the parser, getting back a list of `Event` objects.
-  4. Calls `_process_event()` for each event.
-  5. Pushes updated data to HA via `hass.loop.call_soon_threadsafe(self.async_set_updated_data, ...)`.
+  1. Creates a `Parser` and connects a `TcpSource` (under `_source_lock`).
+  2. Checks `_stop_event` immediately after connect — if set during connect, exits cleanly.
+  3. Reads 4096-byte chunks in a loop.
+  4. Feeds bytes to the parser, getting back a list of `Event` objects.
+  5. For **each event individually**, calls `_process_event()` — if it returns `True` (data changed), pushes an update to HA via `hass.loop.call_soon_threadsafe(self.async_set_updated_data, ...)`. This per-event push avoids micro-batching.
   6. Monitors for silence timeouts (`RECONNECT_TIMEOUT`).
-  7. On error/timeout, closes the source, waits `RECONNECT_DELAY` seconds, and retries.
-  8. Sleep during reconnect delay uses 0.1s increments to respond quickly to stop requests.
+  7. On error/timeout, closes the source (under `_source_lock`), waits `RECONNECT_DELAY` seconds, and retries.
+  8. Sleep during reconnect delay uses 0.1s increments checking `_stop_event` for fast shutdown.
 
 #### Event Processing
 
 ```python
-def _process_event(self, event):
+def _process_event(self, event) -> bool:
+    """Returns True if data was changed."""
     if isinstance(event, PowerReportEvent):
-        self._handle_power_report(event)
+        return self._handle_power_report(event)
     elif isinstance(event, InfrastructureEvent):
-        self._handle_infrastructure(event)
+        return self._handle_infrastructure(event)
     elif isinstance(event, TopologyEvent):
-        self._handle_topology(event)
+        return self._handle_topology(event)
     elif isinstance(event, StringEvent):
         # Logged at DEBUG, not stored
+    return False
 ```
 
-**`_handle_power_report(event)`:**
+**`_handle_power_report(event) → bool`:**
 1. Resolves `barcode` — directly from event, or via `_node_to_barcode` mapping.
-2. If barcode is unknown, logs at DEBUG and returns.
-3. If barcode is not in `_configured_barcodes` (allowlist), logs discovery at INFO and returns.
-4. Upserts into `self.data["nodes"][barcode]` with all power fields plus `last_update` timestamp.
+2. If barcode is unknown, logs at DEBUG and returns `False`.
+3. If barcode is not in `_configured_barcodes` (allowlist), logs discovery at INFO and returns `False`.
+4. Upserts into `self.data["nodes"][barcode]` with all power fields plus `last_update` timestamp. Returns `True`.
 
 The data dict stored per node:
 ```python
@@ -295,7 +302,8 @@ The data dict stored per node:
     "string": str,         # from user config
     "voltage_in": float,
     "voltage_out": float,
-    "current": float,
+    "current_in": float,
+    "current_out": float,
     "power": float,
     "temperature": float,
     "dc_dc_duty_cycle": float,  # 0.0–1.0
@@ -304,13 +312,15 @@ The data dict stored per node:
 }
 ```
 
-**`_handle_infrastructure(event)`:**
+**`_handle_infrastructure(event) → bool`:**
 - Replaces `self.data["gateways"]` with the event's gateway dict.
 - Builds the `barcode ↔ node_id` bidirectional mapping from the node table.
 - Logs newly discovered unconfigured barcodes at INFO level.
+- Returns `True` if gateway data changed.
 
-**`_handle_topology(event)`:**
+**`_handle_topology(event) → bool`:**
 - Attaches topology data to the matching node (by resolving `node_id` → barcode).
+- Returns `True` if data was attached to a configured node.
 
 #### Discovery Logging
 
@@ -338,7 +348,7 @@ Called when the options flow updates the module list.
 
 ### `sensor.py` — Sensor Platform
 
-**~220 lines** implementing 7 sensor entity types using the `CoordinatorEntity` pattern.
+**~225 lines** implementing 8 sensor entity types using the `CoordinatorEntity` pattern.
 
 #### Sensor Descriptions
 
@@ -350,7 +360,9 @@ SENSOR_DESCRIPTIONS = (
         unit=UnitOfElectricPotential.VOLT, device_class=VOLTAGE),
     PyTapSensorEntityDescription(key="voltage_out",       value_key="voltage_out",
         unit=UnitOfElectricPotential.VOLT, device_class=VOLTAGE),
-    PyTapSensorEntityDescription(key="current",           value_key="current",
+    PyTapSensorEntityDescription(key="current_in",        value_key="current_in",
+        unit=UnitOfElectricCurrent.AMPERE, device_class=CURRENT),
+    PyTapSensorEntityDescription(key="current_out",       value_key="current_out",
         unit=UnitOfElectricCurrent.AMPERE, device_class=CURRENT),
     PyTapSensorEntityDescription(key="temperature",       value_key="temperature",
         unit=UnitOfTemperature.CELSIUS,    device_class=TEMPERATURE),
@@ -376,7 +388,7 @@ for module_config in modules:
         entities.append(PyTapSensor(coordinator, description, module_config, entry))
 ```
 
-Two modules × 7 descriptions = 14 sensor entities.
+Two modules × 8 descriptions = 16 sensor entities.
 
 #### `PyTapSensor` Class
 
@@ -397,10 +409,10 @@ DeviceInfo(
 )
 ```
 
-All 7 sensors for the same barcode are grouped under one device.
+All 8 sensors for the same barcode are grouped under one device.
 
 **Availability:**
-Returns `True` only when `coordinator.data["nodes"][barcode]` exists (i.e., at least one `PowerReportEvent` has been received for this optimizer).
+Returns `True` only when `coordinator.data["nodes"][barcode]` exists (i.e., at least one `PowerReportEvent` has been received for this optimizer). There is no unavailable timeout — sensors hold their last received value indefinitely.
 
 **Value updates** (`_handle_coordinator_update`):
 - Reads from `coordinator.data["nodes"][barcode][value_key]`.
@@ -416,16 +428,34 @@ Returns `True` only when `coordinator.data["nodes"][barcode]` exists (i.e., at l
 
 ### `__init__.py` — Integration Lifecycle
 
-**68 lines** handling the three lifecycle phases:
+**~135 lines** handling integration lifecycle, config entry migration, and legacy entity cleanup.
+
+#### Config Entry Version
+
+`CONFIG_ENTRY_VERSION = 2` — Bumped from 1 when voltage/current sensors were split into `_in`/`_out` variants in v0.2.0.
+
+#### `async_migrate_entry(hass, entry) → bool`
+
+Handles config entry version migration:
+- **v1 → v2:** Updates `entry.version` to 2. The actual entity cleanup is done in `_async_cleanup_legacy_entities` during setup.
 
 #### `async_setup_entry(hass, entry) → bool`
 
-1. Creates `PyTapDataUpdateCoordinator(hass, entry)`.
-2. Calls `coordinator.async_config_entry_first_refresh()` — validates initialization (does not block on data since this is push-based).
-3. Calls `coordinator.async_start_listener()` — launches the background streaming task.
-4. Stores coordinator in `hass.data[DOMAIN][entry.entry_id]`.
-5. Forwards platform setup (`Platform.SENSOR`).
-6. Registers `_async_update_options` as an update listener.
+1. Cleans up legacy entity unique IDs from pre-v0.2.0 via `_async_cleanup_legacy_entities()`.
+2. Creates `PyTapDataUpdateCoordinator(hass, entry)`.
+3. Calls `coordinator.async_config_entry_first_refresh()` — validates initialization (does not block on data since this is push-based).
+4. Calls `coordinator.async_start_listener()` — launches the background streaming task.
+5. Registers `coordinator.async_stop_listener` via `entry.async_on_unload()` — ensures the listener is stopped on HA shutdown or entry unload.
+6. Stores coordinator in `hass.data[DOMAIN][entry.entry_id]`.
+7. Forwards platform setup (`Platform.SENSOR`).
+8. Registers `_async_update_options` as an update listener.
+
+#### `_async_cleanup_legacy_entities(hass, entry)`
+
+Removes orphaned entity registry entries left over from the voltage/current → voltage_in/out, current_in/out rename:
+- Iterates configured modules and checks for entities with old unique IDs (`pytap_BARCODE_voltage`, `pytap_BARCODE_current`).
+- Removes matching entries from the entity registry.
+- Logs the count of cleaned-up entities.
 
 #### `_async_update_options(hass, entry)`
 
@@ -434,7 +464,7 @@ Reloads the entire integration when options change, causing a full teardown/setu
 #### `async_unload_entry(hass, entry) → bool`
 
 1. Unloads platforms.
-2. Stops the coordinator's background listener.
+2. Stops the coordinator's background listener (also covered by `async_on_unload` but called explicitly for the non-shutdown unload path).
 3. Removes the coordinator from `hass.data`.
 
 ---
@@ -524,15 +554,19 @@ Parser.feed(bytes) → list[Event]           [executor thread]
     └── StringEvent
     │
     ▼
-coordinator._process_event(event)          [executor thread]
+FOR EACH event:                            [executor thread]
+    coordinator._process_event(event) → bool
     │
-    ├── Barcode in allowlist? YES → merge into data["nodes"][barcode]
-    │                         NO  → log discovery, discard
+    ├── data changed (True)?
+    │   ├── Barcode in allowlist? YES → merge into data["nodes"][barcode]
+    │   │                         NO  → log discovery, discard
+    │   │
+    │   ▼
+    │   hass.loop.call_soon_threadsafe(    [→ main event loop]
+    │       coordinator.async_set_updated_data, data
+    │   )
     │
-    ▼
-hass.loop.call_soon_threadsafe(            [→ main event loop]
-    coordinator.async_set_updated_data, data
-)
+    └── no change (False) → skip push
     │
     ▼
 CoordinatorEntity._handle_coordinator_update()  [main event loop]
@@ -575,15 +609,47 @@ All tests mock `validate_connection` to avoid real TCP connections.
 
 | Test | What it verifies |
 |------|-----------------|
-| `test_sensor_entities_created` | 2 modules × 7 sensors = 14 entities |
+| `test_sensor_entities_created` | 2 modules × 8 sensors = 16 entities |
 | `test_sensor_unique_ids` | IDs follow `{DOMAIN}_{barcode}_{key}` pattern |
 | `test_sensor_available_with_data` | Sensor available when node data exists |
 | `test_sensor_unavailable_without_data` | Sensor unavailable when data dict is empty |
 | `test_sensor_skips_modules_without_barcode` | Modules with empty barcode don't create entities |
 | `test_sensor_device_info` | Device identifiers, manufacturer, model, serial_number |
-| `test_sensor_descriptions_count` | Exactly 7 sensor descriptions defined |
+| `test_sensor_descriptions_count` | Exactly 8 sensor descriptions defined |
 
 Tests use `MagicMock(spec=PyTapDataUpdateCoordinator)` to avoid real coordinator initialization.
+
+### Coordinator Persistence Tests (17 tests)
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_coordinator_init` | Coordinator initializes with correct host, port, barcode allowlist |
+| `test_process_power_report` | Power report updates node data correctly |
+| `test_process_infrastructure` | Infrastructure event builds barcode↔node_id mapping |
+| `test_process_topology` | Topology event attaches data to correct node |
+| `test_unconfigured_barcode_discovery` | Unconfigured barcodes logged and tracked |
+| `test_reload_modules` | Module list hot-reload updates allowlists |
+| `test_listener_start_stop` | Background listener starts and stops cleanly |
+| `test_reconnect_on_error` | Listener reconnects after connection errors |
+| `test_reconnect_on_silence` | Listener reconnects after RECONNECT_TIMEOUT silence |
+| `test_persistence_save_load` | State persisted to and restored from HA Store |
+| `test_persistence_debounce` | Saves are debounced (SAVE_DELAY_SECONDS) |
+| `test_data_survives_restart` | Data restored on coordinator re-initialization |
+| `test_stop_event_thread_safe` | threading.Event works cross-thread |
+| `test_source_lock_protects_source` | _source_lock prevents concurrent _source access |
+| `test_per_event_push` | Each event triggers its own async_set_updated_data call |
+| `test_shutdown_timeout` | async_stop_listener returns within timeout even if task hangs |
+| `test_handler_return_bool` | _process_event returns True only when data changes |
+
+### Entity Migration Tests (5 tests)
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_removes_old_voltage_and_current_entities` | Legacy voltage/current entity registry entries removed on setup |
+| `test_does_not_touch_new_entities` | New _in/_out entities are not affected by cleanup |
+| `test_no_op_when_no_legacy_entities` | No errors when no legacy entities exist |
+| `test_migrates_v1_to_v2` | Config entry version bumped from 1 to 2 |
+| `test_already_current_version` | v2 entries pass through migration unchanged |
 
 ### Parser Library Tests (in `custom_components/pytap/pytap/tests/`)
 
@@ -680,7 +746,10 @@ The architecture document (`architecture.md`) was written during initial design 
 | Options flow | Described as text-based reconfiguration | Menu with add/remove/done actions |
 | Gateway device registration | Described as separate DeviceInfo | Not yet implemented (sensors have device info per optimizer only) |
 | `via_device` on nodes | Linked to gateway device | Not implemented (no gateway device yet) |
-| Unavailable timeout entity | Described as configurable via options | Constant `UNAVAILABLE_TIMEOUT = 120` (not yet in options UI) |
+| Unavailable timeout | Described as configurable via options | Removed — sensors hold last value indefinitely |
+| Sensor count | 7 per optimizer (single voltage/current) | 8 per optimizer (voltage_in/out, current_in/out) |
+| Config entry version | Not mentioned | v2 with async_migrate_entry and legacy entity cleanup |
+| Threading primitives | Not specified | threading.Event + threading.Lock (not asyncio.Event) |
 | State file persistence | Mentioned in options flow design | Not implemented |
 | Diagnostics platform | Mentioned for discovered barcodes | Not implemented yet (data stored in coordinator) |
 
@@ -725,6 +794,29 @@ Rewrote the config flow from a comma-separated text input to a menu-driven appro
 
 Created this implementation document capturing all development work to date.
 
+### Phase 7 — Micro-Batching Fix & Timeout Removal
+
+- Fixed micro-batching: `_listen()` was calling `async_set_updated_data` once per TCP read chunk. Changed to push per-event — each event that changes data triggers its own `async_set_updated_data` call.
+- `_process_event()` and all handler methods now return `bool` indicating whether data changed.
+- Removed `UNAVAILABLE_TIMEOUT` constant and all related logic. Sensors now hold their last received value indefinitely (no forced `None` after timeout).
+- Updated `source.py`: `TcpSource.read()` now raises `OSError("Socket is closed")` when the socket is `None` and `ConnectionResetError` on peer close, instead of silently returning `b''`.
+
+### Phase 8 — Entity Migration (v0.2.0)
+
+- Split `voltage` → `voltage_in`/`voltage_out` and `current` → `current_in`/`current_out`, growing sensor count from 7 to 8 per optimizer.
+- Added entity registry cleanup in `_async_cleanup_legacy_entities()` to remove orphaned `voltage`/`current` entities from pre-v0.2.0 installs.
+- Bumped config entry version to 2 and added `async_migrate_entry()` for v1→v2 migration.
+- Bumped manifest version to 0.2.0.
+- Added 5 entity migration tests.
+
+### Phase 9 — Shutdown & Threading Fixes
+
+- Changed `_stop_event` from `asyncio.Event` to `threading.Event` — the former is not thread-safe across loops and caused HA shutdown to hang.
+- Added `_source_lock` (`threading.Lock`) to protect concurrent `_source` access between the executor thread and the main loop's stop path.
+- `async_stop_listener()` now uses `asyncio.timeout(5)` to prevent indefinite blocking if the listener task doesn't exit.
+- Registered `coordinator.async_stop_listener` via `entry.async_on_unload()` so the listener is stopped on HA shutdown/reload, not just explicit unload.
+- Added 17 coordinator persistence and lifecycle tests.
+
 ---
 
 ## Future Work
@@ -733,8 +825,7 @@ Items identified but not yet implemented:
 
 1. **Gateway device registration** — Create a device per gateway for the `via_device` hierarchy.
 2. **Diagnostics platform** — Expose `discovered_barcodes`, parser counters, and connection state as a diagnostics download.
-3. **Configurable unavailable timeout** — Add `UNAVAILABLE_TIMEOUT` to the options flow.
-4. **Energy dashboard integration** — Ensure power sensors work with HA's energy dashboard (may need `SensorDeviceClass.ENERGY` with Riemann sum).
+3. **Energy dashboard integration** — Ensure power sensors work with HA's energy dashboard (may need `SensorDeviceClass.ENERGY` with Riemann sum).
 5. **Binary sensors** — Node connectivity and gateway online status.
 6. **Persistent state** — Save infrastructure state to disk to survive HA restarts without waiting for gateway enumeration.
 7. **HACS distribution** — Package with `hacs.json` for one-click installation.
