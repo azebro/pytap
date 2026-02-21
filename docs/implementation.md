@@ -45,7 +45,7 @@ PyTap is a Home Assistant custom component that passively monitors Tigo TAP sola
 | Threading model | Blocking parser in executor thread, bridged to async event loop |
 | External dependencies | None — parser library embedded, stdlib only |
 | Sensor types | 8 per optimizer: power, voltage in/out, current in/out, temperature, duty cycle, RSSI |
-| Test coverage | 38 tests (9 config flow + 17 coordinator persistence + 5 migration + 7 sensor platform) |
+| Test coverage | 49 tests (13 config flow + 17 coordinator persistence + 5 migration + 7 sensor platform) |
 
 ---
 
@@ -56,7 +56,7 @@ custom_components/pytap/
 ├── __init__.py          # ~135 lines — Integration lifecycle (setup, teardown, migration, options listener)
 ├── config_flow.py       # 369 lines  — Menu-driven config & options flows
 ├── const.py             # 23 lines   — Domain, config keys, default values
-├── coordinator.py       # ~477 lines — Push-based DataUpdateCoordinator
+├── coordinator.py       # ~635 lines — Push-based DataUpdateCoordinator
 ├── manifest.json        # 13 lines   — HA integration metadata
 ├── sensor.py            # ~225 lines — 8 sensor entity types, CoordinatorEntity pattern
 ├── strings.json         # ~100 lines — UI strings (source of truth)
@@ -314,8 +314,13 @@ The data dict stored per node:
 
 **`_handle_infrastructure(event) → bool`:**
 - Replaces `self.data["gateways"]` with the event's gateway dict.
-- Builds the `barcode ↔ node_id` bidirectional mapping from the node table.
+- Rebuilds the `barcode ↔ node_id` bidirectional mapping from scratch.
 - Logs newly discovered unconfigured barcodes at INFO level.
+- Differentiates the first infrastructure event in a session:
+  - If the event has no barcodes (node table not yet received), logs an INFO explaining that resolution will activate once the gateway sends the full node table.
+  - If the event has barcodes, logs a WARNING with the match count.
+- On subsequent events with changed mappings, logs updated match counts and lists any configured barcodes still missing from the node table.
+- Triggers a persist (via `_schedule_save`) when mappings change **or** when new unconfigured barcodes are discovered.
 - Returns `True` if gateway data changed.
 
 **`_handle_topology(event) → bool`:**
@@ -342,7 +347,18 @@ def reload_modules(self, modules):
     self._module_lookup = {m[CONF_MODULE_BARCODE]: m for m in modules ...}
 ```
 
-Called when the options flow updates the module list.
+Called when the options flow updates the module list. After updating the allowlist, checks whether any newly-configured barcodes already have a known node mapping from previous infrastructure events. If so, creates a placeholder entry in `self.data["nodes"]` with module metadata (name, string group) so sensor entities can bind immediately without waiting for the next power report. Logs which barcodes were resolved from saved state and which are still pending.
+
+#### Persistence
+
+Two persistence layers ensure barcode mappings survive restarts and reloads:
+
+1. **Parser state file** — Written by the parser library as `<config>/.storage/pytap_<entry_id>_parser_state.json`. Contains the raw gateway node table.
+2. **Coordinator HA Store** — Written via `homeassistant.helpers.storage.Store` as `<config>/.storage/pytap_<entry_id>_coordinator`. Stores barcode↔node_id mappings and discovered barcodes.
+
+On startup, coordinator state is loaded from the HA Store (via `_async_load_coordinator_state`). Then, in the executor thread, `_init_mappings_from_parser` attempts to merge parser state. Parser mappings take precedence when non-empty; when the parser state has no node table (first run, state file missing), the coordinator-saved mappings are preserved as fallback. This prevents stale-wipe scenarios where an empty parser state would erase valid saved mappings.
+
+Saves are debounced via `_schedule_save()` (10-second delay, dispatched to the event loop). On shutdown (`async_stop_listener`), any pending unsaved changes are flushed immediately.
 
 ---
 
@@ -816,7 +832,15 @@ Created this implementation document capturing all development work to date.
 - `async_stop_listener()` now uses `asyncio.timeout(5)` to prevent indefinite blocking if the listener task doesn't exit.
 - Registered `coordinator.async_stop_listener` via `entry.async_on_unload()` so the listener is stopped on HA shutdown/reload, not just explicit unload.
 - Added 17 coordinator persistence and lifecycle tests.
+### Phase 10 — Barcode Persistence & Node Table Fix
 
+- **Node table sentinel tolerance** — Fixed parser `_handle_node_table_command` to tolerate trailing bytes on the end-of-table sentinel page (`entries_count=0`). The gateway commonly sends padding/CRC bytes after the zero count, which was previously rejected as "corrupt", preventing the node table from completing and barcodes from being resolved.
+- **Trailing-byte tolerance on data pages** — Data pages with more bytes than expected now parse the declared entries and ignore trailing bytes (changed strict equality check to minimum-length check).
+- **First infrastructure event differentiation** — `_handle_infrastructure` now distinguishes between infra events with and without barcodes. The first event often arrives from gateway identity/version discovery before the node table is received. Previously this logged a misleading "0/N matched" WARNING; now it logs an INFO explaining that resolution will activate once the node table arrives.
+- **Configured barcode mismatch logging** — Infrastructure events now log which specific configured barcodes are NOT found in the node table, helping users identify typos or incorrect barcodes.
+- **Discovery persistence fix** — Discovered (unconfigured) barcodes from infrastructure events now properly trigger `_schedule_save()`. Previously only mapping changes triggered saves, leaving discovered barcodes unpersisted.
+- **Coordinator-saved mapping preservation** — `_init_mappings_from_parser` now preserves coordinator-saved barcode↔node mappings when the parser state is empty (merge instead of replace). This prevents previously-learned mappings from being wiped on reconnect when the parser state file has no node table.
+- **Instant barcode resolution on module add** — `reload_modules` now checks if newly-added barcodes already exist in the saved barcode↔node mapping and pre-populates placeholder node data so sensor entities can bind immediately without waiting for the next power report.
 ---
 
 ## Future Work
@@ -827,6 +851,6 @@ Items identified but not yet implemented:
 2. **Diagnostics platform** — Expose `discovered_barcodes`, parser counters, and connection state as a diagnostics download.
 3. **Energy dashboard integration** — Ensure power sensors work with HA's energy dashboard (may need `SensorDeviceClass.ENERGY` with Riemann sum).
 5. **Binary sensors** — Node connectivity and gateway online status.
-6. **Persistent state** — Save infrastructure state to disk to survive HA restarts without waiting for gateway enumeration.
+
 7. **HACS distribution** — Package with `hacs.json` for one-click installation.
 8. **Update architecture.md** — Align the architecture document with the current menu-driven config flow.

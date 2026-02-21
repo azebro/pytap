@@ -10,10 +10,11 @@ A Home Assistant custom component for monitoring **Tigo TAP solar energy systems
 ## Features
 
 - **Real-time streaming** — Push-based data delivery with sub-second latency (no polling).
-- **Per-optimizer sensors** — 7 sensor entities per Tigo TS4 module: power, voltage in/out, current, temperature, DC-DC duty cycle, and RSSI.
+- **Per-optimizer sensors** — 8 sensor entities per Tigo TS4 module: power, voltage in/out, current in/out, temperature, DC-DC duty cycle, and RSSI.
 - **Menu-driven setup** — Add optimizer modules one at a time with guided form fields.
 - **Barcode-based identification** — Stable hardware barcodes as entity identifiers (survives gateway restarts).
 - **Discovery logging** — Unconfigured barcodes seen on the bus are logged for easy identification.
+- **Persistent barcode mapping** — Discovered barcodes and node mappings are saved across restarts. When you add a previously-discovered barcode, it resolves instantly without waiting for the next gateway enumeration.
 - **No external dependencies** — The protocol parser library is fully embedded; nothing to install from PyPI.
 - **Options flow** — Add or remove optimizer modules at any time without reconfiguring.
 
@@ -26,7 +27,8 @@ Each configured Tigo TS4 optimizer exposes the following sensors:
 | Power | W | `power` |
 | Voltage In | V | `voltage` |
 | Voltage Out | V | `voltage` |
-| Current | A | `current` |
+| Current In | A | `current` |
+| Current Out | A | `current` |
 | Temperature | °C | `temperature` |
 | DC-DC Duty Cycle | % | — |
 | RSSI | dBm | `signal_strength` |
@@ -85,7 +87,8 @@ Check your Home Assistant logs after the gateway has been running for a while (u
 
 Go to **Settings → Devices & Services → PyTap → Configure** to:
 
-- **Add** new optimizer modules.
+- **Change connection** — Update the gateway IP address and port.
+- **Add** new optimizer modules (if the barcode was previously seen on the bus, it resolves instantly).
 - **Remove** modules you no longer want to track.
 - **Save and close** to apply changes.
 
@@ -128,7 +131,7 @@ pytap/
 │   ├── config_flow.py           # Config & options flows
 │   ├── const.py                 # Constants
 │   ├── coordinator.py           # Push-based data coordinator
-│   ├── sensor.py                # Sensor platform (7 entity types)
+│   ├── sensor.py                # Sensor platform (8 entity types)
 │   ├── manifest.json            # Integration metadata
 │   ├── strings.json             # UI strings
 │   ├── translations/en.json     # English translations

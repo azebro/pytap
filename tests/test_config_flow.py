@@ -8,6 +8,8 @@ from homeassistant import config_entries
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 
+from pytest_homeassistant_custom_component.common import MockConfigEntry
+
 from custom_components.pytap.const import (
     CONF_MODULE_BARCODE,
     CONF_MODULE_NAME,
@@ -290,53 +292,153 @@ async def test_add_module_duplicate_barcode(hass: HomeAssistant) -> None:
     assert result["errors"] == {CONF_MODULE_BARCODE: "duplicate_barcode"}
 
 
-async def test_already_configured(hass: HomeAssistant) -> None:
-    """Test that the same host:port cannot be added twice."""
-    # Complete the full flow to create the first entry
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
+# ──────────────────────────────────────────────────────────
+# Options flow: change connection settings
+# ──────────────────────────────────────────────────────────
+
+
+def _make_config_entry(hass: HomeAssistant) -> MockConfigEntry:
+    """Create and add a PyTap config entry for options-flow testing."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        version=2,
+        title=f"PyTap ({MOCK_HOST})",
+        data={
+            "host": MOCK_HOST,
+            "port": MOCK_PORT,
+            CONF_MODULES: [
+                {
+                    CONF_MODULE_STRING: "A",
+                    CONF_MODULE_NAME: "Panel_01",
+                    CONF_MODULE_BARCODE: "A-1234567B",
+                },
+            ],
+        },
+        unique_id="pytap_test_entry",
     )
+    entry.add_to_hass(hass)
+    return entry
+
+
+async def test_options_flow_shows_change_connection(hass: HomeAssistant) -> None:
+    """Test the options menu includes the change_connection option."""
+    entry = _make_config_entry(hass)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "init"
+    assert "change_connection" in result["menu_options"]
+
+
+async def test_options_change_connection_shows_prefilled_form(
+    hass: HomeAssistant,
+) -> None:
+    """Test that selecting change_connection shows a form with current values."""
+    entry = _make_config_entry(hass)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {"next_step_id": "change_connection"},
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "change_connection"
+    # Schema defaults should carry the current values
+    schema = result["data_schema"]
+    schema_dict = {str(k): k for k in schema.schema}
+    host_key = schema_dict["host"]
+    port_key = schema_dict["port"]
+    assert host_key.default() == MOCK_HOST
+    assert port_key.default() == MOCK_PORT
+
+
+async def test_options_change_connection_updates_entry(
+    hass: HomeAssistant,
+) -> None:
+    """Test that submitting new host/port updates entry data and title."""
+    entry = _make_config_entry(hass)
+    new_host = "10.0.0.50"
+    new_port = 8502
+    original_unique_id = entry.unique_id
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {"next_step_id": "change_connection"},
+    )
+    assert result["step_id"] == "change_connection"
+
     with patch(
         "custom_components.pytap.config_flow.validate_connection",
-        return_value={"title": f"PyTap ({MOCK_HOST})"},
+        return_value={"title": f"PyTap ({new_host})"},
     ):
-        result = await hass.config_entries.flow.async_configure(
+        result = await hass.config_entries.options.async_configure(
             result["flow_id"],
-            {"host": MOCK_HOST, "port": MOCK_PORT},
+            {"host": new_host, "port": new_port},
         )
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], {"next_step_id": "add_module"}
-    )
-    with patch(
-        "custom_components.pytap.async_setup_entry",
-        return_value=True,
-    ):
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {
-                CONF_MODULE_STRING: "A",
-                CONF_MODULE_NAME: "Panel_01",
-                CONF_MODULE_BARCODE: "A-1234567B",
-            },
-        )
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"], {"next_step_id": "finish"}
-        )
-        await hass.async_block_till_done()
-    assert result["type"] is FlowResultType.CREATE_ENTRY
 
-    # Try adding the same device again
-    result2 = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    # Should return to the init menu
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "init"
+
+    # Verify the config entry was updated
+    assert entry.data["host"] == new_host
+    assert entry.data["port"] == new_port
+    assert entry.unique_id == original_unique_id  # unique_id must NOT change
+    assert entry.title == f"PyTap ({new_host})"
+
+
+async def test_options_change_connection_warn_only_on_failure(
+    hass: HomeAssistant,
+) -> None:
+    """Test that a failed connection test still saves the new values."""
+    entry = _make_config_entry(hass)
+    new_host = "10.0.0.99"
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {"next_step_id": "change_connection"},
     )
+
     with patch(
         "custom_components.pytap.config_flow.validate_connection",
-        return_value={"title": f"PyTap ({MOCK_HOST})"},
+        side_effect=Exception("Connection refused"),
     ):
-        result2 = await hass.config_entries.flow.async_configure(
-            result2["flow_id"],
-            {"host": MOCK_HOST, "port": MOCK_PORT},
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            {"host": new_host, "port": MOCK_PORT},
         )
 
-    assert result2["type"] is FlowResultType.ABORT
-    assert result2["reason"] == "already_configured"
+    # Should still return to menu despite connection failure
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "init"
+
+    # Values should still be saved
+    assert entry.data["host"] == new_host
+
+
+async def test_options_change_connection_preserves_modules(
+    hass: HomeAssistant,
+) -> None:
+    """Test that changing connection does not alter the module list."""
+    entry = _make_config_entry(hass)
+    original_modules = list(entry.data[CONF_MODULES])
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {"next_step_id": "change_connection"},
+    )
+
+    with patch(
+        "custom_components.pytap.config_flow.validate_connection",
+        return_value={"title": "PyTap (10.0.0.1)"},
+    ):
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            {"host": "10.0.0.1", "port": 503},
+        )
+
+    assert entry.data[CONF_MODULES] == original_modules

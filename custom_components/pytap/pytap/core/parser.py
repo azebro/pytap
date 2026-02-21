@@ -770,7 +770,20 @@ class Parser:
             return []
         entries_count = resp_payload[0]
         entries_data = resp_payload[1:]
-        if len(entries_data) != entries_count * 10:
+
+        # entries_count == 0 is the end-of-table sentinel; trailing bytes
+        # after the count byte are common (padding / CRC remnants) and must
+        # not be treated as corruption.
+        if entries_count == 0:
+            if len(entries_data) > 0:
+                logger.debug(
+                    "NODE_TABLE_RESPONSE gw=%d: final page has %d trailing "
+                    "bytes (ignored)",
+                    gw_id,
+                    len(entries_data),
+                )
+            entries = []
+        elif len(entries_data) < entries_count * 10:
             logger.warning(
                 "NODE_TABLE_RESPONSE gw=%d: corrupt page — "
                 "entries_count=%d but data=%d bytes (expected %d)",
@@ -779,13 +792,22 @@ class Parser:
                 len(entries_data),
                 entries_count * 10,
             )
-            return []  # corrupt
-        entries = []
-        for i in range(entries_count):
-            off = i * 10
-            node_addr = NodeAddress.from_bytes(entries_data[off : off + 2])
-            long_addr = LongAddress(entries_data[off + 2 : off + 10])
-            entries.append((node_addr, long_addr))
+            return []  # corrupt — not enough data to parse entries
+        else:
+            if len(entries_data) > entries_count * 10:
+                logger.debug(
+                    "NODE_TABLE_RESPONSE gw=%d: %d trailing bytes after "
+                    "%d entries (ignored)",
+                    gw_id,
+                    len(entries_data) - entries_count * 10,
+                    entries_count,
+                )
+            entries = []
+            for i in range(entries_count):
+                off = i * 10
+                node_addr = NodeAddress.from_bytes(entries_data[off : off + 2])
+                long_addr = LongAddress(entries_data[off + 2 : off + 10])
+                entries.append((node_addr, long_addr))
 
         logger.info(
             "NODE_TABLE page gw=%d: start_addr=%d, %d entries%s",

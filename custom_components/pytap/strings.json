@@ -87,9 +87,22 @@
         "title": "PyTap Options",
         "description": "{modules_list}",
         "menu_options": {
+          "change_connection": "Change connection settings",
           "add_module": "Add a module",
           "remove_module": "Remove a module",
           "done": "Save and close"
+        }
+      },
+      "change_connection": {
+        "title": "Change Connection Settings",
+        "description": "Update the IP address and port of your Tigo gateway.",
+        "data": {
+          "host": "Host",
+          "port": "Port"
+        },
+        "data_description": {
+          "host": "The hostname or IP address of your Tigo gateway.",
+          "port": "The port number (default: 502)."
         }
       },
       "add_module": {

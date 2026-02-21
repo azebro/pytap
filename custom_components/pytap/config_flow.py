@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import re
+import uuid
 from typing import Any
 
 import voluptuous as vol
@@ -124,12 +125,8 @@ class PyTapConfigFlow(ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             self._user_data = user_input
-            # Set unique ID based on host:port
-            unique_id = (
-                f"{user_input[CONF_HOST]}:{user_input.get(CONF_PORT, DEFAULT_PORT)}"
-            )
-            await self.async_set_unique_id(unique_id)
-            self._abort_if_unique_id_configured()
+            # Stable unique ID — not tied to mutable connection settings
+            await self.async_set_unique_id(uuid.uuid4().hex)
 
             # Optional connection test — warn but don't block
             try:
@@ -153,24 +150,6 @@ class PyTapConfigFlow(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Show the modules menu: add another or finish."""
-        if user_input is not None:
-            next_step = user_input.get("next_step_id")
-            if next_step == "add_module":
-                return await self.async_step_add_module()
-            if next_step == "finish":
-                if not self._modules:
-                    return self.async_show_menu(
-                        step_id="modules_menu",
-                        menu_options=["add_module", "finish"],
-                        description_placeholders={
-                            "modules_list": _modules_description(self._modules),
-                            "error": "You must add at least one module.",
-                        },
-                    )
-                data = {**self._user_data, CONF_MODULES: self._modules}
-                title = f"PyTap ({self._user_data[CONF_HOST]})"
-                return self.async_create_entry(title=title, data=data)
-
         return self.async_show_menu(
             step_id="modules_menu",
             menu_options=["add_module", "finish"],
@@ -250,26 +229,73 @@ class PyTapOptionsFlow(OptionsFlow):
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Show the options menu: add / remove / done."""
-        if user_input is not None:
-            next_step = user_input.get("next_step_id")
-            if next_step == "add_module":
-                return await self.async_step_add_module()
-            if next_step == "remove_module":
-                return await self.async_step_remove_module()
-            if next_step == "done":
-                new_data = {**self._config_entry.data, CONF_MODULES: self._modules}
-                self.hass.config_entries.async_update_entry(
-                    self._config_entry, data=new_data
-                )
-                return self.async_create_entry(title="", data={})
-
+        """Show the options menu: change connection / add / remove / done."""
         return self.async_show_menu(
             step_id="init",
-            menu_options=["add_module", "remove_module", "done"],
+            menu_options=["change_connection", "add_module", "remove_module", "done"],
             description_placeholders={
                 "modules_list": _modules_description(self._modules),
             },
+        )
+
+    async def async_step_done(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Save modules and close the options flow."""
+        new_data = {**self._config_entry.data, CONF_MODULES: self._modules}
+        self.hass.config_entries.async_update_entry(self._config_entry, data=new_data)
+        return self.async_create_entry(title="", data={})
+
+    async def async_step_change_connection(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Allow the user to change the Tigo gateway IP address and port."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            new_host = user_input[CONF_HOST].strip()
+            new_port = user_input.get(CONF_PORT, DEFAULT_PORT)
+
+            if not new_host:
+                errors[CONF_HOST] = "cannot_connect"
+            else:
+                # Warn-only connection test (same as initial setup)
+                try:
+                    await validate_connection(
+                        self.hass, {CONF_HOST: new_host, CONF_PORT: new_port}
+                    )
+                except Exception:
+                    _LOGGER.warning(
+                        "Could not connect to %s:%s — saving anyway",
+                        new_host,
+                        new_port,
+                    )
+
+                # Update entry data with new connection details
+                new_data = {**self._config_entry.data}
+                new_data[CONF_HOST] = new_host
+                new_data[CONF_PORT] = new_port
+                self.hass.config_entries.async_update_entry(
+                    self._config_entry,
+                    data=new_data,
+                    title=f"PyTap ({new_host})",
+                )
+                return await self.async_step_init()
+
+        # Pre-fill with current values
+        current_host = self._config_entry.data.get(CONF_HOST, "")
+        current_port = self._config_entry.data.get(CONF_PORT, DEFAULT_PORT)
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_HOST, default=current_host): str,
+                vol.Optional(CONF_PORT, default=current_port): int,
+            }
+        )
+
+        return self.async_show_form(
+            step_id="change_connection",
+            data_schema=schema,
+            errors=errors,
         )
 
     async def async_step_add_module(

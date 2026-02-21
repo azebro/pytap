@@ -254,30 +254,40 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _init_mappings_from_parser(self, parser: Any) -> None:
         """Pre-populate barcode/node mappings from the parser's persistent state.
 
-        Replaces existing mappings (rather than merging) so that stale entries
-        from earlier reconnection cycles or previous sessions are purged.
-        Each reconnection creates a fresh parser whose state file is the
-        ground-truth for barcode ↔ node relationships.
+        Parser state is the freshest source of truth for barcode ↔ node
+        relationships.  When the parser has a non-empty node table, its
+        mappings fully replace the coordinator's saved ones.  When the
+        parser state is empty (e.g. state file was lost or first run),
+        the coordinator's saved mappings are preserved so that barcodes
+        discovered in earlier sessions survive and can be matched
+        immediately when the user adds them as modules.
         """
         try:
             infra = parser.infrastructure
-            new_barcode_to_node: dict[str, int] = {}
-            new_node_to_barcode: dict[int, str] = {}
+            parser_barcode_to_node: dict[str, int] = {}
+            parser_node_to_barcode: dict[int, str] = {}
             for node_id, node_info in infra.get("nodes", {}).items():
                 barcode = node_info.get("barcode")
                 if barcode:
-                    new_barcode_to_node[barcode] = node_id
-                    new_node_to_barcode[node_id] = barcode
+                    parser_barcode_to_node[barcode] = node_id
+                    parser_node_to_barcode[node_id] = barcode
 
-            purged = set(self._barcode_to_node) - set(new_barcode_to_node)
-            self._barcode_to_node = new_barcode_to_node
-            self._node_to_barcode = new_node_to_barcode
-
-            if new_barcode_to_node:
+            if parser_barcode_to_node:
+                # Parser has data — use it as ground truth
+                purged = set(self._barcode_to_node) - set(parser_barcode_to_node)
+                self._barcode_to_node = parser_barcode_to_node
+                self._node_to_barcode = parser_node_to_barcode
                 _LOGGER.info(
-                    "Restored %d barcode↔node mappings from parser state" "%s",
-                    len(new_barcode_to_node),
+                    "Restored %d barcode↔node mappings from parser state%s",
+                    len(parser_barcode_to_node),
                     f" (purged {len(purged)} stale)" if purged else "",
+                )
+            else:
+                # Parser state is empty — keep coordinator-saved mappings
+                _LOGGER.info(
+                    "Parser state has no node table; keeping %d "
+                    "coordinator-saved barcode mappings as fallback",
+                    len(self._barcode_to_node),
                 )
         except Exception:
             _LOGGER.debug("Could not read parser infrastructure for pre-population")
@@ -383,14 +393,14 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         Returns True (always modifies gateway data).
         """
-        _LOGGER.warning(
+        event_barcodes = [
+            n.get("barcode", "?") for n in event.nodes.values() if n.get("barcode")
+        ]
+        _LOGGER.info(
             "Infrastructure event received: %d gateways, %d nodes (barcodes: %s)",
             len(event.gateways),
             len(event.nodes),
-            ", ".join(
-                n.get("barcode", "?") for n in event.nodes.values() if n.get("barcode")
-            )
-            or "none",
+            ", ".join(event_barcodes) or "none",
         )
 
         first_infra = not self._infra_received
@@ -402,6 +412,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Rebuild barcode ↔ node_id mappings from scratch
         new_barcode_to_node: dict[str, int] = {}
         new_node_to_barcode: dict[int, str] = {}
+        discovered_changed = False
         for node_id, node_info in event.nodes.items():
             barcode = node_info.get("barcode")
             if barcode:
@@ -412,9 +423,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if barcode not in self._configured_barcodes:
                     if barcode not in self._discovered_barcodes:
                         self._discovered_barcodes.add(barcode)
-                        self.data["discovered_barcodes"] = sorted(
-                            self._discovered_barcodes
-                        )
+                        discovered_changed = True
                         _LOGGER.info(
                             "Discovered unconfigured Tigo optimizer barcode: %s "
                             "(node=%d). Add it to your PyTap module list to "
@@ -422,6 +431,9 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             barcode,
                             node_id,
                         )
+
+        if discovered_changed:
+            self.data["discovered_barcodes"] = sorted(self._discovered_barcodes)
 
         mappings_changed = (
             new_barcode_to_node != self._barcode_to_node
@@ -440,16 +452,45 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._barcode_to_node = new_barcode_to_node
         self._node_to_barcode = new_node_to_barcode
 
+        configured_matched = set(new_barcode_to_node) & self._configured_barcodes
+        configured_missing = self._configured_barcodes - set(new_barcode_to_node)
+
         if first_infra:
-            configured_matched = set(new_barcode_to_node) & self._configured_barcodes
+            if not event_barcodes:
+                _LOGGER.info(
+                    "First infrastructure event this session — node table not "
+                    "yet received. Barcode resolution will activate once the "
+                    "gateway sends the full node table. Configured barcodes: %s",
+                    ", ".join(sorted(self._configured_barcodes)) or "none",
+                )
+            else:
+                _LOGGER.warning(
+                    "First infrastructure event this session — barcode "
+                    "resolution now active. %d/%d configured barcodes matched "
+                    "in node table.",
+                    len(configured_matched),
+                    len(self._configured_barcodes),
+                )
+                if configured_missing:
+                    _LOGGER.warning(
+                        "Configured barcodes NOT found in node table: %s. "
+                        "Check that these barcodes are correct.",
+                        ", ".join(sorted(configured_missing)),
+                    )
+        elif mappings_changed and new_barcode_to_node:
             _LOGGER.warning(
-                "First infrastructure event this session — barcode resolution "
-                "now active. %d/%d configured barcodes matched in node table.",
+                "Barcode mappings updated — %d/%d configured barcodes now "
+                "matched in node table.",
                 len(configured_matched),
                 len(self._configured_barcodes),
             )
+            if configured_missing:
+                _LOGGER.warning(
+                    "Configured barcodes still NOT found in node table: %s",
+                    ", ".join(sorted(configured_missing)),
+                )
 
-        if mappings_changed:
+        if mappings_changed or discovered_changed:
             self._schedule_save()
 
         return True
@@ -533,7 +574,15 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.hass.loop.call_soon_threadsafe(_do_schedule)
 
     def reload_modules(self, modules: list[dict[str, str]]) -> None:
-        """Reload the module configuration (called from options flow)."""
+        """Reload the module configuration (called from options flow).
+
+        After updating the allowlist, checks whether any newly-configured
+        barcodes already have a known node mapping from a previous
+        infrastructure event.  If so, a placeholder entry is created in
+        coordinator data so sensor entities can bind immediately instead
+        of waiting for the next power report.
+        """
+        old_configured = set(self._configured_barcodes)
         self._modules = modules
         self._configured_barcodes = {
             m[CONF_MODULE_BARCODE] for m in modules if m.get(CONF_MODULE_BARCODE)
@@ -541,7 +590,45 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._module_lookup = {
             m[CONF_MODULE_BARCODE]: m for m in modules if m.get(CONF_MODULE_BARCODE)
         }
+
+        newly_added = self._configured_barcodes - old_configured
+        already_resolved = newly_added & set(self._barcode_to_node)
+        not_yet_resolved = newly_added - set(self._barcode_to_node)
+
+        # Pre-populate node data for newly added barcodes that already
+        # have a known node mapping so sensors can start immediately.
+        for barcode in already_resolved:
+            if barcode not in self.data["nodes"]:
+                module_meta = self._module_lookup.get(barcode, {})
+                self.data["nodes"][barcode] = {
+                    "gateway_id": None,
+                    "node_id": self._barcode_to_node[barcode],
+                    "barcode": barcode,
+                    "name": module_meta.get(CONF_MODULE_NAME, barcode),
+                    "string": module_meta.get(CONF_MODULE_STRING, ""),
+                    "voltage_in": None,
+                    "voltage_out": None,
+                    "current_in": None,
+                    "current_out": None,
+                    "power": None,
+                    "temperature": None,
+                    "dc_dc_duty_cycle": None,
+                    "rssi": None,
+                    "last_update": None,
+                }
+
         _LOGGER.info(
             "Reloaded module config: tracking %d barcodes",
             len(self._configured_barcodes),
         )
+        if already_resolved:
+            _LOGGER.info(
+                "Newly added barcodes already resolved from saved mappings: %s",
+                ", ".join(sorted(already_resolved)),
+            )
+        if not_yet_resolved:
+            _LOGGER.info(
+                "Newly added barcodes not yet in node table (will resolve "
+                "on next infrastructure event): %s",
+                ", ".join(sorted(not_yet_resolved)),
+            )

@@ -292,9 +292,19 @@ The coordinator handles connection failures and source timeouts with automatic r
 The coordinator maintains a cumulative state dictionary. Incoming events are merged, not replaced:
 
 - **`PowerReportEvent`** — If the event's `barcode` matches a configured module, upserts into `data["nodes"][barcode]` with all power fields + `last_update` timestamp. Events for unconfigured barcodes are **discarded** (but logged at DEBUG level for discovery — see below).
-- **`InfrastructureEvent`** — Replaces `data["gateways"]` and merges node metadata (barcodes, addresses) into the barcode→node_id mapping.
+- **`InfrastructureEvent`** — Replaces `data["gateways"]` and rebuilds the barcode→node_id mapping from scratch. The first infrastructure event in a session may arrive without barcodes (gateway identity only — node table not yet received); barcode resolution activates once the gateway sends the full node table. Subsequent events log the match count and any configured barcodes not found in the node table.
 - **`TopologyEvent`** — Updates topology fields for matched nodes only.
 - **`StringEvent`** — Logged for diagnostics; not stored in entity state.
+
+#### Persistence
+
+The coordinator maintains two persistence layers:
+
+1. **Parser state file** (`<config>/.storage/pytap_<entry_id>_parser_state.json`) — Written by the parser library. Contains gateway identities, versions, and the node table (node_id → MAC address). Used to pre-populate barcode↔node mappings on reconnection.
+
+2. **Coordinator HA Store** (`<config>/.storage/pytap_<entry_id>_coordinator`) — Written by the coordinator via `homeassistant.helpers.storage.Store`. Contains barcode↔node_id mappings and discovered (unconfigured) barcodes. Saves are debounced (10s delay) to avoid excessive writes.
+
+On startup, the coordinator loads saved state from the HA Store, then attempts to merge mappings from the parser state file. Parser mappings take precedence when available; when the parser state has no node table (e.g., first run or state file lost), coordinator-saved mappings are preserved as a fallback. This ensures that barcodes discovered in previous sessions survive and can be matched immediately when the user adds them as modules.
 
 #### Barcode Filtering & Discovery Logging
 
@@ -308,7 +318,11 @@ INFO: Discovered unconfigured Tigo optimizer barcode: S-9999999Z (gateway=1, nod
 
 This approach mirrors the [taptap add-on](https://github.com/litinoveweedle/hassio-addons) pattern: users can monitor the HA log for unconfigured barcodes and add them via the Options Flow. Since barcode discovery messages (`InfrastructureEvent`) from the Tigo gateway can be infrequent (sometimes only during overnight enumeration cycles), users should allow up to 24 hours for full discovery.
 
-The coordinator also maintains a `data["discovered_barcodes"]` set of all seen-but-unconfigured barcodes, exposed via the diagnostics platform for easy lookup.
+The coordinator also maintains a `data["discovered_barcodes"]` set of all seen-but-unconfigured barcodes, persisted to the HA Store for survival across restarts. Discovered barcodes are persisted alongside barcode↔node_id mappings so that when a user later adds a previously-discovered barcode via the Options Flow, it can be resolved immediately from saved state without waiting for the next infrastructure event.
+
+#### Module Reconfiguration
+
+When the user adds or removes modules via the Options Flow, the integration reloads. On reload, the newly-created coordinator loads saved barcode↔node_id mappings from the HA Store. If a newly-added barcode already exists in the saved mappings, a placeholder entry is created in coordinator data so that sensor entities can bind immediately — no need to wait for the next power report or infrastructure event.
 
 ### 5. `sensor.py` — Sensor Platform
 
@@ -587,9 +601,9 @@ Example: `A:Panel_01:S-1234567A, A:Panel_02:S-1234568B, B:Panel_03:S-2345678C`
 Configurable at runtime without removing the integration:
 
 - **Module list** — Add or remove optimizer barcodes as the installation evolves.
+- **Connection settings** — Change the gateway host and port without reconfiguring.
 
-- **State file path** — Enable/disable persistent infrastructure state.
-- **Log unknown barcodes** — Toggle discovery logging for unconfigured nodes (default: on).
+Changes trigger a full integration reload. Previously-discovered barcode mappings are persisted and survive the reload.
 
 ---
 
@@ -597,14 +611,16 @@ Configurable at runtime without removing the integration:
 
 | Scenario | Behavior |
 |----------|----------|
-| Gateway unreachable at setup | Config flow shows "cannot_connect" error |
+| Gateway unreachable at setup | Config flow warns but proceeds (non-blocking) |
 | Connection lost mid-stream | Coordinator reconnects automatically with backoff |
 | CRC error in protocol data | Parser increments `counters["crc_errors"]`, skips frame |
 | Malformed frame (runt/giant) | Parser increments counter, resumes at next frame boundary |
+| Node table page with trailing bytes | Parser tolerates trailing bytes on sentinel (count=0) and data pages; parses the declared entries and ignores extra bytes |
 | No data for `RECONNECT_TIMEOUT` | Coordinator reconnects (stale connection detection) |
 | Node stops reporting | Entity holds last received value and remains available |
 | Barcode not yet identified | Entity stays unavailable until gateway enumeration resolves the barcode |
 | Unconfigured barcode seen | Logged at INFO level for discovery; event data discarded |
+| First infra event without node table | Logged at INFO; barcode resolution deferred until node table arrives |
 
 ---
 
@@ -614,9 +630,10 @@ Configurable at runtime without removing the integration:
 
 | Test File | Scope |
 |-----------|-------|
-| `test_config_flow.py` | Config flow form rendering, validation, error handling |
-| `test_sensor.py` | Entity creation, state updates, availability |
-| `test_coordinator.py` | Event processing, data merging, reconnection logic |
+| `test_config_flow.py` | Config flow form rendering, validation, error handling (13 tests) |
+| `test_coordinator_persistence.py` | Event processing, persistence, barcode mapping lifecycle (17 tests) |
+| `test_migration.py` | Config entry migration and legacy entity cleanup (5 tests) |
+| `test_sensor.py` | Entity creation, state updates, availability (7 tests) |
 
 ### Parser Tests (`custom_components/pytap/pytap/tests/`)
 
