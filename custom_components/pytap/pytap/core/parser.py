@@ -6,6 +6,7 @@ feed(bytes) -> list[Event] interface.
 """
 
 import logging
+import struct
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from enum import Enum, auto
@@ -54,6 +55,16 @@ class _FrameState(Enum):
 
 
 MAX_FRAME_SIZE = 256
+
+# Frame types that fire every poll cycle — suppress per-frame debug logging.
+_HIGH_FREQUENCY_FRAME_TYPES: frozenset[int] = frozenset(
+    {
+        FrameType.RECEIVE_REQUEST,
+        FrameType.RECEIVE_RESPONSE,
+        FrameType.PING_REQUEST,
+        FrameType.PING_RESPONSE,
+    }
+)
 
 # Byte unescaping map: 0x7E followed by key -> value
 _UNESCAPE_MAP: dict[int, int] = {
@@ -324,13 +335,15 @@ class Parser:
             )
             return []
 
-        logger.debug(
-            "Frame %s from gw=%d (is_from=%s, %d bytes)",
-            ft.name,
-            frame.address.gateway_id.value,
-            frame.address.is_from,
-            len(frame.payload),
-        )
+        # Only log non-routine frames; RECEIVE and PING are too frequent.
+        if ft not in _HIGH_FREQUENCY_FRAME_TYPES:
+            logger.debug(
+                "Frame %s from gw=%d (is_from=%s, %d bytes)",
+                ft.name,
+                frame.address.gateway_id.value,
+                frame.address.is_from,
+                len(frame.payload),
+            )
 
         match ft:
             case FrameType.RECEIVE_REQUEST:
@@ -752,7 +765,17 @@ class Parser:
         req_payload: bytes,
         resp_payload: bytes,
     ) -> list[Event]:
-        """Handle NODE_TABLE command pair: accumulate pages."""
+        """Handle NODE_TABLE command pair: accumulate pages.
+
+        Response payload format (verified from live captures):
+          [0:2]  start_address echo (u16 big-endian)
+          [2:4]  entries_count (u16 big-endian)
+          [4..]  entries_count × 10-byte entries:
+                   [0:8]  LongAddress (8 bytes)
+                   [8:10] NodeAddress (u16 big-endian)
+
+        An entries_count of 0 signals end-of-table.
+        """
         if len(req_payload) < 2:
             logger.warning(
                 "NODE_TABLE_REQUEST gw=%d: req_payload too short (%d bytes)",
@@ -761,23 +784,22 @@ class Parser:
             )
             return []
         start_address = NodeAddress.from_bytes(req_payload[0:2])
-        if len(resp_payload) < 1:
-            logger.warning("NODE_TABLE_RESPONSE gw=%d: resp_payload empty", gw_id)
-            return []
-        entries_count = resp_payload[0]
-        entries_data = resp_payload[1:]
 
-        # entries_count == 0 is the end-of-table sentinel; trailing bytes
-        # after the count byte are common (padding / CRC remnants) and must
-        # not be treated as corruption.
+        if len(resp_payload) < 4:
+            logger.warning(
+                "NODE_TABLE_RESPONSE gw=%d: resp_payload too short "
+                "(%d bytes, need at least 4)",
+                gw_id,
+                len(resp_payload),
+            )
+            return []
+
+        # First 2 bytes echo the requested start_address
+        resp_start = struct.unpack(">H", resp_payload[0:2])[0]
+        entries_count = struct.unpack(">H", resp_payload[2:4])[0]
+        entries_data = resp_payload[4:]
+
         if entries_count == 0:
-            if len(entries_data) > 0:
-                logger.debug(
-                    "NODE_TABLE_RESPONSE gw=%d: final page has %d trailing "
-                    "bytes (ignored)",
-                    gw_id,
-                    len(entries_data),
-                )
             entries = []
         elif len(entries_data) < entries_count * 10:
             logger.warning(
@@ -801,14 +823,28 @@ class Parser:
             entries = []
             for i in range(entries_count):
                 off = i * 10
-                node_addr = NodeAddress.from_bytes(entries_data[off : off + 2])
-                long_addr = LongAddress(entries_data[off + 2 : off + 10])
+                long_addr = LongAddress(entries_data[off : off + 8])
+                raw_node_addr = NodeAddress.from_bytes(entries_data[off + 8 : off + 10])
+                # Bit 15 of the node address is a protocol flag (e.g.
+                # router/repeater); strip it to get the real node ID
+                # so that table keys match power-report node addresses.
+                masked_value = raw_node_addr.value & 0x7FFF
+                if raw_node_addr.value != masked_value:
+                    logger.debug(
+                        "NODE_TABLE gw=%d: node address 0x%04X has bit-15 "
+                        "set, using masked value %d",
+                        gw_id,
+                        raw_node_addr.value,
+                        masked_value,
+                    )
+                node_addr = NodeAddress(masked_value)
                 entries.append((node_addr, long_addr))
 
         logger.info(
-            "NODE_TABLE page gw=%d: start_addr=%d, %d entries%s",
+            "NODE_TABLE page gw=%d: start_addr=%d (echo=%d), %d entries%s",
             gw_id,
             start_address.value,
+            resp_start,
             entries_count,
             " (final page — building table)" if entries_count == 0 else "",
         )

@@ -210,6 +210,10 @@ data_to_save = state.to_dict()
 
 `SlotClock`, `NodeTableBuilder`, and enumeration state are internal to `Parser`. The optional `PersistentState` object (gateway identities, versions, node tables) is passed at construction time and mutated in-place. The caller doesn't need to manage or understand the internal state machine.
 
+### 6. Node Address Bit-15 Masking
+
+Node addresses in `NODE_TABLE_RESPONSE` entries are 16-bit values where bit 15 is a protocol flag (indicating router/repeater status), not part of the node ID. The parser masks all node table addresses to 15 bits (`& 0x7FFF`) before storing them, so that table keys match the node IDs used in power reports. Without this masking, flagged nodes would appear with IDs like 32793 (`0x8019`) instead of the correct 25 (`0x0019`).
+
 ## Public API Surface
 
 ### `pytap.api`

@@ -255,7 +255,7 @@ These are available from `pytap.core.types` (and re-exported from `pytap`).
 |------|-------------|------|
 | `GatewayID` | Gateway link-layer identifier | 15-bit int (0–32767) |
 | `NodeID` | PV network node identifier | 16-bit int (1–65535) |
-| `NodeAddress` | PV network address (0=broadcast) | 16-bit int |
+| `NodeAddress` | PV network address (0=broadcast); bit 15 is a protocol flag masked to 15 bits in node table parsing | 16-bit int |
 | `LongAddress` | IEEE 802.15.4 hardware address | 8 bytes |
 | `SlotCounter` | Time synchronization counter | 16-bit (2-bit epoch + 14-bit slot) |
 | `PacketType` | PV application packet type | `IntEnum` |

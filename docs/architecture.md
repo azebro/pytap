@@ -624,6 +624,7 @@ Changes trigger a full integration reload. Previously-discovered barcode mapping
 | CRC error in protocol data | Parser increments `counters["crc_errors"]`, skips frame |
 | Malformed frame (runt/giant) | Parser increments counter, resumes at next frame boundary |
 | Node table page with trailing bytes | Parser tolerates trailing bytes on sentinel (count=0) and data pages; parses the declared entries and ignores extra bytes |
+| Node address with bit-15 flag set | Parser masks node addresses to 15 bits (`& 0x7FFF`) when parsing node table entries; bit 15 is a protocol flag (router/repeater) not part of the node ID |
 | No data for `RECONNECT_TIMEOUT` | Coordinator reconnects (stale connection detection) |
 | Node stops reporting | Entity holds last received value and remains available |
 | Barcode not yet identified | Entity stays unavailable until gateway enumeration resolves the barcode |
