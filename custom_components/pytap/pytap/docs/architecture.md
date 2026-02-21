@@ -4,36 +4,27 @@
 
 `pytap` is a simplified, flat-architecture Python implementation of the TapTap protocol for passive monitoring of Tigo TAP solar energy systems. Unlike the layered `python/taptap` port (which mirrors the Rust crate's sink-chain design), `pytap` collapses the entire protocol stack into a single-pass pipeline that converts raw bytes directly into final parsed events.
 
-The primary design goal is **ease of integration**: the full parsing functionality lives in a library module that can be called programmatically, with the CLI being a thin, replaceable wrapper.
+The primary design goal is **ease of integration**: the full parsing functionality lives in a library module that can be called programmatically. The library has no file I/O — persistence is handled externally by the caller (e.g., the HA coordinator).
 
 ## Comparison with `python/taptap`
 
 | Aspect | `python/taptap` | `pytap` |
 |--------|-----------------|---------|
 | Architecture | Layered sink-chain (5 layers, 3 Sink protocols) | Flat pipeline, single `Parser` class |
-| Module count | ~25 files across 8 packages | ~8 files in 3 packages |
-| Integration | Requires wiring 4 receivers + observer | Single `pytap.parse(source)` call |
+| Module count | ~25 files across 8 packages | ~8 files in 2 packages |
+| Integration | Requires wiring 4 receivers + observer | Single `pytap.create_parser()` call |
 | Extensibility | Add new Sink implementations | Subclass or compose `Parser` |
-| CLI coupling | Click commands directly build pipeline | CLI imports and calls `pytap.api` |
-| Output | JSON to stdout only | Returns Python objects; CLI serializes |
+| Output | JSON to stdout only | Returns Python objects; caller serializes |
 
 ## Architecture Overview
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  CLI  (pytap.cli)                                   │
-│  Thin wrapper: argument parsing, I/O, JSON output   │
-│  Replaceable with any caller of pytap.api           │
-└──────────────────────┬──────────────────────────────┘
-                       │ calls
-                       ▼
-┌─────────────────────────────────────────────────────┐
 │  Public API  (pytap.api)                            │
 │                                                     │
 │  connect(source_config) → Connection                │
 │  parse_bytes(data) → list[Event]                    │
-│  observe(source_config, callback) → None            │
-│  create_parser() → Parser                           │
+│  create_parser(persistent_state) → Parser            │
 └──────────────────────┬──────────────────────────────┘
                        │ uses
                        ▼
@@ -95,12 +86,9 @@ pytap/
 │   ├── events.py            # Event dataclasses
 │   ├── parser.py            # The single Parser class
 │   ├── source.py            # SerialSource, TcpSource
-│   ├── state.py             # SlotClock, NodeTable, PersistentState
+│   ├── state.py             # SlotClock, NodeTableBuilder, PersistentState
 │   ├── crc.py               # CRC-16-CCITT calculation
 │   └── barcode.py           # Tigo barcode encoding/decoding
-├── cli/
-│   ├── __init__.py
-│   └── main.py              # Click CLI (thin wrapper)
 ├── docs/
 │   ├── architecture.md      # This file
 │   └── api_reference.md     # Public API documentation
@@ -200,92 +188,57 @@ All protocol types (`GatewayID`, `NodeID`, `LongAddress`, `SlotCounter`, `Packet
 
 This means users import `from pytap.core.types import GatewayID` rather than needing to know which protocol layer a type belongs to.
 
-### 4. CLI as Thin Wrapper
+### 4. Caller-Owned Persistence
 
-The CLI module only handles:
-- Argument parsing (click)
-- Source construction (serial/TCP config)
-- JSON serialization of events to stdout
-- Reconnection loop with retry logic
-
-All protocol logic lives in `pytap.core` and `pytap.api`, making it trivial to replace the CLI with a function call:
-
-```python
-# CLI usage
-# $ pytap observe --tcp 192.168.1.100
-
-# Equivalent programmatic usage
-from pytap.api import observe
-
-def my_callback(event):
-    store_in_database(event)
-
-observe(
-    source_config={"tcp": "192.168.1.100", "port": 502},
-    callback=my_callback
-)
-```
-
-Or for finer control:
+The parser accepts an optional `PersistentState` object and mutates it in memory as infrastructure events are detected. The caller (e.g., the HA coordinator) owns serialization and storage. This keeps the library free of file I/O dependencies and allows any storage backend:
 
 ```python
 from pytap.api import create_parser
+from pytap import PersistentState
 
-parser = create_parser()
-events = parser.feed(raw_bytes)
-for event in events:
-    process(event)
+# Restore state from your storage
+state = PersistentState.from_dict(saved_data)
+parser = create_parser(persistent_state=state)
+
+# ... use parser ...
+
+# Save state
+data_to_save = state.to_dict()
 ```
 
 ### 5. State Management Inside Parser
 
-`SlotClock`, `NodeTable`, and enumeration state are internal to `Parser`. Persistent state (optional) is configured at `Parser` construction time. The caller doesn't need to manage or understand these.
+`SlotClock`, `NodeTableBuilder`, and enumeration state are internal to `Parser`. The optional `PersistentState` object (gateway identities, versions, node tables) is passed at construction time and mutated in-place. The caller doesn't need to manage or understand the internal state machine.
+
+### 6. Node Address Bit-15 Masking
+
+Node addresses in `NODE_TABLE_RESPONSE` entries are 16-bit values where bit 15 is a protocol flag (indicating router/repeater status), not part of the node ID. The parser masks all node table addresses to 15 bits (`& 0x7FFF`) before storing them, so that table keys match the node IDs used in power reports. Without this masking, flagged nodes would appear with IDs like 32793 (`0x8019`) instead of the correct 25 (`0x0019`).
 
 ## Public API Surface
 
 ### `pytap.api`
 
 ```python
-def create_parser(state_file: str | Path | None = None) -> Parser:
+def create_parser(persistent_state: Optional[PersistentState] = None) -> Parser:
     """Create a new protocol parser.
-    
+
     Args:
-        state_file: Optional path for persistent infrastructure state.
-        
+        persistent_state: Optional PersistentState object for infrastructure
+            state. The parser mutates it in memory; caller owns persistence.
+
     Returns:
         A Parser instance ready to receive bytes via feed().
     """
 
-def parse_bytes(data: bytes, state_file: str | Path | None = None) -> list[Event]:
+def parse_bytes(data: bytes) -> list[Event]:
     """One-shot parse: create a parser, feed bytes, return events.
-    
-    Convenience for non-streaming use (e.g., parsing captured files).
-    """
 
-def observe(
-    source_config: dict,
-    callback: Callable[[Event], None],
-    state_file: str | Path | None = None,
-    reconnect_timeout: int = 60,
-    reconnect_retries: int = 0,
-    reconnect_delay: int = 5,
-) -> None:
-    """Connect to a source and stream parsed events to callback.
-    
-    Runs a blocking read loop with auto-reconnection.
-    
-    Args:
-        source_config: {"tcp": "host", "port": 502} or {"serial": "/dev/ttyUSB0"}
-        callback: Called with each Event as it is parsed.
-        state_file: Optional persistent state file path.
-        reconnect_timeout: Seconds of silence before reconnecting (0=disabled).
-        reconnect_retries: Max reconnection attempts (0=infinite).
-        reconnect_delay: Seconds between reconnect attempts.
+    Convenience for non-streaming use (e.g., parsing captured files).
     """
 
 def connect(source_config: dict) -> Source:
     """Create and open a byte source (serial or TCP).
-    
+
     Returns a Source with a read() method for manual feeding into a Parser.
     """
 ```
@@ -294,20 +247,20 @@ def connect(source_config: dict) -> Source:
 
 ```python
 class Parser:
-    def __init__(self, state_file: str | Path | None = None):
-        """Initialize parser with optional persistent state."""
-    
+    def __init__(self, persistent_state: Optional[PersistentState] = None):
+        """Initialize parser with optional persistent infrastructure state."""
+
     def feed(self, data: bytes) -> list[Event]:
         """Feed raw bytes and return any events parsed from them.
-        
+
         Can be called incrementally — the parser maintains internal state
         across calls for partial frames.
         """
-    
+
     @property
     def infrastructure(self) -> dict:
         """Current known infrastructure: gateways, nodes, barcodes."""
-    
+
     @property
     def counters(self) -> dict:
         """Parse statistics: frames, CRC errors, runts, etc."""
@@ -363,7 +316,7 @@ class StringEvent(Event):
 
 ### Phase 1 — Core Types & CRC (foundation)
 - [ ] `pytap/core/types.py` — All protocol types as dataclasses/NamedTuples
-- [ ] `pytap/core/crc.py` — CRC-16-CCITT (port from `python/taptap`)  
+- [ ] `pytap/core/crc.py` — CRC-16-CCITT (port from `python/taptap`)
 - [ ] `pytap/core/barcode.py` — Barcode encode/decode
 - [ ] Tests for types, CRC, barcode
 
@@ -402,9 +355,9 @@ class StringEvent(Event):
 
 Tests reuse captured protocol data from the Rust implementation (`src/test_data.rs`) to validate byte-level correctness. Each phase includes tests:
 
-1. **Unit**: CRC values, barcode encoding, type construction  
-2. **Parser**: Feed known byte sequences, assert expected events  
-3. **Integration**: Full `observe()` with recorded data, assert JSON output  
+1. **Unit**: CRC values, barcode encoding, type construction
+2. **Parser**: Feed known byte sequences, assert expected events
+3. **Integration**: Full parse pipeline with recorded data, assert correct events
 4. **Regression**: Edge cases from `python/taptap` test suite
 
 ## Dependencies
@@ -412,7 +365,5 @@ Tests reuse captured protocol data from the Rust implementation (`src/test_data.
 | Package | Purpose | Required |
 |---------|---------|----------|
 | `pyserial` | Serial port access | Optional (serial sources only) |
-| `click` | CLI argument parsing | Optional (CLI only) |
-| `dataclasses-json` | JSON serialization of events | Yes |
 
 Zero required dependencies for the core parser — it uses only the Python standard library.

@@ -1,8 +1,8 @@
 # pytap Implementation Plan
 
-> **Target audience:** Developer implementing pytap from scratch.  
-> **Reference code:** `python/taptap/` (layered port) and `src/` (Rust original).  
-> **Architecture doc:** `pytap/docs/architecture.md`  
+> **Target audience:** Developer implementing pytap from scratch.
+> **Reference code:** `python/taptap/` (layered port) and `src/` (Rust original).
+> **Architecture doc:** `pytap/docs/architecture.md`
 > **API reference:** `pytap/docs/api_reference.md`
 
 ---
@@ -103,8 +103,8 @@ pytest --co  # should discover 0 tests, no import errors
 
 ## 2. Phase 1 — CRC Module
 
-**File:** `pytap/core/crc.py`  
-**Reference:** `python/taptap/gateway/link/crc.py`  
+**File:** `pytap/core/crc.py`
+**Reference:** `python/taptap/gateway/link/crc.py`
 **Depends on:** nothing
 
 ### 2.1 Specification
@@ -186,8 +186,8 @@ Write these exact test vectors:
 
 ## 3. Phase 2 — Barcode Module
 
-**File:** `pytap/core/barcode.py`  
-**Reference:** `python/taptap/barcode.py`  
+**File:** `pytap/core/barcode.py`
+**Reference:** `python/taptap/barcode.py`
 **Depends on:** nothing
 
 ### 3.1 Specification
@@ -272,8 +272,8 @@ Output: 8-byte address, or error
 
 ## 4. Phase 3 — Protocol Types
 
-**File:** `pytap/core/types.py`  
-**Reference:** Multiple files from `python/taptap/gateway/link/`, `python/taptap/pv/`  
+**File:** `pytap/core/types.py`
+**Reference:** Multiple files from `python/taptap/gateway/link/`, `python/taptap/pv/`
 **Depends on:** nothing
 
 ### 4.1 All Types to Implement
@@ -574,8 +574,8 @@ class NodeInfo:
 
 ## 5. Phase 4 — Event Types
 
-**File:** `pytap/core/events.py`  
-**Reference:** `python/taptap/observer/event.py`  
+**File:** `pytap/core/events.py`
+**Reference:** `python/taptap/observer/event.py`
 **Depends on:** `types.py`
 
 ### 5.1 Implementation
@@ -683,8 +683,8 @@ class StringEvent(Event):
 
 ## 6. Phase 5 — State Management
 
-**File:** `pytap/core/state.py`  
-**Reference:** `python/taptap/observer/slot_clock.py`, `persistent_state.py`, `node_table.py`  
+**File:** `pytap/core/state.py`
+**Reference:** `python/taptap/observer/slot_clock.py`, `persistent_state.py`, `node_table.py`
 **Depends on:** `types.py`
 
 ### 6.1 SlotClock
@@ -827,8 +827,8 @@ class PersistentState:
 
 ## 7. Phase 6 — Parser Core
 
-**File:** `pytap/core/parser.py`  
-**Reference:** entire `python/taptap/gateway/` + `pv/` + `observer/` chain  
+**File:** `pytap/core/parser.py`
+**Reference:** entire `python/taptap/gateway/` + `pv/` + `observer/` chain
 **Depends on:** `crc.py`, `types.py`, `events.py`, `state.py`, `barcode.py`
 
 This is the largest and most complex phase. It consolidates 4 Receiver classes and the Observer into one.
@@ -1190,14 +1190,18 @@ return [TopologyEvent(gateway_id=gw_id, node_id=node_id, data=data,
 
 ```
 1. start_address = NodeAddress.from_bytes(req_payload[0:2])
-2. entries_count = resp_payload[0]
-3. entries_data = resp_payload[1:]
-4. if len(entries_data) != entries_count * 10: return []   # corrupt
-5. entries = []
+2. resp_start = struct.unpack(">H", resp_payload[0:2])  # echoed start_address
+3. entries_count = struct.unpack(">H", resp_payload[2:4])  # u16 big-endian
+4. entries_data = resp_payload[4:]
+5. if len(entries_data) < entries_count * 10: return []   # corrupt
+6. entries = []
    for i in range(entries_count):
        off = i * 10
-       node_addr = NodeAddress.from_bytes(entries_data[off:off+2])
-       long_addr = LongAddress(entries_data[off+2:off+10])
+       long_addr = LongAddress(entries_data[off:off+8])
+       raw_node_addr = NodeAddress.from_bytes(entries_data[off+8:off+10])
+       # Bit 15 is a protocol flag (router/repeater); mask to 15-bit node ID
+       masked_value = raw_node_addr.value & 0x7FFF
+       node_addr = NodeAddress(masked_value)
        entries.append((node_addr, long_addr))
 6. builder = self._node_table_builders.setdefault(gw_id, NodeTableBuilder())
 7. result = builder.push(start_address, entries)
@@ -1367,7 +1371,7 @@ Feed a frame with >256 body bytes → increment giants counter, no crash.
 
 ## 8. Phase 7 — Data Sources
 
-**File:** `pytap/core/source.py`  
+**File:** `pytap/core/source.py`
 **Depends on:** nothing (uses standard library + optional `pyserial`)
 
 ### 8.1 TcpSource
@@ -1438,7 +1442,7 @@ class SerialSource:
 
 ## 9. Phase 8 — Public API
 
-**File:** `pytap/api.py`  
+**File:** `pytap/api.py`
 **Depends on:** `parser.py`, `source.py`
 
 ### 9.1 Implementation
@@ -1565,7 +1569,7 @@ __all__ = [
 
 ## 10. Phase 9 — CLI
 
-**File:** `pytap/cli/main.py`  
+**File:** `pytap/cli/main.py`
 **Depends on:** `pytap.api`
 
 ### 10.1 Implementation
@@ -1789,10 +1793,11 @@ Data:
 ### Node Table Response
 
 ```
-[0]    entries_count (u8)
-[1..]  entries_count × 10-byte entries:
-         [0-1] NodeAddress (u16 big-endian)
-         [2-9] LongAddress (8 bytes)
+[0-1]  start_address echo (u16 big-endian, echoed from request)
+[2-3]  entries_count (u16 big-endian; 0 = end-of-table sentinel)
+[4..]  entries_count × 10-byte entries:
+         [0-7] LongAddress (8 bytes)
+         [8-9] NodeAddress (u16 big-endian)
 ```
 
 ---

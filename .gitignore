@@ -50,3 +50,6 @@ docker-compose.override.yml
 # Jupyter Notebooks
 *.ipynb_checkpoints/
 *-checkpoint.ipynb
+
+# Deploy credentials
+deploy/.deploy.env

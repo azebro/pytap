@@ -10,10 +10,11 @@ A Home Assistant custom component for monitoring **Tigo TAP solar energy systems
 ## Features
 
 - **Real-time streaming** — Push-based data delivery with sub-second latency (no polling).
-- **Per-optimizer sensors** — 7 sensor entities per Tigo TS4 module: power, voltage in/out, current, temperature, DC-DC duty cycle, and RSSI.
+- **Per-optimizer sensors** — 8 sensor entities per Tigo TS4 module: power, voltage in/out, current in/out, temperature, DC-DC duty cycle, and RSSI.
 - **Menu-driven setup** — Add optimizer modules one at a time with guided form fields.
 - **Barcode-based identification** — Stable hardware barcodes as entity identifiers (survives gateway restarts).
 - **Discovery logging** — Unconfigured barcodes seen on the bus are logged for easy identification.
+- **Persistent barcode mapping** — Discovered barcodes and node mappings are saved across restarts. When you add a previously-discovered barcode, it resolves instantly without waiting for the next gateway enumeration.
 - **No external dependencies** — The protocol parser library is fully embedded; nothing to install from PyPI.
 - **Options flow** — Add or remove optimizer modules at any time without reconfiguring.
 
@@ -26,7 +27,8 @@ Each configured Tigo TS4 optimizer exposes the following sensors:
 | Power | W | `power` |
 | Voltage In | V | `voltage` |
 | Voltage Out | V | `voltage` |
-| Current | A | `current` |
+| Current In | A | `current` |
+| Current Out | A | `current` |
 | Temperature | °C | `temperature` |
 | DC-DC Duty Cycle | % | — |
 | RSSI | dBm | `signal_strength` |
@@ -85,7 +87,8 @@ Check your Home Assistant logs after the gateway has been running for a while (u
 
 Go to **Settings → Devices & Services → PyTap → Configure** to:
 
-- **Add** new optimizer modules.
+- **Change connection** — Update the gateway IP address and port.
+- **Add** new optimizer modules (if the barcode was previously seen on the bus, it resolves instantly).
 - **Remove** modules you no longer want to track.
 - **Save and close** to apply changes.
 
@@ -128,11 +131,14 @@ pytap/
 │   ├── config_flow.py           # Config & options flows
 │   ├── const.py                 # Constants
 │   ├── coordinator.py           # Push-based data coordinator
-│   ├── sensor.py                # Sensor platform (7 entity types)
+│   ├── sensor.py                # Sensor platform (8 entity types)
 │   ├── manifest.json            # Integration metadata
 │   ├── strings.json             # UI strings
 │   ├── translations/en.json     # English translations
 │   └── pytap/                   # Embedded protocol parser library
+├── deploy/                      # Deployment tooling
+│   ├── deploy.sh                # Deploy script (SSH-based)
+│   └── .deploy.env.example      # Example credentials config
 ├── tests/                       # Integration tests
 ├── docs/
 │   ├── architecture.md          # Architecture & design document
@@ -163,6 +169,37 @@ python3 -m pytest custom_components/pytap/pytap/tests/ -vv
 ```bash
 python3 -m ruff check custom_components/pytap/
 ```
+
+### Deploying to a Home Assistant Instance
+
+A deployment script is provided in `deploy/` to push the component to a remote HA OS installation via SSH.
+
+**Setup:**
+
+```bash
+# Copy the example config and fill in your credentials
+cp deploy/.deploy.env.example deploy/.deploy.env
+# Edit deploy/.deploy.env with your host, username, and password
+```
+
+> **Note:** `deploy/.deploy.env` is gitignored — credentials are never committed.
+
+**Deploy:**
+
+```bash
+# Using the config file
+./deploy/deploy.sh
+
+# Or pass credentials directly
+./deploy/deploy.sh --host 192.168.1.184 --user adam --password 'yourpass'
+
+# Deploy without restarting HA
+./deploy/deploy.sh --no-restart
+```
+
+The script uploads the component via tar-over-SSH (compatible with HA OS SSH add-on), verifies the deployment, and optionally restarts Home Assistant Core.
+
+Run `./deploy/deploy.sh --help` for all options.
 
 ### Documentation
 

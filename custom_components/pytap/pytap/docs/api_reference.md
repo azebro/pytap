@@ -5,8 +5,9 @@
 ### Top-Level Imports
 
 ```python
-from pytap import create_parser, parse_bytes, observe, connect
+from pytap import create_parser, parse_bytes, connect
 from pytap import Parser, Event, PowerReportEvent, InfrastructureEvent
+from pytap import PersistentState
 ```
 
 All public symbols are re-exported from `pytap.__init__`.
@@ -18,13 +19,13 @@ All public symbols are re-exported from `pytap.__init__`.
 ### `create_parser`
 
 ```python
-pytap.create_parser(state_file: str | Path | None = None) -> Parser
+pytap.create_parser(persistent_state: Optional[PersistentState] = None) -> Parser
 ```
 
 Create a new protocol parser instance.
 
 **Parameters:**
-- `state_file` — Optional filesystem path. If provided, the parser loads previously-saved infrastructure state on creation and writes updates atomically when infrastructure changes are detected.
+- `persistent_state` — Optional `PersistentState` object. If provided, the parser uses this for infrastructure state (gateway identities, versions, node tables). The parser mutates the state in memory; the caller owns persistence (e.g., via `to_dict()` / `from_dict()`).
 
 **Returns:** A `Parser` ready to accept bytes via `feed()`.
 
@@ -39,7 +40,7 @@ events = parser.feed(some_bytes)
 ### `parse_bytes`
 
 ```python
-pytap.parse_bytes(data: bytes, state_file: str | Path | None = None) -> list[Event]
+pytap.parse_bytes(data: bytes) -> list[Event]
 ```
 
 One-shot convenience: creates a parser, feeds the entire byte buffer, and returns all parsed events.
@@ -48,7 +49,6 @@ Suitable for batch processing of captured data. For streaming use, prefer `creat
 
 **Parameters:**
 - `data` — Raw bytes from the RS-485 bus or a capture file.
-- `state_file` — Optional persistent state file path.
 
 **Returns:** List of all events found in `data`.
 
@@ -58,46 +58,6 @@ with open("capture.bin", "rb") as f:
     events = pytap.parse_bytes(f.read())
 for e in events:
     print(e)
-```
-
----
-
-### `observe`
-
-```python
-pytap.observe(
-    source_config: dict,
-    callback: Callable[[Event], None],
-    state_file: str | Path | None = None,
-    reconnect_timeout: int = 60,
-    reconnect_retries: int = 0,
-    reconnect_delay: int = 5,
-) -> None
-```
-
-Connect to a live data source and stream parsed events to a callback. Runs a blocking loop with automatic reconnection.
-
-**Parameters:**
-- `source_config` — Connection parameters:
-  - TCP: `{"tcp": "192.168.1.100", "port": 502}`
-  - Serial: `{"serial": "/dev/ttyUSB0"}` or `{"serial": "COM3"}`
-- `callback` — Called with each `Event` as it is parsed. Exceptions in the callback propagate to the caller.
-- `state_file` — Optional persistent state file.
-- `reconnect_timeout` — Seconds of silence before reconnecting. `0` disables timeout.
-- `reconnect_retries` — Maximum reconnection attempts. `0` means infinite.
-- `reconnect_delay` — Seconds to wait between reconnection attempts.
-
-**Example:**
-```python
-import json
-
-def handle(event):
-    print(json.dumps(event.to_dict()))
-
-pytap.observe(
-    source_config={"tcp": "192.168.1.100"},
-    callback=handle,
-)
 ```
 
 ---
@@ -132,10 +92,12 @@ while True:
 ### `Parser`
 
 ```python
-class pytap.Parser(state_file: str | Path | None = None)
+class pytap.Parser(persistent_state: Optional[PersistentState] = None)
 ```
 
 The core protocol parser. Maintains internal state for frame assembly, transport correlation, slot clock synchronization, and infrastructure tracking across incremental `feed()` calls.
+
+The parser accepts an optional `PersistentState` object which it mutates in memory as infrastructure events are detected. The caller owns persistence (serialization/deserialization).
 
 #### Methods
 
@@ -293,7 +255,7 @@ These are available from `pytap.core.types` (and re-exported from `pytap`).
 |------|-------------|------|
 | `GatewayID` | Gateway link-layer identifier | 15-bit int (0–32767) |
 | `NodeID` | PV network node identifier | 16-bit int (1–65535) |
-| `NodeAddress` | PV network address (0=broadcast) | 16-bit int |
+| `NodeAddress` | PV network address (0=broadcast); bit 15 is a protocol flag masked to 15 bits in node table parsing | 16-bit int |
 | `LongAddress` | IEEE 802.15.4 hardware address | 8 bytes |
 | `SlotCounter` | Time synchronization counter | 16-bit (2-bit epoch + 14-bit slot) |
 | `PacketType` | PV application packet type | `IntEnum` |
@@ -301,35 +263,3 @@ These are available from `pytap.core.types` (and re-exported from `pytap`).
 | `Barcode` | Tigo device barcode (`X-NNNNNNNC`) | string |
 | `GatewayInfo` | Gateway address + version | dataclass |
 | `NodeInfo` | Node address + barcode | dataclass |
-
----
-
-## CLI
-
-The CLI is a thin wrapper. It parses arguments, calls `pytap.api`, and serializes output.
-
-```
-Usage: pytap [OPTIONS] COMMAND [ARGS]...
-
-Commands:
-  observe             Stream parsed events as JSON
-  peek-bytes          Show raw hex from the bus
-  list-serial-ports   List available serial ports
-```
-
-### `pytap observe`
-
-```
-Usage: pytap observe [OPTIONS]
-
-Options:
-  --tcp TEXT              TCP host (e.g. 192.168.1.100)
-  --port INTEGER         TCP port [default: 502]
-  --serial TEXT           Serial port (e.g. /dev/ttyUSB0, COM3)
-  --state-file PATH      Persistent state JSON file
-  --reconnect-timeout INT  Silence timeout in seconds [default: 60]
-  --reconnect-retries INT  Max retries, 0=infinite [default: 0]
-  --reconnect-delay INT    Delay between retries [default: 5]
-```
-
-Output: one JSON object per line to stdout.
