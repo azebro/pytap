@@ -83,14 +83,20 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._barcode_to_node: dict[str, int] = {}
         self._node_to_barcode: dict[int, str] = {}
 
-        # Whether the current session has received its first InfrastructureEvent.
-        # Until it arrives, stale mappings from the previous session may be
-        # incorrect (node-ID reassignment overnight) so fallback resolution
-        # is suppressed to avoid mis-routing power reports.
+        # Whether the current session has received an InfrastructureEvent
+        # that includes a non-empty node table.  Until a node table arrives,
+        # stale mappings from the previous session may be incorrect (node-ID
+        # reassignment overnight) so fallback resolution is suppressed to
+        # avoid mis-routing power reports.
         self._infra_received: bool = False
 
         # Track barcodes seen on the bus but not in user config
         self._discovered_barcodes: set[str] = set()
+
+        # Counter for power reports dropped because barcode could not be
+        # resolved.  Used to emit periodic INFO-level messages so operators
+        # know data IS flowing but resolution is blocked.
+        self._pending_power_reports: int = 0
 
         # Listener task handle
         self._listener_task: asyncio.Task | None = None
@@ -318,9 +324,10 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         barcode = event.barcode
 
         # Try to resolve barcode from node_id via the coordinator mapping.
-        # Only use the fallback after the *current* session has received its
-        # first InfrastructureEvent — before that, the mapping may contain
-        # stale entries from a previous session where node-IDs differed.
+        # Only use the fallback after the *current* session has received an
+        # InfrastructureEvent with a non-empty node table — before that,
+        # the mapping may contain stale entries from a previous session
+        # where node-IDs differed.
         if (
             not barcode
             and self._infra_received
@@ -329,13 +336,31 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             barcode = self._node_to_barcode[event.node_id]
 
         if not barcode:
+            self._pending_power_reports += 1
             if not self._infra_received:
-                _LOGGER.debug(
-                    "Power report for node %d deferred — waiting for first "
-                    "infrastructure event this session (gateway=%d)",
-                    event.node_id,
-                    event.gateway_id,
-                )
+                # Log at INFO every 50 reports so operator sees data is flowing
+                if self._pending_power_reports == 1:
+                    _LOGGER.info(
+                        "Power report for node %d — waiting for node table "
+                        "before barcode resolution (gateway=%d)",
+                        event.node_id,
+                        event.gateway_id,
+                    )
+                elif self._pending_power_reports % 50 == 0:
+                    _LOGGER.info(
+                        "%d power reports received but barcode resolution "
+                        "still pending — waiting for gateway to send "
+                        "the full node table",
+                        self._pending_power_reports,
+                    )
+                else:
+                    _LOGGER.debug(
+                        "Power report for node %d deferred — waiting for "
+                        "node table (gateway=%d) [%d pending]",
+                        event.node_id,
+                        event.gateway_id,
+                        self._pending_power_reports,
+                    )
             else:
                 _LOGGER.debug(
                     "Power report for node %d with no barcode yet (gateway=%d)",
@@ -396,6 +421,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         event_barcodes = [
             n.get("barcode", "?") for n in event.nodes.values() if n.get("barcode")
         ]
+        has_nodes = bool(event.nodes)
         _LOGGER.info(
             "Infrastructure event received: %d gateways, %d nodes (barcodes: %s)",
             len(event.gateways),
@@ -403,8 +429,13 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ", ".join(event_barcodes) or "none",
         )
 
-        first_infra = not self._infra_received
-        self._infra_received = True
+        # Only treat _infra_received as True once we have an event that
+        # actually contains a node table.  Gateway-only events (0 nodes)
+        # arrive early in the session before the gateway has sent the
+        # full node table, and should not be treated as authoritative.
+        first_infra_with_nodes = not self._infra_received and has_nodes
+        if has_nodes:
+            self._infra_received = True
 
         # Update gateways
         self.data["gateways"] = event.gateways
@@ -435,6 +466,20 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if discovered_changed:
             self.data["discovered_barcodes"] = sorted(self._discovered_barcodes)
 
+        # When the event has no nodes, preserve existing coordinator
+        # mappings — they may have been loaded from saved state and are
+        # better than nothing until a real node table replaces them.
+        if not has_nodes:
+            _LOGGER.info(
+                "Infrastructure event has no node table — keeping %d "
+                "existing barcode mappings as fallback",
+                len(self._barcode_to_node),
+            )
+            # Still schedule a save for gateway data changes
+            if event.gateways:
+                self._schedule_save()
+            return True
+
         mappings_changed = (
             new_barcode_to_node != self._barcode_to_node
             or new_node_to_barcode != self._node_to_barcode
@@ -452,31 +497,32 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._barcode_to_node = new_barcode_to_node
         self._node_to_barcode = new_node_to_barcode
 
+        # Reset pending counter now that resolution is possible
+        if self._pending_power_reports > 0:
+            _LOGGER.info(
+                "Node table received — %d power reports were pending "
+                "barcode resolution",
+                self._pending_power_reports,
+            )
+            self._pending_power_reports = 0
+
         configured_matched = set(new_barcode_to_node) & self._configured_barcodes
         configured_missing = self._configured_barcodes - set(new_barcode_to_node)
 
-        if first_infra:
-            if not event_barcodes:
-                _LOGGER.info(
-                    "First infrastructure event this session — node table not "
-                    "yet received. Barcode resolution will activate once the "
-                    "gateway sends the full node table. Configured barcodes: %s",
-                    ", ".join(sorted(self._configured_barcodes)) or "none",
-                )
-            else:
+        if first_infra_with_nodes:
+            _LOGGER.warning(
+                "First node table this session — barcode "
+                "resolution now active. %d/%d configured barcodes matched "
+                "in node table.",
+                len(configured_matched),
+                len(self._configured_barcodes),
+            )
+            if configured_missing:
                 _LOGGER.warning(
-                    "First infrastructure event this session — barcode "
-                    "resolution now active. %d/%d configured barcodes matched "
-                    "in node table.",
-                    len(configured_matched),
-                    len(self._configured_barcodes),
+                    "Configured barcodes NOT found in node table: %s. "
+                    "Check that these barcodes are correct.",
+                    ", ".join(sorted(configured_missing)),
                 )
-                if configured_missing:
-                    _LOGGER.warning(
-                        "Configured barcodes NOT found in node table: %s. "
-                        "Check that these barcodes are correct.",
-                        ", ".join(sorted(configured_missing)),
-                    )
         elif mappings_changed and new_barcode_to_node:
             _LOGGER.warning(
                 "Barcode mappings updated — %d/%d configured barcodes now "
