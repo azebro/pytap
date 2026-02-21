@@ -21,7 +21,10 @@ from custom_components.pytap.const import (
     DOMAIN,
 )
 from custom_components.pytap.coordinator import PyTapDataUpdateCoordinator
-from custom_components.pytap.pytap.core.events import InfrastructureEvent
+from custom_components.pytap.pytap.core.events import (
+    InfrastructureEvent,
+    PowerReportEvent,
+)
 
 
 MOCK_MODULES = [
@@ -178,7 +181,7 @@ class TestSaveCoordinatorState:
 
 
 class TestInitMappingsFromParser:
-    """Test _init_mappings_from_parser pre-populates coordinator maps."""
+    """Test _init_mappings_from_parser replaces coordinator maps."""
 
     def test_populates_from_parser_infrastructure(self, hass: HomeAssistant) -> None:
         """Mappings should be populated from parser.infrastructure."""
@@ -204,6 +207,31 @@ class TestInitMappingsFromParser:
             10: "A-1234567B",
             20: "C-2345678D",
         }
+
+    def test_replaces_stale_mappings(self, hass: HomeAssistant) -> None:
+        """Old stale entries should be purged when parser state replaces them."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+
+        # Pre-populate with stale mappings from a previous session
+        coordinator._barcode_to_node = {"OLD-BARCODE": 99, "A-1234567B": 5}
+        coordinator._node_to_barcode = {99: "OLD-BARCODE", 5: "A-1234567B"}
+
+        mock_parser = MagicMock()
+        mock_parser.infrastructure = {
+            "gateways": {},
+            "nodes": {
+                10: {"address": "11:22:33:44", "barcode": "A-1234567B"},
+            },
+        }
+
+        coordinator._init_mappings_from_parser(mock_parser)
+
+        # Stale "OLD-BARCODE" and old node_id 5 should be gone
+        assert coordinator._barcode_to_node == {"A-1234567B": 10}
+        assert coordinator._node_to_barcode == {10: "A-1234567B"}
+        assert "OLD-BARCODE" not in coordinator._barcode_to_node
+        assert 99 not in coordinator._node_to_barcode
 
     def test_handles_empty_infrastructure(self, hass: HomeAssistant) -> None:
         """Should handle parser with no nodes gracefully."""
@@ -291,6 +319,167 @@ class TestInfrastructureEventTriggersSave:
         coordinator._handle_infrastructure(event)
 
         coordinator._schedule_save.assert_not_called()
+
+    def test_stale_mappings_purged_on_infrastructure(self, hass: HomeAssistant) -> None:
+        """Stale node mappings must be removed when infrastructure rebuilds."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+
+        # Simulate stale mappings from a prior session
+        coordinator._barcode_to_node = {
+            "A-1234567B": 10,
+            "STALE-BARCODE": 99,
+        }
+        coordinator._node_to_barcode = {
+            10: "A-1234567B",
+            99: "STALE-BARCODE",
+        }
+        coordinator._schedule_save = MagicMock()
+
+        # Infrastructure event only has node 10 — node 99 is gone
+        event = InfrastructureEvent(
+            gateways={},
+            nodes={10: {"address": "11:22:33:44", "barcode": "A-1234567B"}},
+            timestamp=datetime.now(),
+        )
+
+        coordinator._handle_infrastructure(event)
+
+        assert coordinator._barcode_to_node == {"A-1234567B": 10}
+        assert coordinator._node_to_barcode == {10: "A-1234567B"}
+        assert "STALE-BARCODE" not in coordinator._barcode_to_node
+        assert 99 not in coordinator._node_to_barcode
+        coordinator._schedule_save.assert_called_once()
+
+    def test_node_id_reassignment_cleans_old_mapping(self, hass: HomeAssistant) -> None:
+        """When a barcode moves to a new node_id the old entry is removed."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+
+        coordinator._barcode_to_node = {"A-1234567B": 10}
+        coordinator._node_to_barcode = {10: "A-1234567B"}
+        coordinator._schedule_save = MagicMock()
+
+        # Same barcode, different node_id — old node 10 should disappear
+        event = InfrastructureEvent(
+            gateways={},
+            nodes={15: {"address": "11:22:33:44", "barcode": "A-1234567B"}},
+            timestamp=datetime.now(),
+        )
+
+        coordinator._handle_infrastructure(event)
+
+        assert coordinator._barcode_to_node == {"A-1234567B": 15}
+        assert coordinator._node_to_barcode == {15: "A-1234567B"}
+        assert 10 not in coordinator._node_to_barcode
+        coordinator._schedule_save.assert_called_once()
+
+    def test_infra_sets_infra_received_flag(self, hass: HomeAssistant) -> None:
+        """_infra_received should become True after first infrastructure event."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+        coordinator._schedule_save = MagicMock()
+
+        assert coordinator._infra_received is False
+
+        event = InfrastructureEvent(
+            gateways={},
+            nodes={10: {"address": "11:22:33:44", "barcode": "A-1234567B"}},
+            timestamp=datetime.now(),
+        )
+        coordinator._handle_infrastructure(event)
+
+        assert coordinator._infra_received is True
+
+
+class TestPowerReportDeferredBeforeInfra:
+    """Test that power reports with no direct barcode are deferred until
+    the first InfrastructureEvent of the current session."""
+
+    def test_fallback_blocked_before_infra(self, hass: HomeAssistant) -> None:
+        """Power report fallback to _node_to_barcode should be blocked pre-infra."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+
+        # Stale mapping from previous session
+        coordinator._barcode_to_node = {"A-1234567B": 10}
+        coordinator._node_to_barcode = {10: "A-1234567B"}
+        coordinator._infra_received = False
+
+        # Power report with no direct barcode — only node_id match
+        event = PowerReportEvent(
+            gateway_id=1,
+            node_id=10,
+            barcode=None,
+            voltage_in=30.0,
+            voltage_out=29.0,
+            current_in=8.0,
+            temperature=40.0,
+            dc_dc_duty_cycle=0.9,
+            rssi=-60,
+            timestamp=datetime.now(),
+        )
+        result = coordinator._handle_power_report(event)
+
+        # Should be deferred (return False), not stored
+        assert result is False
+        assert "A-1234567B" not in coordinator.data["nodes"]
+
+    def test_fallback_allowed_after_infra(self, hass: HomeAssistant) -> None:
+        """Power report fallback should work after infra event is received."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+        coordinator._schedule_save = MagicMock()
+
+        # Receive infrastructure first
+        infra_event = InfrastructureEvent(
+            gateways={},
+            nodes={10: {"address": "11:22:33:44", "barcode": "A-1234567B"}},
+            timestamp=datetime.now(),
+        )
+        coordinator._handle_infrastructure(infra_event)
+        assert coordinator._infra_received is True
+
+        # Now a power report with no direct barcode
+        power_event = PowerReportEvent(
+            gateway_id=1,
+            node_id=10,
+            barcode=None,
+            voltage_in=30.0,
+            voltage_out=29.0,
+            current_in=8.0,
+            temperature=40.0,
+            dc_dc_duty_cycle=0.9,
+            rssi=-60,
+            timestamp=datetime.now(),
+        )
+        result = coordinator._handle_power_report(power_event)
+
+        assert result is True
+        assert "A-1234567B" in coordinator.data["nodes"]
+
+    def test_direct_barcode_works_before_infra(self, hass: HomeAssistant) -> None:
+        """Power reports with a direct barcode should work even pre-infra."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+        coordinator._infra_received = False
+
+        event = PowerReportEvent(
+            gateway_id=1,
+            node_id=10,
+            barcode="A-1234567B",
+            voltage_in=30.0,
+            voltage_out=29.0,
+            current_in=8.0,
+            temperature=40.0,
+            dc_dc_duty_cycle=0.9,
+            rssi=-60,
+            timestamp=datetime.now(),
+        )
+        result = coordinator._handle_power_report(event)
+
+        assert result is True
+        assert "A-1234567B" in coordinator.data["nodes"]
 
 
 class TestStopFlushesState:

@@ -83,6 +83,12 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._barcode_to_node: dict[str, int] = {}
         self._node_to_barcode: dict[int, str] = {}
 
+        # Whether the current session has received its first InfrastructureEvent.
+        # Until it arrives, stale mappings from the previous session may be
+        # incorrect (node-ID reassignment overnight) so fallback resolution
+        # is suppressed to avoid mis-routing power reports.
+        self._infra_received: bool = False
+
         # Track barcodes seen on the bus but not in user config
         self._discovered_barcodes: set[str] = set()
 
@@ -170,6 +176,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         while not self._stop_event.is_set():
             parser = create_parser(state_file=str(self._state_file_path))
             self._init_mappings_from_parser(parser)
+            self._infra_received = False
             with self._source_lock:
                 self._source = None
 
@@ -247,22 +254,30 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _init_mappings_from_parser(self, parser: Any) -> None:
         """Pre-populate barcode/node mappings from the parser's persistent state.
 
-        Called after parser creation to restore mappings learned in previous
-        sessions (loaded from the parser's state file).
+        Replaces existing mappings (rather than merging) so that stale entries
+        from earlier reconnection cycles or previous sessions are purged.
+        Each reconnection creates a fresh parser whose state file is the
+        ground-truth for barcode ↔ node relationships.
         """
         try:
             infra = parser.infrastructure
-            restored = 0
+            new_barcode_to_node: dict[str, int] = {}
+            new_node_to_barcode: dict[int, str] = {}
             for node_id, node_info in infra.get("nodes", {}).items():
                 barcode = node_info.get("barcode")
                 if barcode:
-                    self._barcode_to_node[barcode] = node_id
-                    self._node_to_barcode[node_id] = barcode
-                    restored += 1
-            if restored:
+                    new_barcode_to_node[barcode] = node_id
+                    new_node_to_barcode[node_id] = barcode
+
+            purged = set(self._barcode_to_node) - set(new_barcode_to_node)
+            self._barcode_to_node = new_barcode_to_node
+            self._node_to_barcode = new_node_to_barcode
+
+            if new_barcode_to_node:
                 _LOGGER.info(
-                    "Restored %d barcode↔node mappings from parser state",
-                    restored,
+                    "Restored %d barcode↔node mappings from parser state" "%s",
+                    len(new_barcode_to_node),
+                    f" (purged {len(purged)} stale)" if purged else "",
                 )
         except Exception:
             _LOGGER.debug("Could not read parser infrastructure for pre-population")
@@ -292,16 +307,31 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Handle a power report event. Returns True if data was modified."""
         barcode = event.barcode
 
-        # Try to resolve barcode from node_id if not directly available
-        if not barcode and event.node_id in self._node_to_barcode:
+        # Try to resolve barcode from node_id via the coordinator mapping.
+        # Only use the fallback after the *current* session has received its
+        # first InfrastructureEvent — before that, the mapping may contain
+        # stale entries from a previous session where node-IDs differed.
+        if (
+            not barcode
+            and self._infra_received
+            and event.node_id in self._node_to_barcode
+        ):
             barcode = self._node_to_barcode[event.node_id]
 
         if not barcode:
-            _LOGGER.debug(
-                "Power report for node %d with no barcode yet (gateway=%d)",
-                event.node_id,
-                event.gateway_id,
-            )
+            if not self._infra_received:
+                _LOGGER.debug(
+                    "Power report for node %d deferred — waiting for first "
+                    "infrastructure event this session (gateway=%d)",
+                    event.node_id,
+                    event.gateway_id,
+                )
+            else:
+                _LOGGER.debug(
+                    "Power report for node %d with no barcode yet (gateway=%d)",
+                    event.node_id,
+                    event.gateway_id,
+                )
             return False
 
         # Check if this barcode is in our configured allowlist
@@ -343,25 +373,40 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return True
 
     def _handle_infrastructure(self, event: InfrastructureEvent) -> bool:
-        """Handle an infrastructure event — update gateway/node mappings.
+        """Handle an infrastructure event — rebuild gateway/node mappings.
+
+        Each InfrastructureEvent carries the *complete* current node table,
+        so mappings are rebuilt from scratch rather than incrementally
+        appended.  This purges stale entries that accumulate after overnight
+        reconnections, gateway re-enumerations, or node-ID reassignments
+        and would otherwise cause incorrect barcode resolution.
 
         Returns True (always modifies gateway data).
         """
+        _LOGGER.warning(
+            "Infrastructure event received: %d gateways, %d nodes (barcodes: %s)",
+            len(event.gateways),
+            len(event.nodes),
+            ", ".join(
+                n.get("barcode", "?") for n in event.nodes.values() if n.get("barcode")
+            )
+            or "none",
+        )
+
+        first_infra = not self._infra_received
+        self._infra_received = True
+
         # Update gateways
         self.data["gateways"] = event.gateways
 
-        # Update barcode ↔ node_id mapping from node table
-        mappings_changed = False
+        # Rebuild barcode ↔ node_id mappings from scratch
+        new_barcode_to_node: dict[str, int] = {}
+        new_node_to_barcode: dict[int, str] = {}
         for node_id, node_info in event.nodes.items():
             barcode = node_info.get("barcode")
             if barcode:
-                if (
-                    self._barcode_to_node.get(barcode) != node_id
-                    or self._node_to_barcode.get(node_id) != barcode
-                ):
-                    mappings_changed = True
-                self._barcode_to_node[barcode] = node_id
-                self._node_to_barcode[node_id] = barcode
+                new_barcode_to_node[barcode] = node_id
+                new_node_to_barcode[node_id] = barcode
 
                 # Log discovery of unconfigured barcodes
                 if barcode not in self._configured_barcodes:
@@ -377,6 +422,32 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             barcode,
                             node_id,
                         )
+
+        mappings_changed = (
+            new_barcode_to_node != self._barcode_to_node
+            or new_node_to_barcode != self._node_to_barcode
+        )
+
+        if mappings_changed:
+            purged_barcodes = set(self._barcode_to_node) - set(new_barcode_to_node)
+            if purged_barcodes:
+                _LOGGER.info(
+                    "Purged %d stale barcode mappings: %s",
+                    len(purged_barcodes),
+                    purged_barcodes,
+                )
+
+        self._barcode_to_node = new_barcode_to_node
+        self._node_to_barcode = new_node_to_barcode
+
+        if first_infra:
+            configured_matched = set(new_barcode_to_node) & self._configured_barcodes
+            _LOGGER.warning(
+                "First infrastructure event this session — barcode resolution "
+                "now active. %d/%d configured barcodes matched in node table.",
+                len(configured_matched),
+                len(self._configured_barcodes),
+            )
 
         if mappings_changed:
             self._schedule_save()

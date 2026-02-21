@@ -184,11 +184,12 @@ class Parser:
                 "version": self._persistent_state.gateway_versions.get(gw),
             }
         nodes = {}
-        for gw_table in self._persistent_state.gateway_node_tables.values():
+        for gw_id, gw_table in self._persistent_state.gateway_node_tables.items():
             for nid, addr in gw_table.items():
                 nodes[nid] = {
                     "address": str(addr),
                     "barcode": barcode_from_address(addr.data),
+                    "gateway_id": gw_id,
                 }
         return {"gateways": gateways, "nodes": nodes}
 
@@ -318,7 +319,22 @@ class Parser:
         try:
             ft = FrameType(frame.frame_type)
         except ValueError:
+            logger.debug(
+                "Unknown frame type 0x%04X from gw=%d (is_from=%s, %d bytes)",
+                frame.frame_type,
+                frame.address.gateway_id.value,
+                frame.address.is_from,
+                len(frame.payload),
+            )
             return []
+
+        logger.debug(
+            "Frame %s from gw=%d (is_from=%s, %d bytes)",
+            ft.name,
+            frame.address.gateway_id.value,
+            frame.address.is_from,
+            len(frame.payload),
+        )
 
         match ft:
             case FrameType.RECEIVE_REQUEST:
@@ -441,6 +457,18 @@ class Parser:
         packet_type = frame.payload[3]
         sequence_number = frame.payload[4]
 
+        try:
+            pkt_name = PacketType(packet_type).name
+        except ValueError:
+            pkt_name = f"0x{packet_type:02X}"
+        logger.debug(
+            "COMMAND_REQUEST gw=%d seq=%d pkt_type=%s (%d bytes payload)",
+            gw_id,
+            sequence_number,
+            pkt_name,
+            len(frame.payload) - 5,
+        )
+
         # Check for retransmit
         old_seq = self._command_sequence_numbers.get(gw_id)
         if old_seq is not None and old_seq == sequence_number:
@@ -461,12 +489,37 @@ class Parser:
         resp_packet_type = frame.payload[3]
         resp_seq = frame.payload[4]
 
+        try:
+            resp_name = PacketType(resp_packet_type).name
+        except ValueError:
+            resp_name = f"0x{resp_packet_type:02X}"
+
         key = (gw_id, resp_seq)
         request_data = self._commands_awaiting.pop(key, None)
         if request_data is None:
+            logger.warning(
+                "COMMAND_RESPONSE gw=%d seq=%d pkt_type=%s — "
+                "no matching request (awaiting keys: %s)",
+                gw_id,
+                resp_seq,
+                resp_name,
+                list(self._commands_awaiting.keys()),
+            )
             return []
         req_type, req_payload = request_data
         resp_payload = frame.payload[5:]
+
+        try:
+            req_name = PacketType(req_type).name
+        except ValueError:
+            req_name = f"0x{req_type:02X}"
+        logger.debug(
+            "COMMAND pair correlated gw=%d seq=%d: req=%s → resp=%s",
+            gw_id,
+            resp_seq,
+            req_name,
+            resp_name,
+        )
 
         return self._handle_command_pair(
             gw_id, req_type, req_payload, resp_packet_type, resp_payload
@@ -571,6 +624,11 @@ class Parser:
         if not frame.address.is_from:
             return []
         if self._enum_state is not None:
+            logger.info(
+                "Enumeration ended: %d gateway identities, %d versions discovered",
+                len(self._enum_state.gateway_identities),
+                len(self._enum_state.gateway_versions),
+            )
             self._persistent_state.gateway_identities = dict(
                 self._enum_state.gateway_identities
             )
@@ -700,13 +758,27 @@ class Parser:
     ) -> list[Event]:
         """Handle NODE_TABLE command pair: accumulate pages."""
         if len(req_payload) < 2:
+            logger.warning(
+                "NODE_TABLE_REQUEST gw=%d: req_payload too short (%d bytes)",
+                gw_id,
+                len(req_payload),
+            )
             return []
         start_address = NodeAddress.from_bytes(req_payload[0:2])
         if len(resp_payload) < 1:
+            logger.warning("NODE_TABLE_RESPONSE gw=%d: resp_payload empty", gw_id)
             return []
         entries_count = resp_payload[0]
         entries_data = resp_payload[1:]
         if len(entries_data) != entries_count * 10:
+            logger.warning(
+                "NODE_TABLE_RESPONSE gw=%d: corrupt page — "
+                "entries_count=%d but data=%d bytes (expected %d)",
+                gw_id,
+                entries_count,
+                len(entries_data),
+                entries_count * 10,
+            )
             return []  # corrupt
         entries = []
         for i in range(entries_count):
@@ -715,12 +787,31 @@ class Parser:
             long_addr = LongAddress(entries_data[off + 2 : off + 10])
             entries.append((node_addr, long_addr))
 
+        logger.info(
+            "NODE_TABLE page gw=%d: start_addr=%d, %d entries%s",
+            gw_id,
+            start_address.value,
+            entries_count,
+            " (final page — building table)" if entries_count == 0 else "",
+        )
+
         builder = self._node_table_builders.setdefault(gw_id, NodeTableBuilder())
         result = builder.push(start_address, entries)
         if result is not None:
+            logger.warning(
+                "NODE_TABLE complete for gw=%d: %d nodes resolved",
+                gw_id,
+                len(result),
+            )
             self._persistent_state.gateway_node_tables[gw_id] = result
             self._save_persistent_state()
             return self._emit_infrastructure_event()
+
+        logger.debug(
+            "NODE_TABLE gw=%d: %d entries accumulated so far",
+            gw_id,
+            len(builder._entries),
+        )
         return []
 
     def _handle_string_command(
@@ -767,6 +858,7 @@ class Parser:
                 nodes[node_id_val] = {
                     "address": str(long_addr),
                     "barcode": barcode,
+                    "gateway_id": gw_id_key,
                 }
 
         self._save_persistent_state()
