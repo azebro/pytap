@@ -659,22 +659,4 @@ Changes trigger a full integration reload. Previously-discovered barcode mapping
 - **Dev container** — The repository includes a dev container with HA installed. Run `python3 -m homeassistant --config config/ --debug` to test the full integration locally.
 - **Mock source** — For automated tests, the coordinator can be tested with a mock `Source` that replays captured byte sequences.
 
----
 
-## Future Considerations
-
-### Energy Dashboard Integration
-
-Expose `PowerReportEvent.power` as a `SensorDeviceClass.POWER` entity with `SensorStateClass.MEASUREMENT`. HA's energy dashboard can then track per-optimizer production when combined with a Riemann sum integration helper for energy (kWh).
-
-### Diagnostics Platform
-
-Expose parser counters (`frames_received`, `crc_errors`, `noise_bytes`) and infrastructure state as a diagnostics download for troubleshooting.
-
-### Binary Sensor Platform
-
-Add binary sensors for node connectivity (available/unavailable based on `last_update` age) and gateway online status.
-
-### HACS Distribution
-
-Package for distribution via [HACS](https://hacs.xyz/) with a `hacs.json` manifest for one-click installation.
