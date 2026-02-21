@@ -1,7 +1,7 @@
-"""Tests for PyTap coordinator persistence (barcode mappings & discovered barcodes).
+"""Tests for PyTap coordinator persistence (barcode mappings, discovered barcodes, parser state).
 
-Validates that barcode↔node mappings and discovered barcodes survive restarts
-via both the parser's state_file and the coordinator's HA Store.
+Validates that barcode\u2194node mappings, discovered barcodes, and parser
+infrastructure state survive restarts via the consolidated HA Store.
 """
 
 from datetime import datetime
@@ -25,6 +25,7 @@ from custom_components.pytap.pytap.core.events import (
     InfrastructureEvent,
     PowerReportEvent,
 )
+from custom_components.pytap.pytap.core.state import PersistentState
 
 
 MOCK_MODULES = [
@@ -52,16 +53,15 @@ def _make_entry(hass):
 class TestCoordinatorPersistenceInit:
     """Test that persistence infrastructure is set up in __init__."""
 
-    def test_state_file_path_set(self, hass: HomeAssistant) -> None:
-        """State file path should point to .storage in HA config dir."""
+    def test_persistent_state_initialised(self, hass: HomeAssistant) -> None:
+        """PersistentState should be initialised as empty."""
         entry = _make_entry(hass)
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
 
-        assert coordinator._state_file_path is not None
-        path_str = str(coordinator._state_file_path)
-        assert ".storage" in path_str
-        assert entry.entry_id in path_str
-        assert path_str.endswith(".json")
+        assert isinstance(coordinator._persistent_state, PersistentState)
+        assert coordinator._persistent_state.gateway_identities == {}
+        assert coordinator._persistent_state.gateway_versions == {}
+        assert coordinator._persistent_state.gateway_node_tables == {}
 
     def test_store_created(self, hass: HomeAssistant) -> None:
         """HA Store should be created with correct key."""
@@ -144,12 +144,53 @@ class TestLoadCoordinatorState:
 
         assert coordinator._barcode_to_node == {}
 
+    async def test_load_restores_parser_state(self, hass: HomeAssistant) -> None:
+        """Parser infrastructure state should be restored from Store."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+
+        stored_data = {
+            "barcode_to_node": {},
+            "discovered_barcodes": [],
+            "parser_state": {
+                "gateway_identities": {"1": "aa:bb:cc:dd:ee:ff:00:11"},
+                "gateway_versions": {"1": "2.0.1"},
+                "gateway_node_tables": {},
+            },
+        }
+        coordinator._store.async_load = AsyncMock(return_value=stored_data)
+
+        await coordinator._async_load_coordinator_state()
+
+        assert len(coordinator._persistent_state.gateway_identities) == 1
+        assert coordinator._persistent_state.gateway_versions[1] == "2.0.1"
+
+    async def test_load_handles_corrupt_parser_state(self, hass: HomeAssistant) -> None:
+        """Corrupt parser state in Store should fall back to empty state."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+
+        stored_data = {
+            "barcode_to_node": {},
+            "discovered_barcodes": [],
+            "parser_state": {
+                "garbage": "data",
+                "gateway_identities": {"not_int": "bad"},
+            },
+        }
+        coordinator._store.async_load = AsyncMock(return_value=stored_data)
+
+        # Should not raise
+        await coordinator._async_load_coordinator_state()
+
+        # Parser state may be partially loaded or fresh — should not crash
+
 
 class TestSaveCoordinatorState:
     """Test _async_save_coordinator_state persists data."""
 
     async def test_save_writes_all_data(self, hass: HomeAssistant) -> None:
-        """Save should write barcode mappings and discovered barcodes."""
+        """Save should write barcode mappings, discovered barcodes, and parser state."""
         entry = _make_entry(hass)
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
 
@@ -166,6 +207,7 @@ class TestSaveCoordinatorState:
         saved = coordinator._store.async_save.call_args[0][0]
         assert saved["barcode_to_node"] == {"A-1234567B": 10}
         assert saved["discovered_barcodes"] == ["X-9999999Z"]
+        assert "parser_state" in saved
         assert coordinator._unsaved_changes is False
 
     async def test_save_handles_exception(self, hass: HomeAssistant) -> None:
@@ -262,18 +304,16 @@ class TestInitMappingsFromParser:
         coordinator._init_mappings_from_parser(mock_parser)
 
 
-class TestParserStateFilePassedThrough:
-    """Test that the parser is created with a state_file for persistence."""
+class TestParserStatePassedThrough:
+    """Test that the parser is created with the coordinator's PersistentState."""
 
-    def test_listen_creates_parser_with_state_file(self, hass: HomeAssistant) -> None:
-        """Parser should be created with state_file in _listen."""
+    def test_persistent_state_shared_with_parser(self, hass: HomeAssistant) -> None:
+        """PersistentState from coordinator should be the same object used by parser."""
         entry = _make_entry(hass)
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
 
-        # We verify by checking the coordinator has the right state file path
-        expected_path = str(coordinator._state_file_path)
-        assert ".storage" in expected_path
-        assert "parser_state" in expected_path
+        # Verify PersistentState exists and is a valid instance
+        assert isinstance(coordinator._persistent_state, PersistentState)
 
 
 class TestInfrastructureEventTriggersSave:

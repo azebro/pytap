@@ -45,7 +45,7 @@ PyTap is a Home Assistant custom component that passively monitors Tigo TAP sola
 | Threading model | Blocking parser in executor thread, bridged to async event loop |
 | External dependencies | None — parser library embedded, stdlib only |
 | Sensor types | 8 per optimizer: power, voltage in/out, current in/out, temperature, duty cycle, RSSI |
-| Test coverage | 49 tests (13 config flow + 17 coordinator persistence + 5 migration + 7 sensor platform) |
+| Test coverage | 51 tests (13 config flow + 19 coordinator persistence + 5 migration + 7 sensor platform + 7 options flow) |
 
 ---
 
@@ -62,21 +62,21 @@ custom_components/pytap/
 ├── strings.json         # ~100 lines — UI strings (source of truth)
 ├── translations/
 │   └── en.json          # ~100 lines — English translations (mirrors strings.json)
-└── pytap/               # Embedded protocol parser library (not modified)
-    ├── api.py           # Public API: connect(), create_parser(), observe()
+└── pytap/               # Embedded protocol parser library (persistence decoupled)
+    ├── api.py           # Public API: connect(), create_parser(), parse_bytes()
     └── core/
         ├── parser.py    # Protocol parser: bytes → events
         ├── types.py     # Protocol constants & frame types
         ├── events.py    # Event dataclasses (PowerReportEvent, etc.)
-        ├── state.py     # SlotClock, NodeTable, PersistentState
+        ├── state.py     # SlotClock, NodeTableBuilder, PersistentState (to_dict/from_dict)
         ├── source.py    # TcpSource, SerialSource
         ├── crc.py       # CRC-16-CCITT
         └── barcode.py   # Tigo barcode encode/decode
 
 tests/
 ├── conftest.py                    # 14 lines  — Auto-enable custom integrations fixture
-├── test_config_flow.py            # 343 lines — 9 config flow tests
-├── test_coordinator_persistence.py # ~350 lines — 17 coordinator & persistence tests
+├── test_config_flow.py            # 445 lines — 13 config flow tests
+├── test_coordinator_persistence.py # ~510 lines — 19 coordinator & persistence tests
 ├── test_migration.py              # ~120 lines — 5 entity migration tests
 └── test_sensor.py                 # ~210 lines — 7 sensor platform tests
 
@@ -206,7 +206,7 @@ Four custom `HomeAssistantError` subclasses: `CannotConnect`, `InvalidAuth`, `In
 
 ### `coordinator.py` — Data Coordinator
 
-**~477 lines** implementing `PyTapDataUpdateCoordinator`, the core runtime engine.
+**~680 lines** implementing `PyTapDataUpdateCoordinator`, the core runtime engine.
 
 #### Class: `PyTapDataUpdateCoordinator`
 
@@ -351,14 +351,15 @@ Called when the options flow updates the module list. After updating the allowli
 
 #### Persistence
 
-Two persistence layers ensure barcode mappings survive restarts and reloads:
+All persistent state is consolidated into a single HA Store, written via `homeassistant.helpers.storage.Store` (version 2) as `<config>/.storage/pytap_<entry_id>_coordinator`. The store contains:
 
-1. **Parser state file** — Written by the parser library as `<config>/.storage/pytap_<entry_id>_parser_state.json`. Contains the raw gateway node table.
-2. **Coordinator HA Store** — Written via `homeassistant.helpers.storage.Store` as `<config>/.storage/pytap_<entry_id>_coordinator`. Stores barcode↔node_id mappings and discovered barcodes.
+- **`barcode_to_node`** — Barcode↔node_id mappings learned from infrastructure events.
+- **`discovered_barcodes`** — Set of unconfigured barcodes seen on the bus.
+- **`parser_state`** — Serialised parser infrastructure state (gateway identities, versions, node tables) via `PersistentState.to_dict()`.
 
-On startup, coordinator state is loaded from the HA Store (via `_async_load_coordinator_state`). Then, in the executor thread, `_init_mappings_from_parser` attempts to merge parser state. Parser mappings take precedence when non-empty; when the parser state has no node table (first run, state file missing), the coordinator-saved mappings are preserved as fallback. This prevents stale-wipe scenarios where an empty parser state would erase valid saved mappings.
+On startup, coordinator state is loaded from the HA Store (via `_async_load_coordinator_state`), including the parser's `PersistentState` which is deserialized via `PersistentState.from_dict()`. The parser receives a shared `PersistentState` object and mutates it in memory — the parser never performs file I/O. The coordinator schedules debounced saves (10-second delay) when mappings or infrastructure change, and flushes immediately on shutdown.
 
-Saves are debounced via `_schedule_save()` (10-second delay, dispatched to the event loop). On shutdown (`async_stop_listener`), any pending unsaved changes are flushed immediately.
+The `_init_mappings_from_parser` method pre-populates barcode↔node mappings from the parser's infrastructure on reconnect. Parser mappings take precedence when non-empty; when the parser state has no node table (first run), the coordinator-saved mappings are preserved as fallback.
 
 ---
 
@@ -766,7 +767,6 @@ The architecture document (`architecture.md`) was written during initial design 
 | Sensor count | 7 per optimizer (single voltage/current) | 8 per optimizer (voltage_in/out, current_in/out) |
 | Config entry version | Not mentioned | v2 with async_migrate_entry and legacy entity cleanup |
 | Threading primitives | Not specified | threading.Event + threading.Lock (not asyncio.Event) |
-| State file persistence | Mentioned in options flow design | Not implemented |
 | Diagnostics platform | Mentioned for discovered barcodes | Not implemented yet (data stored in coordinator) |
 
 ---
@@ -841,6 +841,18 @@ Created this implementation document capturing all development work to date.
 - **Discovery persistence fix** — Discovered (unconfigured) barcodes from infrastructure events now properly trigger `_schedule_save()`. Previously only mapping changes triggered saves, leaving discovered barcodes unpersisted.
 - **Coordinator-saved mapping preservation** — `_init_mappings_from_parser` now preserves coordinator-saved barcode↔node mappings when the parser state is empty (merge instead of replace). This prevents previously-learned mappings from being wiped on reconnect when the parser state file has no node table.
 - **Instant barcode resolution on module add** — `reload_modules` now checks if newly-added barcodes already exist in the saved barcode↔node mapping and pre-populates placeholder node data so sensor entities can bind immediately without waiting for the next power report.
+
+### Phase 11 — Storage Consolidation & CLI Removal
+
+- **Consolidated storage** — Merged the parser's raw JSON state file and the coordinator's HA Store into a single `homeassistant.helpers.storage.Store` (version 2). The store now holds barcode↔node mappings, discovered barcodes, and parser infrastructure state (`PersistentState.to_dict()`). This eliminates raw file I/O, ensures proper HA backup inclusion, and enables automatic cleanup on config entry removal.
+- **Parser decoupled from file I/O** — `Parser.__init__` now accepts an optional `PersistentState` object instead of a `state_file` path. The parser mutates the state in memory; the coordinator owns persistence.
+- **`PersistentState` serialization** — Replaced `save(path)` / `load(path)` file I/O methods with `to_dict()` / `from_dict()` for JSON-compatible serialization via the HA Store.
+- **`create_parser()` API updated** — Accepts `persistent_state: Optional[PersistentState]` instead of `state_file: str | Path | None`.
+- **CLI removed** — Deleted `pytap/cli/` module, `pytap/setup.py`, and `pytap.egg-info/`. The library is now embedded-only, used exclusively through the HA integration coordinator.
+- **`observe()` function removed** — The blocking streaming loop with callback was only used by the CLI. Callers now use `create_parser()` + `connect()` + manual `feed()` loop.
+- **Store version bumped to 2** — Added migration path from v1 (barcode mappings + discovered barcodes only) to v2 (adds `parser_state`).
+- **Tests updated** — Replaced `_state_file_path` assertions with `_persistent_state` checks, added `test_load_restores_parser_state` and `test_load_handles_corrupt_parser_state`. 51 tests passing.
+- **Documentation updated** — All docs (README, architecture, implementation, API reference) updated to reflect the consolidated storage model and removed CLI.
 ---
 
 ## Future Work
@@ -850,7 +862,5 @@ Items identified but not yet implemented:
 1. **Gateway device registration** — Create a device per gateway for the `via_device` hierarchy.
 2. **Diagnostics platform** — Expose `discovered_barcodes`, parser counters, and connection state as a diagnostics download.
 3. **Energy dashboard integration** — Ensure power sensors work with HA's energy dashboard (may need `SensorDeviceClass.ENERGY` with Riemann sum).
-5. **Binary sensors** — Node connectivity and gateway online status.
-
-7. **HACS distribution** — Package with `hacs.json` for one-click installation.
-8. **Update architecture.md** — Align the architecture document with the current menu-driven config flow.
+4. **Binary sensors** — Node connectivity and gateway online status.
+5. **HACS distribution** — Package with `hacs.json` for one-click installation.

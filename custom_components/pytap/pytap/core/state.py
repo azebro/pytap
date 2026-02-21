@@ -1,17 +1,17 @@
 """State management for the pytap parser.
 
-Contains SlotClock (time synchronization), NodeTableBuilder (accumulates
-node table pages), and PersistentState (optional JSON persistence).
+Contains SlotClock (time synchronisation), NodeTableBuilder (accumulates
+node table pages), and PersistentState (in-memory infrastructure state).
 """
 
-import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Optional
 
 from .types import (
-    SlotCounter, LongAddress, NodeAddress,
+    SlotCounter,
+    LongAddress,
+    NodeAddress,
     SLOTS_PER_EPOCH,
 )
 
@@ -19,6 +19,7 @@ from .types import (
 # ---------------------------------------------------------------------------
 #  SlotClock
 # ---------------------------------------------------------------------------
+
 
 class SlotClock:
     """Maps SlotCounter values to wall-clock datetime objects.
@@ -68,9 +69,8 @@ class SlotClock:
             steps = (index - self._last_index) % self.NUM_INDICES
             for i in range(1, steps):
                 fill_idx = (self._last_index + i) % self.NUM_INDICES
-                self._times[fill_idx] = (
-                    self._times[self._last_index]
-                    + timedelta(milliseconds=5000.0 * i)
+                self._times[fill_idx] = self._times[self._last_index] + timedelta(
+                    milliseconds=5000.0 * i
                 )
         self._last_index = index
         self._last_time = time
@@ -88,6 +88,7 @@ class SlotClock:
 # ---------------------------------------------------------------------------
 #  NodeTableBuilder
 # ---------------------------------------------------------------------------
+
 
 class NodeTableBuilder:
     """Accumulates node table pages until completion.
@@ -118,12 +119,14 @@ class NodeTableBuilder:
 #  PersistentState
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class PersistentState:
-    """Persistent infrastructure state: gateway identities, versions, and node tables.
+    """In-memory infrastructure state: gateway identities, versions, and node tables.
 
-    Optionally saved to / loaded from a JSON file.
+    Persistence is handled externally by the HA coordinator via to_dict/from_dict.
     """
+
     gateway_identities: dict[int, LongAddress]
     gateway_versions: dict[int, str]
     gateway_node_tables: dict[int, dict[int, LongAddress]]
@@ -133,44 +136,29 @@ class PersistentState:
         self.gateway_versions = {}
         self.gateway_node_tables = {}
 
-    def save(self, path: Path):
-        """Atomic write: write to .tmp then rename."""
-        tmp = path.with_suffix('.tmp')
-        data = {
-            'gateway_identities': {
+    def to_dict(self) -> dict:
+        """Serialise to a JSON-compatible dict for HA Store."""
+        return {
+            "gateway_identities": {
                 str(k): str(v) for k, v in self.gateway_identities.items()
             },
-            'gateway_versions': {
-                str(k): v for k, v in self.gateway_versions.items()
-            },
-            'gateway_node_tables': {
-                str(gw): {
-                    str(nid): str(addr)
-                    for nid, addr in nodes.items()
-                }
+            "gateway_versions": {str(k): v for k, v in self.gateway_versions.items()},
+            "gateway_node_tables": {
+                str(gw): {str(nid): str(addr) for nid, addr in nodes.items()}
                 for gw, nodes in self.gateway_node_tables.items()
             },
         }
-        with open(tmp, 'w') as f:
-            json.dump(data, f, indent=2)
-        tmp.replace(path)
 
     @classmethod
-    def load(cls, path: Path) -> 'PersistentState':
-        """Load state from JSON file. Returns empty state on any error."""
+    def from_dict(cls, data: dict) -> "PersistentState":
+        """Deserialise from a dict (as stored in HA Store)."""
         state = cls()
-        try:
-            with open(path) as f:
-                data = json.load(f)
-            for k, v in data.get('gateway_identities', {}).items():
-                state.gateway_identities[int(k)] = LongAddress.from_str(v)
-            for k, v in data.get('gateway_versions', {}).items():
-                state.gateway_versions[int(k)] = v
-            for gw, nodes in data.get('gateway_node_tables', {}).items():
-                state.gateway_node_tables[int(gw)] = {
-                    int(nid): LongAddress.from_str(addr)
-                    for nid, addr in nodes.items()
-                }
-        except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError):
-            pass
+        for k, v in data.get("gateway_identities", {}).items():
+            state.gateway_identities[int(k)] = LongAddress.from_str(v)
+        for k, v in data.get("gateway_versions", {}).items():
+            state.gateway_versions[int(k)] = v
+        for gw, nodes in data.get("gateway_node_tables", {}).items():
+            state.gateway_node_tables[int(gw)] = {
+                int(nid): LongAddress.from_str(addr) for nid, addr in nodes.items()
+            }
         return state

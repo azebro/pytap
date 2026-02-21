@@ -12,7 +12,6 @@ import logging
 import threading
 import time
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -39,10 +38,11 @@ from .pytap.core.events import (
     StringEvent,
     TopologyEvent,
 )
+from .pytap.core.state import PersistentState
 
 _LOGGER = logging.getLogger(__name__)
 
-STORE_VERSION = 1
+STORE_VERSION = 2
 SAVE_DELAY_SECONDS = 10
 
 
@@ -106,17 +106,15 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._source: Any = None
         self._source_lock = threading.Lock()
 
-        # --- Persistence ---
-        # Parser-level state file (gateway identities, versions, node tables)
-        self._state_file_path: Path = Path(
-            hass.config.path(f".storage/pytap_{entry.entry_id}_parser_state.json")
-        )
-        # Coordinator-level HA Store (barcode mappings, discovered barcodes)
+        # --- Persistence (single HA Store for all state) ---
         self._store: Store = Store(
             hass, STORE_VERSION, f"pytap_{entry.entry_id}_coordinator"
         )
         self._unsaved_changes: bool = False
         self._save_task: asyncio.TimerHandle | None = None
+
+        # Parser infrastructure state — shared between coordinator and parser
+        self._persistent_state: PersistentState = PersistentState()
 
         # Initialize data structure
         self.data: dict[str, Any] = {
@@ -180,7 +178,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         retries = 0
 
         while not self._stop_event.is_set():
-            parser = create_parser(state_file=str(self._state_file_path))
+            parser = create_parser(persistent_state=self._persistent_state)
             self._init_mappings_from_parser(parser)
             self._infra_received = False
             with self._source_lock:
@@ -559,7 +557,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # -------------------------------------------------------------------
 
     async def _async_load_coordinator_state(self) -> None:
-        """Load coordinator-level state (barcode mappings, discovered barcodes) from HA Store."""
+        """Load all persisted state (barcode mappings, discovered barcodes, parser state) from HA Store."""
         try:
             stored = await self._store.async_load()
         except Exception:
@@ -580,20 +578,34 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._discovered_barcodes = set(discovered)
         self.data["discovered_barcodes"] = sorted(self._discovered_barcodes)
 
+        # Restore parser infrastructure state
+        parser_state_data = stored.get("parser_state")
+        if parser_state_data:
+            try:
+                self._persistent_state = PersistentState.from_dict(parser_state_data)
+            except Exception:
+                _LOGGER.warning(
+                    "Failed to restore parser state from store, starting fresh"
+                )
+                self._persistent_state = PersistentState()
+
         _LOGGER.info(
-            "Restored coordinator state: %d barcode mappings, %d discovered barcodes",
+            "Restored coordinator state: %d barcode mappings, %d discovered barcodes, "
+            "%d gateway identities",
             len(barcode_to_node),
             len(discovered),
+            len(self._persistent_state.gateway_identities),
         )
 
     async def _async_save_coordinator_state(self) -> None:
-        """Save coordinator-level state to HA Store."""
+        """Save all state (barcode mappings, discovered barcodes, parser state) to HA Store."""
         self._unsaved_changes = False
         data = {
             "barcode_to_node": {
                 barcode: node_id for barcode, node_id in self._barcode_to_node.items()
             },
             "discovered_barcodes": sorted(self._discovered_barcodes),
+            "parser_state": self._persistent_state.to_dict(),
         }
         try:
             await self._store.async_save(data)

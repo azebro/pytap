@@ -9,7 +9,6 @@ import logging
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from enum import Enum, auto
-from pathlib import Path
 from typing import Optional
 
 from .barcode import barcode_from_address
@@ -120,7 +119,10 @@ class Parser:
     incremental feed() calls.
     """
 
-    def __init__(self, state_file: str | Path | None = None):
+    def __init__(
+        self,
+        persistent_state: Optional[PersistentState] = None,
+    ):
         # Frame accumulator state
         self._state: _FrameState = _FrameState.IDLE
         self._buffer: bytearray = bytearray()
@@ -137,20 +139,14 @@ class Parser:
         # Enumeration state
         self._enum_state: Optional[_EnumerationState] = None
 
-        # Infrastructure
-        self._persistent_state: PersistentState
-        self._state_file: Optional[Path] = None
+        # Infrastructure — caller owns persistence; parser only mutates in memory
+        self._persistent_state: PersistentState = (
+            persistent_state if persistent_state is not None else PersistentState()
+        )
         self._node_table_builders: dict[int, NodeTableBuilder] = {}
 
         # Counters
         self._counters: _Counters = _Counters()
-
-        # Load persistent state
-        if state_file is not None:
-            self._state_file = Path(state_file)
-            self._persistent_state = PersistentState.load(self._state_file)
-        else:
-            self._persistent_state = PersistentState()
 
     # -------------------------------------------------------------------
     #  Public Interface
@@ -826,7 +822,6 @@ class Parser:
                 len(result),
             )
             self._persistent_state.gateway_node_tables[gw_id] = result
-            self._save_persistent_state()
             return self._emit_infrastructure_event()
 
         logger.debug(
@@ -883,7 +878,6 @@ class Parser:
                     "gateway_id": gw_id_key,
                 }
 
-        self._save_persistent_state()
         return [
             InfrastructureEvent(
                 gateways=gateways,
@@ -891,11 +885,3 @@ class Parser:
                 timestamp=datetime.now(),
             )
         ]
-
-    def _save_persistent_state(self):
-        """Save persistent state if a state file is configured."""
-        if self._state_file is not None:
-            try:
-                self._persistent_state.save(self._state_file)
-            except OSError as e:
-                logger.error("Failed to save persistent state: %s", e)

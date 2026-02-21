@@ -63,21 +63,21 @@ pytap/                              # Repository root
 │       │   └── en.json             # English translations
 │       └── pytap/                  # Embedded protocol parser library
 │           ├── __init__.py         # Library re-exports
-│           ├── api.py              # Public API (create_parser, observe, etc.)
+│           ├── api.py              # Public API (create_parser, parse_bytes, connect)
 │           ├── core/
 │           │   ├── parser.py       # Protocol parser (bytes → events)
 │           │   ├── types.py        # Protocol types & constants
 │           │   ├── events.py       # Event dataclasses
-│           │   ├── state.py        # SlotClock, NodeTable, PersistentState
+│           │   ├── state.py        # SlotClock, NodeTableBuilder, PersistentState
 │           │   ├── source.py       # TcpSource, SerialSource
 │           │   ├── crc.py          # CRC-16-CCITT
 │           │   └── barcode.py      # Tigo barcode encode/decode
-│           └── cli/                # Standalone CLI (not used by HA)
-│               └── main.py
 ├── tests/
 │   ├── conftest.py                 # HA test fixtures
 │   ├── test_config_flow.py         # Config flow tests
-│   └── test_sensor.py             # Sensor platform tests
+│   ├── test_coordinator_persistence.py  # Coordinator & persistence tests
+│   ├── test_migration.py           # Entity migration tests
+│   └── test_sensor.py              # Sensor platform tests
 ├── requirements.txt                # Pinned HA + dev dependencies
 └── pytest.ini                      # Test configuration
 ```
@@ -298,13 +298,21 @@ The coordinator maintains a cumulative state dictionary. Incoming events are mer
 
 #### Persistence
 
-The coordinator maintains two persistence layers:
+All persistent state is consolidated into a single **HA Store** (`<config>/.storage/pytap_<entry_id>_coordinator`), written via `homeassistant.helpers.storage.Store` (version 2). The store contains:
 
-1. **Parser state file** (`<config>/.storage/pytap_<entry_id>_parser_state.json`) — Written by the parser library. Contains gateway identities, versions, and the node table (node_id → MAC address). Used to pre-populate barcode↔node mappings on reconnection.
+- **`barcode_to_node`** — Barcode↔node_id mappings learned from infrastructure events.
+- **`discovered_barcodes`** — Set of unconfigured barcodes seen on the bus.
+- **`parser_state`** — Serialised parser infrastructure state (gateway identities, versions, node tables) via `PersistentState.to_dict()`.
 
-2. **Coordinator HA Store** (`<config>/.storage/pytap_<entry_id>_coordinator`) — Written by the coordinator via `homeassistant.helpers.storage.Store`. Contains barcode↔node_id mappings and discovered (unconfigured) barcodes. Saves are debounced (10s delay) to avoid excessive writes.
+Saves are debounced (10s delay) to avoid excessive writes. On shutdown, any pending unsaved changes are flushed immediately.
 
-On startup, the coordinator loads saved state from the HA Store, then attempts to merge mappings from the parser state file. Parser mappings take precedence when available; when the parser state has no node table (e.g., first run or state file lost), coordinator-saved mappings are preserved as a fallback. This ensures that barcodes discovered in previous sessions survive and can be matched immediately when the user adds them as modules.
+On startup, the coordinator loads all state from the HA Store. The parser receives a shared `PersistentState` object (deserialized from the store) which it mutates in memory as new infrastructure events arrive. The coordinator owns persistence — the parser never performs file I/O.
+
+This single-store approach ensures:
+- No raw file I/O on the event loop (HA Store is fully async).
+- Automatic cleanup when a config entry is removed.
+- Proper inclusion in HA backups.
+- Version migration support via the Store's built-in versioning.
 
 #### Barcode Filtering & Discovery Logging
 
@@ -510,7 +518,7 @@ The `pytap` parser library is bundled inside the custom component at `custom_com
 - **Version lock** — The parser version always matches the integration version.
 - **No PyPI publishing required** — Reduces release complexity for a niche integration.
 
-The library maintains a clean boundary: it has **no Home Assistant imports** and can be used standalone (CLI, scripts, other platforms).
+The library maintains a clean boundary: it has **no Home Assistant imports** and can be used standalone (scripts, other platforms). Persistence is handled externally — the parser accepts a `PersistentState` object and mutates it in memory; the caller owns serialization.
 
 ### 2. Push-Based Streaming (Not Polling)
 
@@ -631,7 +639,7 @@ Changes trigger a full integration reload. Previously-discovered barcode mapping
 | Test File | Scope |
 |-----------|-------|
 | `test_config_flow.py` | Config flow form rendering, validation, error handling (13 tests) |
-| `test_coordinator_persistence.py` | Event processing, persistence, barcode mapping lifecycle (17 tests) |
+| `test_coordinator_persistence.py` | Event processing, persistence, barcode mapping lifecycle (19 tests) |
 | `test_migration.py` | Config entry migration and legacy entity cleanup (5 tests) |
 | `test_sensor.py` | Entity creation, state updates, availability (7 tests) |
 

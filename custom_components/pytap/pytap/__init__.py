@@ -3,7 +3,7 @@
 Public surface re-exports from core modules and the api module.
 """
 
-__version__ = '0.1.0'
+__version__ = "0.1.0"
 
 # Core types
 from .core.types import (
@@ -55,27 +55,47 @@ from .api import (
     create_parser,
     parse_bytes,
     connect,
-    observe,
 )
 
 __all__ = [
-    '__version__',
+    "__version__",
     # Types
-    'GatewayID', 'Address', 'FrameType', 'Frame',
-    'NodeID', 'NodeAddress', 'LongAddress', 'RSSI', 'SlotCounter',
-    'PacketType', 'ReceivedPacketHeader', 'U12Pair', 'PowerReport',
-    'GatewayInfo', 'NodeInfo', 'iter_received_packets',
+    "GatewayID",
+    "Address",
+    "FrameType",
+    "Frame",
+    "NodeID",
+    "NodeAddress",
+    "LongAddress",
+    "RSSI",
+    "SlotCounter",
+    "PacketType",
+    "ReceivedPacketHeader",
+    "U12Pair",
+    "PowerReport",
+    "GatewayInfo",
+    "NodeInfo",
+    "iter_received_packets",
     # Events
-    'Event', 'PowerReportEvent', 'InfrastructureEvent',
-    'TopologyEvent', 'StringEvent',
+    "Event",
+    "PowerReportEvent",
+    "InfrastructureEvent",
+    "TopologyEvent",
+    "StringEvent",
     # State
-    'SlotClock', 'NodeTableBuilder', 'PersistentState',
+    "SlotClock",
+    "NodeTableBuilder",
+    "PersistentState",
     # Parser
-    'Parser',
+    "Parser",
     # Barcode
-    'encode_barcode', 'decode_barcode', 'barcode_from_address',
+    "encode_barcode",
+    "decode_barcode",
+    "barcode_from_address",
     # CRC
-    'crc',
+    "crc",
     # API
-    'create_parser', 'parse_bytes', 'connect', 'observe',
+    "create_parser",
+    "parse_bytes",
+    "connect",
 ]
