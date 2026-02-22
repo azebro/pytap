@@ -136,7 +136,7 @@ pytap/                              # Repository root
 Entry point for Home Assistant. Implements the two required lifecycle hooks:
 
 | Function | Purpose |
-|----------|---------|
+| --- | --- |
 | `async_setup_entry(hass, entry)` | Create coordinator, start data streaming, forward platform setup |
 | `async_unload_entry(hass, entry)` | Stop coordinator, unload platforms, clean up |
 
@@ -156,31 +156,26 @@ Entry point for Home Assistant. Implements the two required lifecycle hooks:
 Implements a multi-step `ConfigFlow` to collect connection parameters and module barcodes via the HA frontend:
 
 | Step | Fields | Validation |
-|------|--------|------------|
+| --- | --- | --- |
 | `user` | `host` (required), `port` (default: 502) | Attempt TCP connection to validate reachability |
-| `modules` | `modules` (required, comma-separated list) | Validate barcode format (`X-NNNNNNNC`) |
+| `modules_menu` | Menu (`add_module` / `finish`) | Ensures explicit module-by-module setup |
+| `add_module` | `string` (required), `name` (required), `barcode` (required) | Non-empty fields, barcode format, duplicate prevention |
 
 **Step 1 — Connection:** The user provides the gateway host and port. Validation opens a short-lived TCP connection using `pytap.api.connect()` (run in the executor). On success, proceeds to step 2. On failure, shows "cannot_connect".
 
-**Step 2 — Modules:** The user provides a comma-separated list of Tigo optimizer barcodes to monitor. Each entry follows the format `STRING:NAME:BARCODE` (inspired by the [taptap add-on](https://github.com/litinoveweedle/hassio-addons)):
+**Step 2 — Modules:** The user adds modules one at a time from a menu-driven flow:
 
-- **`STRING`** — Optional string/group name (e.g., `A`, `B`, `East`, `West`). Used to logically group optimizers. Omit for no grouping.
+- **`STRING`** — Required string/group name (e.g., `A`, `B`, `East`, `West`).
 - **`NAME`** — Required user-friendly name for the optimizer (e.g., `Panel_01`, `Roof_North_3`).
-- **`BARCODE`** — Optional Tigo barcode from the module sticker (e.g., `S-1234567A`). If omitted, the module is matched to a discovered node by order of appearance.
+- **`BARCODE`** — Required Tigo barcode from the module sticker (e.g., `S-1234567A`).
 
-Example input:
-```
-A:Panel_01:S-1234567A, A:Panel_02:S-1234568B, B:Panel_03:S-2345678C
-```
+Barcodes are validated against the `X-NNNNNNNC` format and duplicates are rejected. The module list is stored in `ConfigEntry.data["modules"]` as:
 
-Barcodes are validated against the `X-NNNNNNNC` format using `pytap.core.barcode`. Invalid barcodes show an error.
-
-The parsed module list is stored in `ConfigEntry.data["modules"]` as:
 ```python
 [
-    {"string": "A", "name": "Panel_01", "barcode": "S-1234567A"},
-    {"string": "A", "name": "Panel_02", "barcode": "S-1234568B"},
-    {"string": "B", "name": "Panel_03", "barcode": "S-2345678C"},
+    {"string": "A", "name": "Panel_01", "barcode": "A-1234567B"},
+    {"string": "A", "name": "Panel_02", "barcode": "C-2345678D"},
+    {"string": "B", "name": "Panel_03", "barcode": "E-3456789F"},
 ]
 ```
 
@@ -338,18 +333,26 @@ Creates sensor entities **only** for optimizer modules explicitly listed in the 
 
 #### Entity Model
 
-Each configured Tigo TS4 optimizer module becomes a **device** in the HA device registry, with multiple sensor entities:
+Each configured Tigo TS4 optimizer module becomes a **device** in the HA device registry, with 10 sensor entities:
 
 ```
 Device: "Tigo TS4 Panel_01" (user-defined name from config)
   ├── Sensor: Power          (W)   — SensorDeviceClass.POWER
   ├── Sensor: Voltage In     (V)   — SensorDeviceClass.VOLTAGE
   ├── Sensor: Voltage Out    (V)   — SensorDeviceClass.VOLTAGE
-  ├── Sensor: Current        (A)   — SensorDeviceClass.CURRENT
+    ├── Sensor: Current In     (A)   — SensorDeviceClass.CURRENT
+    ├── Sensor: Current Out    (A)   — SensorDeviceClass.CURRENT
   ├── Sensor: Temperature    (°C)  — SensorDeviceClass.TEMPERATURE
   ├── Sensor: DC-DC Duty Cycle (%) — SensorStateClass.MEASUREMENT
-  └── Sensor: RSSI           (dBm) — SensorDeviceClass.SIGNAL_STRENGTH
+    ├── Sensor: RSSI           (dBm) — SensorDeviceClass.SIGNAL_STRENGTH
+    ├── Sensor: Daily Energy   (Wh)  — SensorDeviceClass.ENERGY
+    └── Sensor: Total Energy   (Wh)  — SensorDeviceClass.ENERGY
 ```
+
+Aggregate virtual devices are also created:
+
+- `Tigo String <name>`: 3 sensors (`power`, `daily_energy`, `total_energy`)
+- `Tigo Installation`: 3 sensors (`power`, `daily_energy`, `total_energy`)
 
 #### Device Info
 
@@ -362,19 +365,6 @@ DeviceInfo(
     manufacturer="Tigo Energy",
     model="TS4",
     serial_number=barcode,
-    via_device=(DOMAIN, f"gateway_{gateway_id}"),
-)
-```
-
-Gateway devices are also registered:
-
-```python
-DeviceInfo(
-    identifiers={(DOMAIN, f"gateway_{gateway_id}")},
-    name=f"Tigo Gateway {gateway_id}",
-    manufacturer="Tigo Energy",
-    model="TAP Gateway",
-    sw_version=version,
 )
 ```
 
@@ -383,9 +373,10 @@ DeviceInfo(
 Unlike auto-discovery integrations, entities are created **deterministically** from the configured module list:
 
 1. At `async_setup_entry`, the sensor platform reads `ConfigEntry.data["modules"]`.
-2. For each configured module, it creates the full set of 7 sensor entities immediately.
-3. Entities start in an **unavailable** state until the first matching `PowerReportEvent` arrives from the bus.
-4. When the coordinator receives a `PowerReportEvent` with a barcode matching a configured module, the corresponding entities become available and display live data.
+2. For each configured module, it creates the full set of 10 per-optimizer sensor entities immediately.
+3. It also creates aggregate sensors per distinct string and for the whole installation.
+4. Entities start in an **unavailable** state until the first matching `PowerReportEvent` arrives from the bus.
+5. When the coordinator receives a `PowerReportEvent` with a barcode matching a configured module, the corresponding entities become available and display live data.
 
 This approach is inspired by the [taptap HA add-on](https://github.com/litinoveweedle/hassio-addons) which similarly requires users to define `taptap_modules` as `STRING:NAME:SERIAL` triplets.
 
@@ -394,7 +385,7 @@ This approach is inspired by the [taptap HA add-on](https://github.com/litinovew
 - **Predictable entity IDs** — Users know exactly which entities will exist, enabling dashboards and automations to be set up before the first data arrives.
 - **No phantom entities** — Auto-discovery can create entities for neighbor nodes on adjacent installations sharing the same RS-485 bus. Explicit barcodes prevent this.
 - **User-friendly names** — Names are defined by the user (e.g., "Roof_East_Panel_03") rather than opaque node IDs.
-- **String grouping** — The optional `string` field groups optimizers for aggregate statistics (e.g., total power per string).
+- **String grouping** — The required `string` field powers deterministic per-string aggregate entities.
 
 #### Barcode-to-Node Matching
 
@@ -525,7 +516,7 @@ The library maintains a clean boundary: it has **no Home Assistant imports** and
 Unlike most HA integrations that poll an API on an interval, PyTap uses a continuous streaming model:
 
 | Aspect | Polling | Streaming (PyTap) |
-|--------|---------|---------------------|
+| --- | --- | --- |
 | Latency | `scan_interval` seconds | Sub-second |
 | Bandwidth | Redundant requests | Only new data |
 | HA CPU | Timer fires + HTTP call | Idle until event arrives |
@@ -584,7 +575,7 @@ The coordinator stores node data as a flat dictionary keyed by `barcode` (not `n
 ### User-Facing Config (via Config Flow)
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| --- | --- | --- | --- |
 | `host` | string | (required) | IP address or hostname of the Tigo gateway |
 | `port` | int | 502 | TCP port for the gateway's RS-485 bridge |
 | `modules` | list | (required) | List of optimizer modules as `STRING:NAME:BARCODE` triplets |
@@ -599,7 +590,7 @@ Example: `A:Panel_01:S-1234567A, A:Panel_02:S-1234568B, B:Panel_03:S-2345678C`
 ### Internal Constants
 
 | Constant | Value | Description |
-|----------|-------|-------------|
+| --- | --- | --- |
 | `RECONNECT_TIMEOUT` | 60s | Seconds of silence before reconnecting |
 | `RECONNECT_DELAY` | 5s | Delay between reconnection attempts |
 | `RECONNECT_RETRIES` | 0 | Max retries (0 = infinite) |
@@ -618,7 +609,7 @@ Changes trigger a full integration reload. Previously-discovered barcode mapping
 ## Error Handling
 
 | Scenario | Behavior |
-|----------|----------|
+| --- | --- |
 | Gateway unreachable at setup | Config flow warns but proceeds (non-blocking) |
 | Connection lost mid-stream | Coordinator reconnects automatically with backoff |
 | CRC error in protocol data | Parser increments `counters["crc_errors"]`, skips frame |
@@ -638,7 +629,7 @@ Changes trigger a full integration reload. Previously-discovered barcode mapping
 ### Unit Tests (`tests/`)
 
 | Test File | Scope |
-|-----------|-------|
+| --- | --- |
 | `test_config_flow.py` | Config flow form rendering, validation, error handling (13 tests) |
 | `test_coordinator_persistence.py` | Event processing, persistence, barcode mapping lifecycle (19 tests) |
 | `test_migration.py` | Config entry migration and legacy entity cleanup (5 tests) |
@@ -647,7 +638,7 @@ Changes trigger a full integration reload. Previously-discovered barcode mapping
 ### Parser Tests (`custom_components/pytap/pytap/tests/`)
 
 | Test File | Scope |
-|-----------|-------|
+| --- | --- |
 | `test_parser.py` | End-to-end byte → event parsing with captured data |
 | `test_types.py` | Protocol type construction and validation |
 | `test_crc.py` | CRC calculation against known vectors |

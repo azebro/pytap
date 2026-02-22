@@ -3,18 +3,29 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![HA Version](https://img.shields.io/badge/Home%20Assistant-2024.1%2B-blue.svg)](https://www.home-assistant.io/)
 
-A Home Assistant custom component for monitoring **Tigo TAP solar energy systems**. PyTap connects to your Tigo gateway over TCP, passively listens to the RS-485 bus protocol, and exposes real-time per-optimizer sensor entities — power, voltage, current, temperature, and more.
+A Home Assistant custom component for monitoring **Tigo TAP solar energy systems**.
+PyTap connects to your Tigo gateway over TCP, passively listens to the RS-485
+bus protocol, and exposes real-time per-optimizer sensor entities — power,
+voltage, current, temperature, and more.
 
 ---
+
+## Hardware requirements
+Please note that this integration requires RS485 to TCP converter that needs to be connected to Tigo CCA to read the data from TAPs. It should be connected exactly the same way the TAP is connected to CCA. For detailed hardware requirements and connection details review this repo: [taptap](https://github.com/willglynn/taptap).
 
 ## Features
 
 - **Real-time streaming** — Push-based data delivery with sub-second latency (no polling).
-- **Per-optimizer sensors** — 10 sensor entities per Tigo TS4 module: power, voltage in/out, current in/out, temperature, DC-DC duty cycle, RSSI, daily energy, and total energy.
+- **Per-optimizer sensors** — 10 sensor entities per Tigo TS4 module: power,
+  voltage in/out, current in/out, temperature, DC-DC duty cycle, RSSI,
+  daily energy, and total energy.
+- **Aggregate sensors** — 3 sensors per string and 3 for the full installation: power, daily energy, total energy.
 - **Menu-driven setup** — Add optimizer modules one at a time with guided form fields.
 - **Barcode-based identification** — Stable hardware barcodes as entity identifiers (survives gateway restarts).
 - **Discovery logging** — Unconfigured barcodes seen on the bus are logged for easy identification.
-- **Persistent barcode mapping** — Discovered barcodes and node mappings are saved across restarts. When you add a previously-discovered barcode, it resolves instantly without waiting for the next gateway enumeration.
+- **Persistent barcode mapping** — Discovered barcodes and node mappings are
+    saved across restarts. When you add a previously-discovered barcode,
+    it resolves instantly without waiting for the next gateway enumeration.
 - **Energy accumulation** — Trapezoidal Wh integration with daily reset semantics and monotonic lifetime totals.
 - **No external dependencies** — The protocol parser library is fully embedded; nothing to install from PyPI.
 - **Options flow** — Add or remove optimizer modules at any time without reconfiguring.
@@ -24,7 +35,7 @@ A Home Assistant custom component for monitoring **Tigo TAP solar energy systems
 Each configured Tigo TS4 optimizer exposes the following sensors:
 
 | Sensor | Unit | Device Class |
-|--------|------|-------------|
+| --- | --- | --- |
 | Power | W | `power` |
 | Voltage In | V | `voltage` |
 | Voltage Out | V | `voltage` |
@@ -35,6 +46,11 @@ Each configured Tigo TS4 optimizer exposes the following sensors:
 | RSSI | dBm | `signal_strength` |
 | Daily Energy | Wh | `energy` |
 | Total Energy | Wh | `energy` |
+
+PyTap also creates aggregate virtual devices:
+
+- **Tigo String <name>** — `power`, `daily_energy`, `total_energy`
+- **Tigo Installation** — `power`, `daily_energy`, `total_energy`
 
 ---
 
@@ -61,7 +77,9 @@ PyTap is configured entirely through the Home Assistant UI — no YAML needed.
 2. Search for **PyTap**.
 3. Enter your Tigo gateway's **host** (IP address or hostname) and **port** (default: 502).
 
-> **Note:** The connection test is non-blocking. If the gateway is temporarily unreachable (e.g., powered off at night), setup will proceed and connect when the gateway becomes available.
+> **Note:** The connection test is non-blocking. If the gateway is temporarily
+> unreachable (e.g., powered off at night), setup will proceed and connect
+> when the gateway becomes available.
 
 ### Step 2: Add Modules
 
@@ -69,7 +87,7 @@ After entering connection details, you'll see a modules menu:
 
 1. Click **"Add a module"**.
 2. Fill in the fields:
-   - **String group** — Optional label to group optimizers by string (e.g., `A`, `East`).
+    - **String group** — Required label to group optimizers by string (e.g., `A`, `East`).
    - **Name** — A friendly name for the optimizer (e.g., `Roof_Panel_01`).
    - **Barcode** — The Tigo optimizer barcode printed on the module (e.g., `A-1234567B`).
 3. Repeat for each optimizer you want to monitor.
@@ -213,7 +231,7 @@ Run `./deploy/deploy.sh --help` for all options.
 
 ## Acknowledgements
 
-Inspired by the [taptap Home Assistant add-on](https://github.com/litinoveweedle/hassio-addons) which pioneered the barcode-driven module configuration approach for Tigo systems.
+Inspired by the [taptap](https://github.com/willglynn/taptap) which reverse engineered the Tigo TAP protcol.
 
 ---
 

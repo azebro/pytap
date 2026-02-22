@@ -12,7 +12,9 @@ Each sensor now implements the following meters:
 
 ## 2. Total Cumulatives
 
-Next step: create aggregate entities to show daily and total energy for:
+Status: ✅ Implemented in Feature 2.
+
+Aggregate entities now expose power, daily energy, and total energy at two levels:
 
 2.1 **String**
 

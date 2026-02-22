@@ -14,7 +14,13 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 
-from .const import CONF_MODULE_BARCODE, CONF_MODULES, DOMAIN
+from .const import (
+    CONF_MODULE_BARCODE,
+    CONF_MODULE_STRING,
+    CONF_MODULES,
+    DEFAULT_STRING_NAME,
+    DOMAIN,
+)
 from .coordinator import PyTapDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -22,7 +28,8 @@ _LOGGER = logging.getLogger(__name__)
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 
 # Bumped from 1 → 2 when voltage/current were split into in/out variants.
-CONFIG_ENTRY_VERSION = 2
+# Bumped from 2 → 3 when module string labels became mandatory.
+CONFIG_ENTRY_VERSION = 3
 
 # Old unique IDs that were replaced by the _in/_out split.
 _LEGACY_UNIQUE_ID_RENAMES: dict[str, str] = {
@@ -91,15 +98,37 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Migrate a config entry to the current version.
 
     v1 → v2: voltage/current sensors split into _in/_out variants.
+    v2 → v3: module string labels are mandatory.
     """
-    if entry.version < CONFIG_ENTRY_VERSION:
+    if entry.version == 1:
         _LOGGER.info(
-            "Migrating PyTap config entry %s from version %d to %d",
+            "Migrating PyTap config entry %s from version 1 to 2",
             entry.entry_id,
-            entry.version,
-            CONFIG_ENTRY_VERSION,
         )
-        hass.config_entries.async_update_entry(entry, version=CONFIG_ENTRY_VERSION)
+        hass.config_entries.async_update_entry(entry, version=2)
+
+    if entry.version == 2:
+        _LOGGER.info(
+            "Migrating PyTap config entry %s from version 2 to 3",
+            entry.entry_id,
+        )
+        modules = list(entry.data.get(CONF_MODULES, []))
+        updated_modules: list[dict[str, str]] = []
+        updated = False
+
+        for module in modules:
+            normalized = dict(module)
+            if not normalized.get(CONF_MODULE_STRING):
+                normalized[CONF_MODULE_STRING] = DEFAULT_STRING_NAME
+                updated = True
+            updated_modules.append(normalized)
+
+        if updated:
+            new_data = {**entry.data, CONF_MODULES: updated_modules}
+            hass.config_entries.async_update_entry(entry, data=new_data, version=3)
+        else:
+            hass.config_entries.async_update_entry(entry, version=3)
+
     return True
 
 

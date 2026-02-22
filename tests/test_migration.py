@@ -22,6 +22,7 @@ from custom_components.pytap.const import (
     CONF_MODULE_NAME,
     CONF_MODULE_STRING,
     CONF_MODULES,
+    DEFAULT_STRING_NAME,
     DEFAULT_PORT,
     DOMAIN,
 )
@@ -41,14 +42,18 @@ MOCK_MODULES = [
 ]
 
 
-def _make_entry(hass: HomeAssistant, version: int = 1) -> MockConfigEntry:
+def _make_entry(
+    hass: HomeAssistant,
+    version: int = 1,
+    modules: list[dict[str, str]] | None = None,
+) -> MockConfigEntry:
     """Create and register a MockConfigEntry."""
     entry = MockConfigEntry(
         domain=DOMAIN,
         data={
             CONF_HOST: "192.168.1.100",
             CONF_PORT: DEFAULT_PORT,
-            CONF_MODULES: MOCK_MODULES,
+            CONF_MODULES: modules if modules is not None else MOCK_MODULES,
         },
         version=version,
         entry_id="test_entry_migration",
@@ -137,10 +142,10 @@ class TestLegacyEntityCleanup:
 
 
 class TestConfigEntryMigration:
-    """Test async_migrate_entry bumps version."""
+    """Test async_migrate_entry version and data migrations."""
 
     async def test_migrates_v1_to_v2(self, hass: HomeAssistant) -> None:
-        """Config entry version should be bumped from 1 to 2."""
+        """Config entry version should be bumped from 1 to current version."""
         entry = _make_entry(hass, version=1)
 
         result = await async_migrate_entry(hass, entry)
@@ -157,3 +162,65 @@ class TestConfigEntryMigration:
 
         assert result is True
         assert entry.version == original_version
+
+    async def test_migrate_v2_to_v3_empty_strings(self, hass: HomeAssistant) -> None:
+        """Modules with missing/empty string should get default label."""
+        entry = _make_entry(
+            hass,
+            version=2,
+            modules=[
+                {
+                    CONF_MODULE_STRING: "",
+                    CONF_MODULE_NAME: "Panel_01",
+                    CONF_MODULE_BARCODE: "A-1234567B",
+                },
+                {
+                    CONF_MODULE_NAME: "Panel_02",
+                    CONF_MODULE_BARCODE: "C-2345678D",
+                },
+            ],
+        )
+
+        result = await async_migrate_entry(hass, entry)
+
+        assert result is True
+        assert entry.version == CONFIG_ENTRY_VERSION
+        assert entry.data[CONF_MODULES][0][CONF_MODULE_STRING] == DEFAULT_STRING_NAME
+        assert entry.data[CONF_MODULES][1][CONF_MODULE_STRING] == DEFAULT_STRING_NAME
+
+    async def test_migrate_v2_to_v3_existing_strings(self, hass: HomeAssistant) -> None:
+        """Existing string labels should be preserved."""
+        entry = _make_entry(hass, version=2)
+        original_modules = list(entry.data[CONF_MODULES])
+
+        result = await async_migrate_entry(hass, entry)
+
+        assert result is True
+        assert entry.version == CONFIG_ENTRY_VERSION
+        assert entry.data[CONF_MODULES] == original_modules
+
+    async def test_migrate_v2_to_v3_mixed(self, hass: HomeAssistant) -> None:
+        """Only missing string labels should be defaulted in mixed lists."""
+        entry = _make_entry(
+            hass,
+            version=2,
+            modules=[
+                {
+                    CONF_MODULE_STRING: "A",
+                    CONF_MODULE_NAME: "Panel_01",
+                    CONF_MODULE_BARCODE: "A-1234567B",
+                },
+                {
+                    CONF_MODULE_STRING: "",
+                    CONF_MODULE_NAME: "Panel_02",
+                    CONF_MODULE_BARCODE: "C-2345678D",
+                },
+            ],
+        )
+
+        result = await async_migrate_entry(hass, entry)
+
+        assert result is True
+        assert entry.version == CONFIG_ENTRY_VERSION
+        assert entry.data[CONF_MODULES][0][CONF_MODULE_STRING] == "A"
+        assert entry.data[CONF_MODULES][1][CONF_MODULE_STRING] == DEFAULT_STRING_NAME

@@ -37,15 +37,15 @@ PyTap is a Home Assistant custom component that passively monitors Tigo TAP sola
 **Key characteristics of the current implementation:**
 
 | Aspect | Implementation |
-|--------|---------------|
+| --- | --- |
 | Integration type | Hub (`integration_type: "hub"`) |
 | Data delivery | Push-based streaming (`iot_class: "local_push"`) |
 | Entity creation | Deterministic from user-configured barcode list (no auto-discovery) |
 | Config flow | Menu-driven: add modules one at a time via individual form fields |
 | Threading model | Blocking parser in executor thread, bridged to async event loop |
 | External dependencies | None — parser library embedded, stdlib only |
-| Sensor types | 10 per optimizer: power, voltage in/out, current in/out, temperature, duty cycle, RSSI, daily energy, total energy |
-| Test coverage | 65 tests (13 config flow + 28 coordinator persistence + 5 migration + 9 sensor platform + 10 energy unit tests) |
+| Sensor types | 10 per optimizer + aggregate sensors per string and per installation (power, daily energy, total energy) |
+| Test coverage | Expanded integration + parser coverage, including aggregate sensor and v2→v3 migration behavior |
 
 ---
 
@@ -101,7 +101,7 @@ DEFAULT_PORT = 502                # Tigo gateway default TCP port
 
 # Config entry data keys
 CONF_MODULES = "modules"          # List of module dicts in ConfigEntry.data
-CONF_MODULE_STRING = "string"     # Optional string/group label
+CONF_MODULE_STRING = "string"     # Required string/group label
 CONF_MODULE_NAME = "name"         # User-friendly optimizer name
 CONF_MODULE_BARCODE = "barcode"   # Tigo hardware barcode (stable ID)
 
@@ -295,6 +295,7 @@ def _process_event(self, event) -> bool:
 4. Upserts into `self.data["nodes"][barcode]` with all power fields plus `last_update` timestamp. Returns `True`.
 
 The data dict stored per node:
+
 ```python
 {
     "gateway_id": int,
@@ -368,7 +369,7 @@ The `_init_mappings_from_parser` method pre-populates barcode↔node mappings fr
 
 ### `sensor.py` — Sensor Platform
 
-**~270 lines** implementing 10 sensor entity types using the `CoordinatorEntity` pattern.
+Implements per-optimizer sensors and aggregate sensors using the `CoordinatorEntity` pattern.
 
 #### Sensor Descriptions
 
@@ -412,7 +413,12 @@ for module_config in modules:
         entities.append(PyTapSensor(coordinator, description, module_config, entry))
 ```
 
-Two modules × 10 descriptions = 20 sensor entities.
+For two modules on two strings, entity creation is:
+
+- Per-optimizer: `2 × 10 = 20`
+- Per-string aggregate: `2 × 3 = 6`
+- Installation aggregate: `3`
+- Total: `29`
 
 #### `PyTapSensor` Class
 
@@ -423,6 +429,7 @@ Inherits `CoordinatorEntity[PyTapDataUpdateCoordinator]` and `SensorEntity`.
 - `has_entity_name = True`
 
 **Device grouping:**
+
 ```python
 DeviceInfo(
     identifiers={(DOMAIN, barcode)},
@@ -452,16 +459,20 @@ Returns `True` only when `coordinator.data["nodes"][barcode]` exists (i.e., at l
 
 ### `__init__.py` — Integration Lifecycle
 
-**~135 lines** handling integration lifecycle, config entry migration, and legacy entity cleanup.
+Handles integration lifecycle, config entry migration, and legacy entity cleanup.
 
 #### Config Entry Version
 
-`CONFIG_ENTRY_VERSION = 2` — Bumped from 1 when voltage/current sensors were split into `_in`/`_out` variants in v0.2.0.
+`CONFIG_ENTRY_VERSION = 3`:
+
+- `v1 → v2`: voltage/current split to `_in`/`_out`
+- `v2 → v3`: module string labels became mandatory (defaulted to `"Default"` during migration)
 
 #### `async_migrate_entry(hass, entry) → bool`
 
 Handles config entry version migration:
-- **v1 → v2:** Updates `entry.version` to 2. The actual entity cleanup is done in `_async_cleanup_legacy_entities` during setup.
+- **v1 → v2:** Updates `entry.version` to 2.
+- **v2 → v3:** Ensures each module has a non-empty string label, defaulting missing/empty values to `"Default"`.
 
 #### `async_setup_entry(hass, entry) → bool`
 
@@ -508,7 +519,7 @@ Defines all user-facing text for the config flow and options flow in structured 
 - `add_module` — Same fields as config flow.
 - `remove_module` — Dropdown with `remove_barcode` selector.
 
-**Error strings:** `cannot_connect`, `invalid_barcode`, `missing_name`, `missing_barcode`, `duplicate_barcode`, `no_modules`, `unknown`.
+**Error strings:** `cannot_connect`, `invalid_barcode`, `missing_string`, `missing_name`, `missing_barcode`, `duplicate_barcode`, `no_modules`, `unknown`.
 
 **Abort reasons:** `already_configured`.
 
@@ -518,16 +529,16 @@ Defines all user-facing text for the config flow and options flow in structured 
 
 ## Config Flow UX Design
 
-The config flow uses a **menu-driven approach** where users add optimizer modules one at a time through individual form fields, rather than typing comma-separated text.
+The config flow uses a **menu-driven approach** where users add optimizer modules one at a time through individual form fields.
 
 ### Rationale
 
-The initial implementation used a comma-separated text field where users entered all modules as `STRING:NAME:BARCODE` triplets in a single textarea. This was replaced because:
+The menu-driven form is used because it improves usability and validation:
 
-1. **Error-prone** — Easy to misplace colons, commas, or spaces.
-2. **No per-field validation** — Errors couldn't be attributed to a specific module or field.
-3. **Poor discoverability** — Users had to know the format without guidance.
-4. **No inline help** — Individual fields can have their own descriptions.
+1. **Lower error rate** — Each field is validated directly.
+2. **Per-field errors** — Validation issues are shown on the relevant field.
+3. **Better discoverability** — Users are guided through the expected inputs.
+4. **Inline help** — Each field can include a focused description.
 
 ### Current UX Flow
 
@@ -540,7 +551,7 @@ The initial implementation used a comma-separated text field where users entered
    [Add a module]  [Finish setup]
 
 3. User clicks "Add a module" → form appears:
-   String group: [___________]  (optional)
+    String group: [___________]  (required)
    Name:         [___________]  (required)
    Barcode:      [___________]  (required)
 
@@ -613,12 +624,12 @@ Home Assistant frontend / automations / history
 - **Async mode:** `asyncio_mode = auto` (in `pytest.ini`)
 - **Fixture:** `auto_enable_custom_integrations` (in `conftest.py`) enables loading from `custom_components/`.
 
-### Config Flow Tests (13 tests)
+### Config Flow Tests
 
 Representative tests:
 
 | Test | What it verifies |
-|------|-----------------|
+| --- | --- |
 | `test_step_user_shows_form` | Initial step renders host/port form with no errors |
 | `test_user_step_proceeds_to_menu` | Submitting host/port advances to modules_menu |
 | `test_user_step_proceeds_even_without_connection` | Failed TCP test still proceeds (non-blocking) |
@@ -631,12 +642,12 @@ Representative tests:
 
 All tests mock `validate_connection` to avoid real TCP connections.
 
-### Sensor Platform Tests (9 tests)
+### Sensor Platform Tests
 
 | Test | What it verifies |
-|------|-----------------|
-| `test_sensor_entities_created` | 2 modules × 10 sensors = 20 entities |
-| `test_sensor_unique_ids` | IDs follow `{DOMAIN}_{barcode}_{key}` pattern |
+| --- | --- |
+| `test_sensor_entities_created` | 2 modules, 2 strings create 29 entities including aggregate sensors |
+| `test_sensor_unique_ids` | IDs include per-optimizer and aggregate unique ID formats |
 | `test_sensor_available_with_data` | Sensor available when node data exists |
 | `test_sensor_unavailable_without_data` | Sensor unavailable when data dict is empty |
 | `test_sensor_skips_modules_without_barcode` | Modules with empty barcode don't create entities |
@@ -644,6 +655,10 @@ All tests mock `validate_connection` to avoid real TCP connections.
 | `test_sensor_descriptions_count` | Exactly 10 sensor descriptions defined |
 | `test_energy_sensor_descriptions` | Daily/total energy sensor metadata and state classes |
 | `test_daily_energy_last_reset` | Daily energy exposes `last_reset` from `daily_reset_date` |
+| `test_string_daily_energy_sums` | String daily aggregate sums constituent `daily_energy_wh` |
+| `test_installation_total_energy_sums_all` | Installation total aggregate sums constituent `total_energy_wh` |
+| `test_string_aggregate_device_info` | String aggregate uses virtual string device metadata |
+| `test_installation_aggregate_device_info` | Installation aggregate uses installation virtual device metadata |
 
 Tests use `MagicMock(spec=PyTapDataUpdateCoordinator)` to avoid real coordinator initialization.
 
@@ -655,22 +670,23 @@ Coverage includes coordinator initialization, barcode mapping restoration and pu
 
 `tests/test_energy.py` validates trapezoidal integration in isolation across baseline behavior, nominal interval integration, gap handling during production, overnight gaps, daily resets with preserved total accumulation, and related edge cases.
 
-### Entity Migration Tests (5 tests)
+### Entity Migration Tests
 
 | Test | What it verifies |
-|------|-----------------|
+| --- | --- |
 | `test_removes_old_voltage_and_current_entities` | Legacy voltage/current entity registry entries removed on setup |
 | `test_does_not_touch_new_entities` | New _in/_out entities are not affected by cleanup |
 | `test_no_op_when_no_legacy_entities` | No errors when no legacy entities exist |
-| `test_migrates_v1_to_v2` | Config entry version bumped from 1 to 2 |
-| `test_already_current_version` | v2 entries pass through migration unchanged |
+| `test_migrates_v1_to_v2` | Config entry version migrates forward to current version |
+| `test_migrate_v2_to_v3_empty_strings` | Empty/missing module strings are defaulted during migration |
+| `test_already_current_version` | Current-version entries pass through migration unchanged |
 
 ### Parser Library Tests (in `custom_components/pytap/pytap/tests/`)
 
 The embedded parser library has its own test suite:
 
 | Test File | Coverage |
-|-----------|----------|
+| --- | --- |
 | `test_parser.py` | Byte-level protocol parsing with captured data |
 | `test_types.py` | Protocol type construction and field validation |
 | `test_crc.py` | CRC-16 calculation against known vectors |
@@ -694,14 +710,14 @@ python3 -m ruff check custom_components/pytap/
 
 ## Design Decisions & Trade-offs
 
-### 1. Menu-Driven Module Input (vs. Comma-Separated Text)
+### 1. Menu-Driven Module Input
 
 **Chosen:** Individual form-per-module with a menu loop.
 
 **Trade-off:** More config flow steps for users with many modules, but significantly better UX:
 - Per-field validation with targeted error messages.
-- Optional field (string group) is clearly labeled.
-- No need to remember `STRING:NAME:BARCODE` format.
+- Required field (string group) is clearly labeled.
+- Guided field-by-field entry for string, name, and barcode.
 - Matches HA's native form conventions.
 
 ### 2. Non-Blocking Connection Test
@@ -754,15 +770,15 @@ python3 -m ruff check custom_components/pytap/
 The architecture document (`architecture.md`) was written during initial design and has not been fully updated for the menu-driven config flow. Notable differences:
 
 | Aspect | Architecture Doc | Actual Implementation |
-|--------|-----------------|----------------------|
-| Config flow modules step | Two-step: host/port → comma-separated modules text | Menu-driven: host/port → modules_menu → add_module loop → finish |
-| Module input format | `STRING:NAME:BARCODE` comma-separated text blob | Individual form fields per module |
+| --- | --- | --- |
+| Config flow modules step | Legacy flow variants | Menu-driven: host/port → modules_menu → add_module loop → finish |
+| Module input format | Legacy text input formats | Individual form fields per module |
 | Options flow | Described as text-based reconfiguration | Menu with add/remove/done actions |
 | Gateway device registration | Described as separate DeviceInfo | Not yet implemented (sensors have device info per optimizer only) |
 | `via_device` on nodes | Linked to gateway device | Not implemented (no gateway device yet) |
 | Unavailable timeout | Described as configurable via options | Removed — sensors hold last value indefinitely |
-| Sensor count | 7 per optimizer (single voltage/current) | 8 per optimizer (voltage_in/out, current_in/out) |
-| Config entry version | Not mentioned | v2 with async_migrate_entry and legacy entity cleanup |
+| Sensor count | Historical counts | 10 per optimizer, plus string/installation aggregate sensors |
+| Config entry version | Not mentioned | v3 with v1→v2 and v2→v3 migration steps |
 | Threading primitives | Not specified | threading.Event + threading.Lock (not asyncio.Event) |
 | Diagnostics platform | Mentioned for discovered barcodes | Not implemented yet (data stored in coordinator) |
 
@@ -776,15 +792,15 @@ Created `docs/architecture.md` capturing the full design: system context, module
 
 ### Phase 2 — Barcode-Driven Design
 
-Updated the architecture to remove auto-discovery in favor of user-configured barcodes, inspired by the [taptap HA add-on](https://github.com/litinoveweedle/hassio-addons). Added the `STRING:NAME:BARCODE` triplet pattern.
+Updated the architecture to remove auto-discovery in favor of user-configured barcodes, inspired by the [taptap HA add-on](https://github.com/litinoveweedle/hassio-addons).
 
 ### Phase 3 — Initial Implementation
 
 Implemented all core files:
 - `const.py`, `manifest.json` — Constants and metadata.
-- `config_flow.py` — Two-step flow (host/port → comma-separated modules).
+- `config_flow.py` — Menu-driven flow (host/port → modules menu → add/remove modules).
 - `coordinator.py` — Push-based streaming with barcode filtering.
-- `sensor.py` — 7 sensor types with CoordinatorEntity.
+- `sensor.py` — 10 per-optimizer sensor types plus aggregate sensor platform entities.
 - `__init__.py` — Lifecycle management.
 - `strings.json`, `translations/en.json` — UI strings.
 - Test suite — 14 tests passing.
@@ -795,7 +811,7 @@ Discovered that the TCP connection test in step 1 blocked the flow when no gatew
 
 ### Phase 5 — Menu-Driven Config Flow
 
-Rewrote the config flow from a comma-separated text input to a menu-driven approach:
+Refined the config flow to the current menu-driven approach:
 - Individual `add_module` form with string/name/barcode fields.
 - Menu loop for adding multiple modules.
 - Options flow with add/remove/done menu.
@@ -816,7 +832,7 @@ Created this implementation document capturing all development work to date.
 
 ### Phase 8 — Entity Migration (v0.2.0)
 
-- Split `voltage` → `voltage_in`/`voltage_out` and `current` → `current_in`/`current_out`, growing sensor count from 7 to 8 per optimizer.
+- Split `voltage` → `voltage_in`/`voltage_out` and `current` → `current_in`/`current_out`, then expanded per-optimizer sensor count to 10 with daily/total energy.
 - Added entity registry cleanup in `_async_cleanup_legacy_entities()` to remove orphaned `voltage`/`current` entities from pre-v0.2.0 installs.
 - Bumped config entry version to 2 and added `async_migrate_entry()` for v1→v2 migration.
 - Bumped manifest version to 0.2.0.
@@ -839,7 +855,7 @@ Created this implementation document capturing all development work to date.
 - **Coordinator-saved mapping preservation** — `_init_mappings_from_parser` now preserves coordinator-saved barcode↔node mappings when the parser state is empty (merge instead of replace). This prevents previously-learned mappings from being wiped on reconnect when the parser state file has no node table.
 - **Instant barcode resolution on module add** — `reload_modules` now checks if newly-added barcodes already exist in the saved barcode↔node mapping and pre-populates placeholder node data so sensor entities can bind immediately without waiting for the next power report.
 
-### Phase 12 — Node Address Bit-15 Masking
+### Phase 11 — Node Address Bit-15 Masking
 
 - **Node address bit-15 flag masking** — Fixed parser `_handle_node_table_command` to mask node addresses to 15 bits (`& 0x7FFF`) when parsing `NODE_TABLE_RESPONSE` entries. Bit 15 of the `NodeAddress` in node table entries is a protocol flag (indicating router/repeater status), not part of the node ID. Two nodes with barcodes `4-D39A3ES` and `4-D39CB6R` were observed with raw addresses `0x8019` (32793) and `0x801A` (32794) instead of the expected 25 and 26. Without masking, node table keys did not match the 15-bit node IDs used in power reports, causing those nodes' power data to be unresolvable to barcodes.
 - **Debug logging for flagged nodes** — When bit 15 is detected on a node address, the parser now emits a `DEBUG`-level log with the raw and masked values for protocol analysis.
@@ -856,6 +872,14 @@ Created this implementation document capturing all development work to date.
 - **Store version bumped to 2** — Added migration path from v1 (barcode mappings + discovered barcodes only) to v2 (adds `parser_state`).
 - **Tests updated** — Replaced `_state_file_path` assertions with `_persistent_state` checks, added `test_load_restores_parser_state` and `test_load_handles_corrupt_parser_state`. 51 tests passing.
 - **Documentation updated** — All docs (README, architecture, implementation, API reference) updated to reflect the consolidated storage model and removed CLI.
+
+### Phase 13 — Aggregate Sensors & Mandatory String Labels
+
+- Added aggregate sensors for each string and for the full installation (`power`, `daily_energy`, `total_energy`).
+- Added `PyTapAggregateSensor` and dedicated virtual devices (`Tigo String <name>`, `Tigo Installation`).
+- Made module `string` mandatory in config and options flow (`missing_string` validation).
+- Bumped config entry version to 3 with `v2 → v3` migration defaulting missing strings to `"Default"`.
+- Added aggregate and migration tests to validate sums, IDs, availability, metadata, and migration behavior.
 ---
 
 ## Future Work
@@ -864,6 +888,5 @@ Items identified but not yet implemented:
 
 1. **Gateway device registration** — Create a device per gateway for the `via_device` hierarchy.
 2. **Diagnostics platform** — Expose `discovered_barcodes`, parser counters, and connection state as a diagnostics download.
-3. **String/installation energy aggregates** — Add cumulative daily/total energy entities at string and whole-installation scope.
-4. **Binary sensors** — Node connectivity and gateway online status.
-5. **HACS distribution** — Package with `hacs.json` for one-click installation.
+3. **Binary sensors** — Node connectivity and gateway online status.
+4. **HACS distribution** — Package with `hacs.json` for one-click installation.
