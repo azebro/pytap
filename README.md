@@ -3,10 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![HA Version](https://img.shields.io/badge/Home%20Assistant-2024.1%2B-blue.svg)](https://www.home-assistant.io/)
 
-A Home Assistant custom component for monitoring **Tigo TAP solar energy systems**.
-PyTap connects to your Tigo gateway over TCP, passively listens to the RS-485
-bus protocol, and exposes real-time per-optimizer sensor entities — power,
-voltage, current, temperature, and more.
+A Home Assistant custom integration for monitoring **Tigo TAP solar energy systems**. PyTap connects to your Tigo gateway over TCP, passively listens to the RS-485 bus protocol, and exposes real-time per-optimizer sensor entities — power, voltage, current, temperature, and more.
 
 ---
 
@@ -212,7 +209,7 @@ cp deploy/.deploy.env.example deploy/.deploy.env
 ./deploy/deploy.sh
 
 # Or pass credentials directly
-./deploy/deploy.sh --host 192.168.1.184 --user adam --password 'yourpass'
+./deploy/deploy.sh --host 192.168.1.184 --user 'user' --password 'yourpass'
 
 # Deploy without restarting HA
 ./deploy/deploy.sh --no-restart
@@ -231,7 +228,7 @@ Run `./deploy/deploy.sh --help` for all options.
 
 ## Acknowledgements
 
-Inspired by the [taptap](https://github.com/willglynn/taptap) which reverse engineered the Tigo TAP protcol.
+Inspired by the [taptap](https://github.com/litinoveweedle/taptap) and [taptap Home Assistant add-on](https://github.com/litinoveweedle/hassio-addons).
 
 ---
 
