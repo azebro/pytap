@@ -45,7 +45,7 @@ PyTap is a Home Assistant custom component that passively monitors Tigo TAP sola
 | Threading model | Blocking parser in executor thread, bridged to async event loop |
 | External dependencies | None — parser library embedded, stdlib only |
 | Sensor types | 10 per optimizer: power, voltage in/out, current in/out, temperature, duty cycle, RSSI, daily energy, total energy |
-| Test coverage | 60 tests (13 config flow + 28 coordinator persistence + 5 migration + 9 sensor platform + 5 energy unit tests) |
+| Test coverage | 65 tests (13 config flow + 28 coordinator persistence + 5 migration + 9 sensor platform + 10 energy unit tests) |
 
 ---
 
