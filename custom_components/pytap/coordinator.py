@@ -18,7 +18,8 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_MODULE_BARCODE,
@@ -27,10 +28,13 @@ from .const import (
     CONF_MODULES,
     DEFAULT_PORT,
     DOMAIN,
+    ENERGY_GAP_THRESHOLD_SECONDS,
+    ENERGY_LOW_POWER_THRESHOLD_W,
     RECONNECT_DELAY,
     RECONNECT_RETRIES,
     RECONNECT_TIMEOUT,
 )
+from .energy import EnergyAccumulator, accumulate_energy
 from .pytap.core.events import (
     Event,
     InfrastructureEvent,
@@ -115,6 +119,9 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Parser infrastructure state — shared between coordinator and parser
         self._persistent_state: PersistentState = PersistentState()
+
+        # Per-module energy accumulation state (persisted)
+        self._energy_state: dict[str, EnergyAccumulator] = {}
 
         # Initialize data structure
         self.data: dict[str, Any] = {
@@ -386,6 +393,24 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Get module metadata
         module_meta = self._module_lookup.get(barcode, {})
+        now = dt_util.now()
+
+        acc = self._energy_state.setdefault(
+            barcode,
+            EnergyAccumulator(daily_reset_date=now.date().isoformat()),
+        )
+        update_result = accumulate_energy(
+            acc,
+            power=event.power,
+            now=now,
+            gap_threshold=ENERGY_GAP_THRESHOLD_SECONDS,
+            low_power_threshold=ENERGY_LOW_POWER_THRESHOLD_W,
+        )
+        if update_result.discarded_gap_during_production:
+            _LOGGER.debug(
+                "Discarded energy trapezoid for %s due to long gap during production",
+                barcode,
+            )
 
         self.data["nodes"][barcode] = {
             "gateway_id": event.gateway_id,
@@ -401,8 +426,12 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "temperature": event.temperature,
             "dc_dc_duty_cycle": event.dc_dc_duty_cycle,
             "rssi": event.rssi,
-            "last_update": datetime.now().isoformat(),
+            "daily_energy_wh": round(acc.daily_energy_wh, 2),
+            "total_energy_wh": round(acc.total_energy_wh, 2),
+            "daily_reset_date": acc.daily_reset_date,
+            "last_update": now.isoformat(),
         }
+        self._schedule_save()
         return True
 
     def _handle_infrastructure(self, event: InfrastructureEvent) -> bool:
@@ -589,12 +618,37 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 self._persistent_state = PersistentState()
 
+        # Restore energy accumulation state
+        today = dt_util.now().date().isoformat()
+        for barcode, energy_data in stored.get("energy_data", {}).items():
+            last_reading_ts = None
+            if raw_ts := energy_data.get("last_reading_ts"):
+                try:
+                    last_reading_ts = datetime.fromisoformat(raw_ts)
+                except (TypeError, ValueError):
+                    last_reading_ts = None
+
+            daily_reset_date = str(energy_data.get("daily_reset_date", ""))
+            daily_energy_wh = float(energy_data.get("daily_energy_wh", 0.0))
+            if daily_reset_date != today:
+                daily_reset_date = today
+                daily_energy_wh = 0.0
+
+            self._energy_state[barcode] = EnergyAccumulator(
+                daily_energy_wh=daily_energy_wh,
+                total_energy_wh=float(energy_data.get("total_energy_wh", 0.0)),
+                daily_reset_date=daily_reset_date,
+                last_power_w=float(energy_data.get("last_power_w", 0.0)),
+                last_reading_ts=last_reading_ts,
+            )
+
         _LOGGER.info(
             "Restored coordinator state: %d barcode mappings, %d discovered barcodes, "
-            "%d gateway identities",
+            "%d gateway identities, %d energy states",
             len(barcode_to_node),
             len(discovered),
             len(self._persistent_state.gateway_identities),
+            len(self._energy_state),
         )
 
     async def _async_save_coordinator_state(self) -> None:
@@ -606,6 +660,20 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             },
             "discovered_barcodes": sorted(self._discovered_barcodes),
             "parser_state": self._persistent_state.to_dict(),
+            "energy_data": {
+                barcode: {
+                    "daily_energy_wh": acc.daily_energy_wh,
+                    "daily_reset_date": acc.daily_reset_date,
+                    "total_energy_wh": acc.total_energy_wh,
+                    "last_power_w": acc.last_power_w,
+                    "last_reading_ts": (
+                        acc.last_reading_ts.isoformat()
+                        if acc.last_reading_ts is not None
+                        else None
+                    ),
+                }
+                for barcode, acc in self._energy_state.items()
+            },
         }
         try:
             await self._store.async_save(data)
@@ -658,6 +726,11 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         for barcode in already_resolved:
             if barcode not in self.data["nodes"]:
                 module_meta = self._module_lookup.get(barcode, {})
+                now = dt_util.now()
+                acc = self._energy_state.setdefault(
+                    barcode,
+                    EnergyAccumulator(daily_reset_date=now.date().isoformat()),
+                )
                 self.data["nodes"][barcode] = {
                     "gateway_id": None,
                     "node_id": self._barcode_to_node[barcode],
@@ -672,6 +745,9 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "temperature": None,
                     "dc_dc_duty_cycle": None,
                     "rssi": None,
+                    "daily_energy_wh": round(acc.daily_energy_wh, 2),
+                    "total_energy_wh": round(acc.total_energy_wh, 2),
+                    "daily_reset_date": acc.daily_reset_date,
                     "last_update": None,
                 }
 

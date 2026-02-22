@@ -1,6 +1,5 @@
 """Tests for the core protocol parser."""
 
-import pytest
 from pytap.core.parser import Parser
 from pytap.core.crc import crc
 
@@ -652,7 +651,7 @@ def test_frame_accumulation():
     raw = (
         bytes([0xFF, 0x7E, 0x07]) + body + c.to_bytes(2, "little") + bytes([0x7E, 0x08])
     )
-    events = parser.feed(raw)
+    parser.feed(raw)
     assert parser.counters["frames_received"] == 1
     assert parser.counters["crc_errors"] == 0
 
@@ -692,7 +691,7 @@ def test_runt():
 def test_enumeration_sequence():
     """Feed the full enumeration sequence and verify infrastructure discovery."""
     parser = Parser()
-    events = parser.feed(ENUMERATION_SEQUENCE)
+    parser.feed(ENUMERATION_SEQUENCE)
 
     # Should parse many frames without errors
     assert parser.counters["frames_received"] > 10
@@ -777,7 +776,7 @@ def test_escape_handling():
             escaped.append(b)
 
     raw = bytes([0xFF, 0x7E, 0x07]) + bytes(escaped) + bytes([0x7E, 0x08])
-    events = parser.feed(raw)
+    parser.feed(raw)
     assert parser.counters["frames_received"] == 1
     assert parser.counters["crc_errors"] == 0
 
@@ -817,7 +816,7 @@ def test_split_across_feeds():
     # Split in the middle
     mid = len(raw) // 2
     parser.feed(raw[:mid])
-    events = parser.feed(raw[mid:])
+    parser.feed(raw[mid:])
 
     assert parser.counters["frames_received"] == 1
     assert parser.counters["crc_errors"] == 0
