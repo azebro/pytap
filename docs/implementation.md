@@ -80,7 +80,7 @@ tests/
 ├── test_coordinator_persistence.py # ~570 lines — 28 coordinator & persistence tests
 ├── test_migration.py              # ~120 lines — 5 entity migration tests
 ├── test_sensor.py                 # ~250 lines — 9 sensor platform tests
-└── test_energy.py                 # ~75 lines  — 5 pure energy accumulation tests
+└── test_energy.py                 # 142 lines  — 10 pure energy accumulation tests
 
 docs/
 ├── architecture.md      # 656 lines — Architecture & design document
