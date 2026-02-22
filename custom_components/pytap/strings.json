@@ -30,7 +30,7 @@
           "barcode": "Barcode"
         },
         "data_description": {
-          "string": "Optional string/group label (e.g. A, B).",
+          "string": "String group label (e.g. A, B, East, West). Required for aggregate energy tracking.",
           "name": "A friendly name for this optimizer (e.g. Panel_01).",
           "barcode": "The Tigo optimizer barcode (e.g. A-1234567B)."
         }
@@ -43,6 +43,7 @@
       "cannot_connect": "Failed to connect to the Tigo gateway. Check host and port.",
       "invalid_auth": "Invalid authentication",
       "invalid_barcode": "Invalid barcode format. Expected format like A-1234567B.",
+      "missing_string": "String group is required.",
       "missing_name": "Module name is required.",
       "missing_barcode": "Barcode is required.",
       "duplicate_barcode": "This barcode has already been added.",
@@ -80,6 +81,24 @@
         "name": "Daily energy"
       },
       "total_energy": {
+        "name": "Total energy"
+      },
+      "string_power": {
+        "name": "Power"
+      },
+      "string_daily_energy": {
+        "name": "Daily energy"
+      },
+      "string_total_energy": {
+        "name": "Total energy"
+      },
+      "installation_power": {
+        "name": "Power"
+      },
+      "installation_daily_energy": {
+        "name": "Daily energy"
+      },
+      "installation_total_energy": {
         "name": "Total energy"
       },
       "rssi": {
@@ -120,7 +139,7 @@
           "barcode": "Barcode"
         },
         "data_description": {
-          "string": "Optional string/group label (e.g. A, B).",
+          "string": "String group label (e.g. A, B, East, West). Required for aggregate energy tracking.",
           "name": "A friendly name for this optimizer (e.g. Panel_01).",
           "barcode": "The Tigo optimizer barcode (e.g. A-1234567B)."
         }

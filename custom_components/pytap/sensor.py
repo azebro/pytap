@@ -52,6 +52,13 @@ class PyTapSensorEntityDescription(SensorEntityDescription):
     value_key: str
 
 
+@dataclass(frozen=True, kw_only=True)
+class PyTapAggregateSensorDescription(SensorEntityDescription):
+    """Describes a PyTap aggregate sensor entity."""
+
+    value_key: str
+
+
 SENSOR_DESCRIPTIONS: tuple[PyTapSensorEntityDescription, ...] = (
     PyTapSensorEntityDescription(
         key="power",
@@ -137,6 +144,66 @@ SENSOR_DESCRIPTIONS: tuple[PyTapSensorEntityDescription, ...] = (
 )
 
 
+STRING_SENSOR_DESCRIPTIONS: tuple[PyTapAggregateSensorDescription, ...] = (
+    PyTapAggregateSensorDescription(
+        key="power",
+        translation_key="string_power",
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_key="power",
+    ),
+    PyTapAggregateSensorDescription(
+        key="daily_energy",
+        translation_key="string_daily_energy",
+        native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL,
+        suggested_display_precision=1,
+        value_key="daily_energy_wh",
+    ),
+    PyTapAggregateSensorDescription(
+        key="total_energy",
+        translation_key="string_total_energy",
+        native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        suggested_display_precision=0,
+        value_key="total_energy_wh",
+    ),
+)
+
+
+INSTALLATION_SENSOR_DESCRIPTIONS: tuple[PyTapAggregateSensorDescription, ...] = (
+    PyTapAggregateSensorDescription(
+        key="power",
+        translation_key="installation_power",
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_key="power",
+    ),
+    PyTapAggregateSensorDescription(
+        key="daily_energy",
+        translation_key="installation_daily_energy",
+        native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL,
+        suggested_display_precision=1,
+        value_key="daily_energy_wh",
+    ),
+    PyTapAggregateSensorDescription(
+        key="total_energy",
+        translation_key="installation_total_energy",
+        native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        suggested_display_precision=0,
+        value_key="total_energy_wh",
+    ),
+)
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -150,11 +217,19 @@ async def async_setup_entry(
     coordinator: PyTapDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
     modules: list[dict[str, str]] = entry.data.get(CONF_MODULES, [])
 
-    entities: list[PyTapSensor] = []
+    entities: list[SensorEntity] = []
+    string_to_barcodes: dict[str, list[str]] = {}
+    all_barcodes: list[str] = []
+
     for module_config in modules:
         barcode = module_config.get(CONF_MODULE_BARCODE, "")
+        string_name = module_config.get(CONF_MODULE_STRING, "")
         if not barcode:
             continue
+        all_barcodes.append(barcode)
+        if string_name:
+            string_to_barcodes.setdefault(string_name, []).append(barcode)
+
         for description in SENSOR_DESCRIPTIONS:
             entities.append(
                 PyTapSensor(
@@ -162,6 +237,46 @@ async def async_setup_entry(
                     description=description,
                     module_config=module_config,
                     entry=entry,
+                )
+            )
+
+    for string_name, barcodes in string_to_barcodes.items():
+        device_info = DeviceInfo(
+            identifiers={(DOMAIN, f"{entry.entry_id}_string_{string_name}")},
+            name=f"Tigo String {string_name}",
+            manufacturer="Tigo Energy",
+            model="String Aggregate",
+        )
+        for description in STRING_SENSOR_DESCRIPTIONS:
+            entities.append(
+                PyTapAggregateSensor(
+                    coordinator=coordinator,
+                    description=description,
+                    barcodes=barcodes,
+                    device_info=device_info,
+                    unique_id=(
+                        f"{DOMAIN}_{entry.entry_id}_string_{string_name}_{description.key}"
+                    ),
+                )
+            )
+
+    if all_barcodes:
+        device_info = DeviceInfo(
+            identifiers={(DOMAIN, f"{entry.entry_id}_installation")},
+            name="Tigo Installation",
+            manufacturer="Tigo Energy",
+            model="Installation Aggregate",
+        )
+        for description in INSTALLATION_SENSOR_DESCRIPTIONS:
+            entities.append(
+                PyTapAggregateSensor(
+                    coordinator=coordinator,
+                    description=description,
+                    barcodes=all_barcodes,
+                    device_info=device_info,
+                    unique_id=(
+                        f"{DOMAIN}_{entry.entry_id}_installation_{description.key}"
+                    ),
                 )
             )
 
@@ -268,3 +383,74 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], SensorEntity):
             timezone = dt_util.get_time_zone(self.hass.config.time_zone)
 
         return datetime.combine(reset_day, time.min, tzinfo=timezone)
+
+
+class PyTapAggregateSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], SensorEntity):
+    """Aggregate sensor that sums values across multiple optimizers."""
+
+    _attr_has_entity_name = True
+    entity_description: PyTapAggregateSensorDescription
+
+    def __init__(
+        self,
+        coordinator: PyTapDataUpdateCoordinator,
+        description: PyTapAggregateSensorDescription,
+        barcodes: list[str],
+        device_info: DeviceInfo,
+        unique_id: str,
+    ) -> None:
+        """Initialize aggregate sensor."""
+        super().__init__(coordinator)
+        self.entity_description = description
+        self._barcodes = barcodes
+        self._attr_unique_id = unique_id
+        self._attr_device_info = device_info
+
+    @property
+    def available(self) -> bool:
+        """Return True when at least one constituent has data."""
+        if not self.coordinator.data:
+            return False
+        nodes = self.coordinator.data.get("nodes", {})
+        return any(nodes.get(barcode) is not None for barcode in self._barcodes)
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        nodes = self.coordinator.data.get("nodes", {})
+        total: float | None = None
+
+        for barcode in self._barcodes:
+            node_data = nodes.get(barcode)
+            if node_data is None:
+                continue
+            value = node_data.get(self.entity_description.value_key)
+            if value is not None:
+                total = (total or 0.0) + value
+
+        self._attr_native_value = total
+        self.async_write_ha_state()
+
+    @property
+    def last_reset(self) -> datetime | None:
+        """Return last reset for aggregate daily energy."""
+        if self.entity_description.key != "daily_energy":
+            return None
+
+        timezone = dt_util.UTC
+        if self.hass is not None:
+            timezone = dt_util.get_time_zone(self.hass.config.time_zone) or dt_util.UTC
+
+        return datetime.combine(dt_util.now(timezone).date(), time.min, tzinfo=timezone)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return additional aggregate state attributes."""
+        nodes = self.coordinator.data.get("nodes", {})
+        reporting = [
+            barcode for barcode in self._barcodes if nodes.get(barcode) is not None
+        ]
+        return {
+            "optimizer_count": len(self._barcodes),
+            "reporting_count": len(reporting),
+        }

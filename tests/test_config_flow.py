@@ -236,7 +236,7 @@ async def test_add_module_missing_name(hass: HomeAssistant) -> None:
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
         {
-            CONF_MODULE_STRING: "",
+            CONF_MODULE_STRING: "A",
             CONF_MODULE_NAME: "",
             CONF_MODULE_BARCODE: "A-1234567B",
         },
@@ -245,6 +245,38 @@ async def test_add_module_missing_name(hass: HomeAssistant) -> None:
     assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "add_module"
     assert result["errors"] == {CONF_MODULE_NAME: "missing_name"}
+
+
+async def test_add_module_missing_string(hass: HomeAssistant) -> None:
+    """Test that a missing string shows an error on the add_module step."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    with patch(
+        "custom_components.pytap.config_flow.validate_connection",
+        return_value={"title": f"PyTap ({MOCK_HOST})"},
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {"host": MOCK_HOST, "port": MOCK_PORT},
+        )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "add_module"}
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_MODULE_STRING: "",
+            CONF_MODULE_NAME: "Panel_01",
+            CONF_MODULE_BARCODE: "A-1234567B",
+        },
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "add_module"
+    assert result["errors"] == {CONF_MODULE_STRING: "missing_string"}
 
 
 async def test_add_module_duplicate_barcode(hass: HomeAssistant) -> None:

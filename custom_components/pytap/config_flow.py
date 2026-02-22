@@ -50,7 +50,7 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
 
 ADD_MODULE_SCHEMA = vol.Schema(
     {
-        vol.Optional(CONF_MODULE_STRING, default=""): str,
+        vol.Required(CONF_MODULE_STRING): str,
         vol.Required(CONF_MODULE_NAME): str,
         vol.Required(CONF_MODULE_BARCODE): str,
     }
@@ -170,7 +170,9 @@ class PyTapConfigFlow(ConfigFlow, domain=DOMAIN):
             name = user_input.get(CONF_MODULE_NAME, "").strip()
             string_group = user_input.get(CONF_MODULE_STRING, "").strip()
 
-            if not name:
+            if not string_group:
+                errors[CONF_MODULE_STRING] = "missing_string"
+            elif not name:
                 errors[CONF_MODULE_NAME] = "missing_name"
             elif not barcode:
                 errors[CONF_MODULE_BARCODE] = "missing_barcode"
@@ -309,7 +311,9 @@ class PyTapOptionsFlow(OptionsFlow):
             name = user_input.get(CONF_MODULE_NAME, "").strip()
             string_group = user_input.get(CONF_MODULE_STRING, "").strip()
 
-            if not name:
+            if not string_group:
+                errors[CONF_MODULE_STRING] = "missing_string"
+            elif not name:
                 errors[CONF_MODULE_NAME] = "missing_name"
             elif not barcode:
                 errors[CONF_MODULE_BARCODE] = "missing_barcode"
