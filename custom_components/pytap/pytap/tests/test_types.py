@@ -6,18 +6,12 @@ from pytap.core.types import (
     GatewayID,
     Address,
     FrameType,
-    Frame,
     NodeID,
-    NodeAddress,
     LongAddress,
-    RSSI,
     SlotCounter,
-    PacketType,
     ReceivedPacketHeader,
     U12Pair,
     PowerReport,
-    SLOTS_PER_EPOCH,
-    MAX_SLOT_NUMBER,
     iter_received_packets,
 )
 

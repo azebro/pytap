@@ -44,8 +44,8 @@ PyTap is a Home Assistant custom component that passively monitors Tigo TAP sola
 | Config flow | Menu-driven: add modules one at a time via individual form fields |
 | Threading model | Blocking parser in executor thread, bridged to async event loop |
 | External dependencies | None — parser library embedded, stdlib only |
-| Sensor types | 8 per optimizer: power, voltage in/out, current in/out, temperature, duty cycle, RSSI |
-| Test coverage | 51 tests (13 config flow + 19 coordinator persistence + 5 migration + 7 sensor platform + 7 options flow) |
+| Sensor types | 10 per optimizer: power, voltage in/out, current in/out, temperature, duty cycle, RSSI, daily energy, total energy |
+| Test coverage | 65 tests (13 config flow + 28 coordinator persistence + 5 migration + 9 sensor platform + 10 energy unit tests) |
 
 ---
 
@@ -55,10 +55,11 @@ PyTap is a Home Assistant custom component that passively monitors Tigo TAP sola
 custom_components/pytap/
 ├── __init__.py          # ~135 lines — Integration lifecycle (setup, teardown, migration, options listener)
 ├── config_flow.py       # 369 lines  — Menu-driven config & options flows
-├── const.py             # 23 lines   — Domain, config keys, default values
+├── const.py             # ~27 lines  — Domain, config keys, defaults, energy tuning constants
 ├── coordinator.py       # ~635 lines — Push-based DataUpdateCoordinator
+├── energy.py            # ~80 lines  — Pure trapezoidal energy accumulation helpers
 ├── manifest.json        # 13 lines   — HA integration metadata
-├── sensor.py            # ~225 lines — 8 sensor entity types, CoordinatorEntity pattern
+├── sensor.py            # ~270 lines — 10 sensor entity types, CoordinatorEntity pattern
 ├── strings.json         # ~100 lines — UI strings (source of truth)
 ├── translations/
 │   └── en.json          # ~100 lines — English translations (mirrors strings.json)
@@ -76,9 +77,10 @@ custom_components/pytap/
 tests/
 ├── conftest.py                    # 14 lines  — Auto-enable custom integrations fixture
 ├── test_config_flow.py            # 445 lines — 13 config flow tests
-├── test_coordinator_persistence.py # ~510 lines — 19 coordinator & persistence tests
+├── test_coordinator_persistence.py # ~570 lines — 28 coordinator & persistence tests
 ├── test_migration.py              # ~120 lines — 5 entity migration tests
-└── test_sensor.py                 # ~210 lines — 7 sensor platform tests
+├── test_sensor.py                 # ~250 lines — 9 sensor platform tests
+└── test_energy.py                 # 142 lines  — 10 pure energy accumulation tests
 
 docs/
 ├── architecture.md      # 656 lines — Architecture & design document
@@ -356,6 +358,7 @@ All persistent state is consolidated into a single HA Store, written via `homeas
 - **`barcode_to_node`** — Barcode↔node_id mappings learned from infrastructure events.
 - **`discovered_barcodes`** — Set of unconfigured barcodes seen on the bus.
 - **`parser_state`** — Serialised parser infrastructure state (gateway identities, versions, node tables) via `PersistentState.to_dict()`.
+- **`energy_data`** — Per-barcode accumulator state (`daily_energy_wh`, `daily_reset_date`, `total_energy_wh`, `last_power_w`, `last_reading_ts`).
 
 On startup, coordinator state is loaded from the HA Store (via `_async_load_coordinator_state`), including the parser's `PersistentState` which is deserialized via `PersistentState.from_dict()`. The parser receives a shared `PersistentState` object and mutates it in memory — the parser never performs file I/O. The coordinator schedules debounced saves (10-second delay) when mappings or infrastructure change, and flushes immediately on shutdown.
 
@@ -365,7 +368,7 @@ The `_init_mappings_from_parser` method pre-populates barcode↔node mappings fr
 
 ### `sensor.py` — Sensor Platform
 
-**~225 lines** implementing 8 sensor entity types using the `CoordinatorEntity` pattern.
+**~270 lines** implementing 10 sensor entity types using the `CoordinatorEntity` pattern.
 
 #### Sensor Descriptions
 
@@ -387,10 +390,14 @@ SENSOR_DESCRIPTIONS = (
         unit="%",                          state_class=MEASUREMENT),
     PyTapSensorEntityDescription(key="rssi",              value_key="rssi",
         unit=SIGNAL_STRENGTH_DECIBELS_MILLIWATT, device_class=SIGNAL_STRENGTH),
+    PyTapSensorEntityDescription(key="daily_energy",      value_key="daily_energy_wh",
+        unit=UnitOfEnergy.WATT_HOUR,       device_class=ENERGY, state_class=TOTAL),
+    PyTapSensorEntityDescription(key="total_energy",      value_key="total_energy_wh",
+        unit=UnitOfEnergy.WATT_HOUR,       device_class=ENERGY, state_class=TOTAL_INCREASING),
 )
 ```
 
-Each uses `SensorStateClass.MEASUREMENT` for HA history tracking.
+Power/electrical sensors use `SensorStateClass.MEASUREMENT`; energy sensors use `TOTAL`/`TOTAL_INCREASING` for HA long-term statistics and energy dashboard compatibility.
 
 #### Entity Creation
 
@@ -405,7 +412,7 @@ for module_config in modules:
         entities.append(PyTapSensor(coordinator, description, module_config, entry))
 ```
 
-Two modules × 8 descriptions = 16 sensor entities.
+Two modules × 10 descriptions = 20 sensor entities.
 
 #### `PyTapSensor` Class
 
@@ -426,7 +433,7 @@ DeviceInfo(
 )
 ```
 
-All 8 sensors for the same barcode are grouped under one device.
+All 10 sensors for the same barcode are grouped under one device.
 
 **Availability:**
 Returns `True` only when `coordinator.data["nodes"][barcode]` exists (i.e., at least one `PowerReportEvent` has been received for this optimizer). There is no unavailable timeout — sensors hold their last received value indefinitely.
@@ -606,7 +613,9 @@ Home Assistant frontend / automations / history
 - **Async mode:** `asyncio_mode = auto` (in `pytest.ini`)
 - **Fixture:** `auto_enable_custom_integrations` (in `conftest.py`) enables loading from `custom_components/`.
 
-### Config Flow Tests (9 tests)
+### Config Flow Tests (13 tests)
+
+Representative tests:
 
 | Test | What it verifies |
 |------|-----------------|
@@ -618,45 +627,33 @@ Home Assistant frontend / automations / history
 | `test_add_module_invalid_barcode` | Invalid barcode format shows error on barcode field |
 | `test_add_module_missing_name` | Empty name shows error on name field |
 | `test_add_module_duplicate_barcode` | Duplicate barcode shows error on barcode field |
-| `test_already_configured` | Second flow with same host:port aborts with "already_configured" |
+
 
 All tests mock `validate_connection` to avoid real TCP connections.
 
-### Sensor Platform Tests (7 tests)
+### Sensor Platform Tests (9 tests)
 
 | Test | What it verifies |
 |------|-----------------|
-| `test_sensor_entities_created` | 2 modules × 8 sensors = 16 entities |
+| `test_sensor_entities_created` | 2 modules × 10 sensors = 20 entities |
 | `test_sensor_unique_ids` | IDs follow `{DOMAIN}_{barcode}_{key}` pattern |
 | `test_sensor_available_with_data` | Sensor available when node data exists |
 | `test_sensor_unavailable_without_data` | Sensor unavailable when data dict is empty |
 | `test_sensor_skips_modules_without_barcode` | Modules with empty barcode don't create entities |
 | `test_sensor_device_info` | Device identifiers, manufacturer, model, serial_number |
-| `test_sensor_descriptions_count` | Exactly 8 sensor descriptions defined |
+| `test_sensor_descriptions_count` | Exactly 10 sensor descriptions defined |
+| `test_energy_sensor_descriptions` | Daily/total energy sensor metadata and state classes |
+| `test_daily_energy_last_reset` | Daily energy exposes `last_reset` from `daily_reset_date` |
 
 Tests use `MagicMock(spec=PyTapDataUpdateCoordinator)` to avoid real coordinator initialization.
 
-### Coordinator Persistence Tests (17 tests)
+### Coordinator Persistence Tests (28 tests)
 
-| Test | What it verifies |
-|------|-----------------|
-| `test_coordinator_init` | Coordinator initializes with correct host, port, barcode allowlist |
-| `test_process_power_report` | Power report updates node data correctly |
-| `test_process_infrastructure` | Infrastructure event builds barcode↔node_id mapping |
-| `test_process_topology` | Topology event attaches data to correct node |
-| `test_unconfigured_barcode_discovery` | Unconfigured barcodes logged and tracked |
-| `test_reload_modules` | Module list hot-reload updates allowlists |
-| `test_listener_start_stop` | Background listener starts and stops cleanly |
-| `test_reconnect_on_error` | Listener reconnects after connection errors |
-| `test_reconnect_on_silence` | Listener reconnects after RECONNECT_TIMEOUT silence |
-| `test_persistence_save_load` | State persisted to and restored from HA Store |
-| `test_persistence_debounce` | Saves are debounced (SAVE_DELAY_SECONDS) |
-| `test_data_survives_restart` | Data restored on coordinator re-initialization |
-| `test_stop_event_thread_safe` | threading.Event works cross-thread |
-| `test_source_lock_protects_source` | _source_lock prevents concurrent _source access |
-| `test_per_event_push` | Each event triggers its own async_set_updated_data call |
-| `test_shutdown_timeout` | async_stop_listener returns within timeout even if task hangs |
-| `test_handler_return_bool` | _process_event returns True only when data changes |
+Coverage includes coordinator initialization, barcode mapping restoration and purging, deferred power-report handling before infrastructure, save/load behavior, parser-state restore/fallback, stop-flush behavior, and energy-data persistence (`energy_data` save/load with daily reset on new day).
+
+### Energy Accumulation Unit Tests (10 tests)
+
+`tests/test_energy.py` validates trapezoidal integration in isolation across baseline behavior, nominal interval integration, gap handling during production, overnight gaps, daily resets with preserved total accumulation, and related edge cases.
 
 ### Entity Migration Tests (5 tests)
 
@@ -867,6 +864,6 @@ Items identified but not yet implemented:
 
 1. **Gateway device registration** — Create a device per gateway for the `via_device` hierarchy.
 2. **Diagnostics platform** — Expose `discovered_barcodes`, parser counters, and connection state as a diagnostics download.
-3. **Energy dashboard integration** — Ensure power sensors work with HA's energy dashboard (may need `SensorDeviceClass.ENERGY` with Riemann sum).
+3. **String/installation energy aggregates** — Add cumulative daily/total energy entities at string and whole-installation scope.
 4. **Binary sensors** — Node connectivity and gateway online status.
 5. **HACS distribution** — Package with `hacs.json` for one-click installation.

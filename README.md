@@ -10,11 +10,12 @@ A Home Assistant custom integration for monitoring **Tigo TAP solar energy syste
 ## Features
 
 - **Real-time streaming** — Push-based data delivery with sub-second latency (no polling).
-- **Per-optimizer sensors** — 8 sensor entities per Tigo TS4 module: power, voltage in/out, current in/out, temperature, DC-DC duty cycle, and RSSI.
+- **Per-optimizer sensors** — 10 sensor entities per Tigo TS4 module: power, voltage in/out, current in/out, temperature, DC-DC duty cycle, RSSI, daily energy, and total energy.
 - **Menu-driven setup** — Add optimizer modules one at a time with guided form fields.
 - **Barcode-based identification** — Stable hardware barcodes as entity identifiers (survives gateway restarts).
 - **Discovery logging** — Unconfigured barcodes seen on the bus are logged for easy identification.
 - **Persistent barcode mapping** — Discovered barcodes and node mappings are saved across restarts. When you add a previously-discovered barcode, it resolves instantly without waiting for the next gateway enumeration.
+- **Energy accumulation** — Trapezoidal Wh integration with daily reset semantics and monotonic lifetime totals.
 - **No external dependencies** — The protocol parser library is fully embedded; nothing to install from PyPI.
 - **Options flow** — Add or remove optimizer modules at any time without reconfiguring.
 
@@ -32,6 +33,8 @@ Each configured Tigo TS4 optimizer exposes the following sensors:
 | Temperature | °C | `temperature` |
 | DC-DC Duty Cycle | % | — |
 | RSSI | dBm | `signal_strength` |
+| Daily Energy | Wh | `energy` |
+| Total Energy | Wh | `energy` |
 
 ---
 
@@ -131,7 +134,7 @@ pytap/
 │   ├── config_flow.py           # Config & options flows
 │   ├── const.py                 # Constants
 │   ├── coordinator.py           # Push-based data coordinator
-│   ├── sensor.py                # Sensor platform (8 entity types)
+│   ├── sensor.py                # Sensor platform (10 entity types)
 │   ├── manifest.json            # Integration metadata
 │   ├── strings.json             # UI strings
 │   ├── translations/en.json     # English translations

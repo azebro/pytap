@@ -76,6 +76,12 @@
       "dc_dc_duty_cycle": {
         "name": "DC-DC duty cycle"
       },
+      "daily_energy": {
+        "name": "Daily energy"
+      },
+      "total_energy": {
+        "name": "Total energy"
+      },
       "rssi": {
         "name": "RSSI"
       }

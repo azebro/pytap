@@ -26,7 +26,6 @@ from .types import (
     Address,
     FrameType,
     Frame,
-    GatewayID,
     NodeAddress,
     LongAddress,
     SlotCounter,

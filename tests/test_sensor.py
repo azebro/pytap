@@ -4,7 +4,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from homeassistant.const import CONF_HOST, CONF_PORT
+from homeassistant.components.sensor import SensorStateClass
+from homeassistant.const import CONF_HOST, CONF_PORT, UnitOfEnergy
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 
@@ -48,6 +49,9 @@ MOCK_NODE_DATA = {
         "temperature": 42.0,
         "dc_dc_duty_cycle": 0.95,
         "rssi": -65,
+        "daily_energy_wh": 123.45,
+        "total_energy_wh": 4567.89,
+        "daily_reset_date": "2025-01-01",
         "last_update": "2025-01-01T12:00:00",
     },
 }
@@ -97,8 +101,8 @@ async def test_sensor_entities_created(hass: HomeAssistant) -> None:
 
     await async_setup_entry(hass, entry, capture_entities)
 
-    # 2 modules × 8 sensors = 16 entities
-    assert len(entities) == 16
+    # 2 modules × 10 sensors = 20 entities
+    assert len(entities) == 20
 
 
 async def test_sensor_unique_ids(hass: HomeAssistant) -> None:
@@ -181,8 +185,8 @@ async def test_sensor_skips_modules_without_barcode(hass: HomeAssistant) -> None
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
-    # Only the 2 valid modules should create entities: 2 × 8 = 16
-    assert len(entities) == 16
+    # Only the 2 valid modules should create entities: 2 × 10 = 20
+    assert len(entities) == 20
 
 
 async def test_sensor_device_info(hass: HomeAssistant) -> None:
@@ -208,4 +212,37 @@ async def test_sensor_device_info(hass: HomeAssistant) -> None:
 
 async def test_sensor_descriptions_count() -> None:
     """Test that we have the expected number of sensor descriptions."""
-    assert len(SENSOR_DESCRIPTIONS) == 8
+    assert len(SENSOR_DESCRIPTIONS) == 10
+
+
+async def test_energy_sensor_descriptions() -> None:
+    """Test energy sensor description metadata."""
+    description_map = {
+        description.key: description for description in SENSOR_DESCRIPTIONS
+    }
+
+    daily_energy = description_map["daily_energy"]
+    assert daily_energy.native_unit_of_measurement == UnitOfEnergy.WATT_HOUR
+    assert daily_energy.state_class == SensorStateClass.TOTAL
+
+    total_energy = description_map["total_energy"]
+    assert total_energy.native_unit_of_measurement == UnitOfEnergy.WATT_HOUR
+    assert total_energy.state_class == SensorStateClass.TOTAL_INCREASING
+
+
+async def test_daily_energy_last_reset(hass: HomeAssistant) -> None:
+    """Test that daily energy exposes a last_reset timestamp."""
+    entry = _make_mock_config_entry(hass)
+    coordinator = _make_mock_coordinator(hass, entry, node_data=MOCK_NODE_DATA)
+
+    hass.data.setdefault(DOMAIN, {})
+    hass.data[DOMAIN][entry.entry_id] = coordinator
+
+    entities = []
+    await async_setup_entry(hass, entry, lambda e: entities.extend(e))
+
+    daily_energy_sensor = next(
+        e for e in entities if e.unique_id == f"{DOMAIN}_A-1234567B_daily_energy"
+    )
+    assert daily_energy_sensor.last_reset is not None
+    assert daily_energy_sensor.last_reset.isoformat().startswith("2025-01-01T00:00:00")

@@ -21,6 +21,7 @@ from custom_components.pytap.const import (
     DOMAIN,
 )
 from custom_components.pytap.coordinator import PyTapDataUpdateCoordinator
+from custom_components.pytap.energy import EnergyAccumulator
 from custom_components.pytap.pytap.core.events import (
     InfrastructureEvent,
     PowerReportEvent,
@@ -185,6 +186,84 @@ class TestLoadCoordinatorState:
 
         # Parser state may be partially loaded or fresh — should not crash
 
+    async def test_load_restores_energy_data(self, hass: HomeAssistant) -> None:
+        """Energy accumulator state should be restored from Store."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+
+        stored_data = {
+            "barcode_to_node": {},
+            "discovered_barcodes": [],
+            "energy_data": {
+                "A-1234567B": {
+                    "daily_energy_wh": 10.5,
+                    "daily_reset_date": datetime.now().date().isoformat(),
+                    "total_energy_wh": 1234.5,
+                    "last_power_w": 250.0,
+                    "last_reading_ts": "2025-01-01T10:00:00",
+                }
+            },
+        }
+        coordinator._store.async_load = AsyncMock(return_value=stored_data)
+
+        await coordinator._async_load_coordinator_state()
+
+        acc = coordinator._energy_state["A-1234567B"]
+        assert acc.daily_energy_wh == 10.5
+        assert acc.total_energy_wh == 1234.5
+        assert acc.last_power_w == 250.0
+
+    async def test_load_resets_daily_energy_on_new_day(
+        self, hass: HomeAssistant
+    ) -> None:
+        """Daily energy should reset when stored reset date is not today."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+
+        stored_data = {
+            "barcode_to_node": {},
+            "discovered_barcodes": [],
+            "energy_data": {
+                "A-1234567B": {
+                    "daily_energy_wh": 99.0,
+                    "daily_reset_date": "2000-01-01",
+                    "total_energy_wh": 555.0,
+                    "last_power_w": 100.0,
+                    "last_reading_ts": "2025-01-01T10:00:00",
+                }
+            },
+        }
+        coordinator._store.async_load = AsyncMock(return_value=stored_data)
+
+        await coordinator._async_load_coordinator_state()
+
+        acc = coordinator._energy_state["A-1234567B"]
+        assert acc.daily_energy_wh == 0.0
+        assert acc.total_energy_wh == 555.0
+        assert acc.daily_reset_date == datetime.now().date().isoformat()
+
+    async def test_load_handles_missing_energy_data(self, hass: HomeAssistant) -> None:
+        """Missing energy_data key should leave energy state empty."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+
+        stored_data = {
+            "barcode_to_node": {"A-1234567B": 10},
+            "discovered_barcodes": ["X-9999999Z"],
+            "parser_state": {
+                "gateway_identities": {},
+                "gateway_versions": {},
+                "gateway_node_tables": {},
+            },
+        }
+        coordinator._store.async_load = AsyncMock(return_value=stored_data)
+
+        await coordinator._async_load_coordinator_state()
+
+        assert coordinator._barcode_to_node == {"A-1234567B": 10}
+        assert coordinator._discovered_barcodes == {"X-9999999Z"}
+        assert coordinator._energy_state == {}
+
 
 class TestSaveCoordinatorState:
     """Test _async_save_coordinator_state persists data."""
@@ -197,6 +276,15 @@ class TestSaveCoordinatorState:
         coordinator._barcode_to_node = {"A-1234567B": 10}
         coordinator._node_to_barcode = {10: "A-1234567B"}
         coordinator._discovered_barcodes = {"X-9999999Z"}
+        coordinator._energy_state = {
+            "A-1234567B": EnergyAccumulator(
+                daily_energy_wh=1.25,
+                daily_reset_date=datetime.now().date().isoformat(),
+                total_energy_wh=100.75,
+                last_power_w=250.0,
+                last_reading_ts=datetime.now(),
+            )
+        }
         coordinator._unsaved_changes = True
 
         coordinator._store.async_save = AsyncMock()
@@ -208,6 +296,8 @@ class TestSaveCoordinatorState:
         assert saved["barcode_to_node"] == {"A-1234567B": 10}
         assert saved["discovered_barcodes"] == ["X-9999999Z"]
         assert "parser_state" in saved
+        assert "energy_data" in saved
+        assert "A-1234567B" in saved["energy_data"]
         assert coordinator._unsaved_changes is False
 
     async def test_save_handles_exception(self, hass: HomeAssistant) -> None:

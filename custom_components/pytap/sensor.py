@@ -8,6 +8,7 @@ from the configured module list — no auto-discovery.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime, time
 import logging
 from typing import Any
 
@@ -22,6 +23,7 @@ from homeassistant.const import (
     SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
     UnitOfElectricCurrent,
     UnitOfElectricPotential,
+    UnitOfEnergy,
     UnitOfPower,
     UnitOfTemperature,
 )
@@ -29,6 +31,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_MODULE_BARCODE,
@@ -113,6 +116,24 @@ SENSOR_DESCRIPTIONS: tuple[PyTapSensorEntityDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         value_key="rssi",
     ),
+    PyTapSensorEntityDescription(
+        key="daily_energy",
+        translation_key="daily_energy",
+        native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL,
+        suggested_display_precision=1,
+        value_key="daily_energy_wh",
+    ),
+    PyTapSensorEntityDescription(
+        key="total_energy",
+        translation_key="total_energy",
+        native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        suggested_display_precision=0,
+        value_key="total_energy_wh",
+    ),
 )
 
 
@@ -124,7 +145,7 @@ async def async_setup_entry(
     """Set up PyTap sensors from a config entry.
 
     Creates sensor entities deterministically from the configured module list.
-    Each configured module gets the full set of 8 sensor entities.
+    Each configured module gets the full set of 10 sensor entities.
     """
     coordinator: PyTapDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
     modules: list[dict[str, str]] = entry.data.get(CONF_MODULES, [])
@@ -222,3 +243,28 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], SensorEntity):
         if gateway_id is not None:
             attrs["gateway_id"] = gateway_id
         return attrs if attrs else None
+
+    @property
+    def last_reset(self) -> datetime | None:
+        """Return last reset for daily energy sensor cycles."""
+        if self.entity_description.key != "daily_energy":
+            return None
+
+        node_data = self.coordinator.data.get("nodes", {}).get(self._barcode)
+        if not node_data:
+            return None
+
+        reset_date = node_data.get("daily_reset_date")
+        if not reset_date:
+            return None
+
+        try:
+            reset_day = date.fromisoformat(reset_date)
+        except ValueError:
+            return None
+
+        timezone = dt_util.UTC
+        if self.hass is not None:
+            timezone = dt_util.get_time_zone(self.hass.config.time_zone)
+
+        return datetime.combine(reset_day, time.min, tzinfo=timezone)
