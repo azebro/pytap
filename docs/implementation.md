@@ -651,9 +651,9 @@ Tests use `MagicMock(spec=PyTapDataUpdateCoordinator)` to avoid real coordinator
 
 Coverage includes coordinator initialization, barcode mapping restoration and purging, deferred power-report handling before infrastructure, save/load behavior, parser-state restore/fallback, stop-flush behavior, and energy-data persistence (`energy_data` save/load with daily reset on new day).
 
-### Energy Accumulation Unit Tests (5 tests)
+### Energy Accumulation Unit Tests (10 tests)
 
-`tests/test_energy.py` validates trapezoidal integration in isolation: first reading baseline behavior, nominal interval integration, gap discard during production, overnight gap skip, and daily reset with preserved total accumulation.
+`tests/test_energy.py` validates trapezoidal integration in isolation across baseline behavior, nominal interval integration, gap handling during production, overnight gaps, daily resets with preserved total accumulation, and related edge cases.
 
 ### Entity Migration Tests (5 tests)
 
