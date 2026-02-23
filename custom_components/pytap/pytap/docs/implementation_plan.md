@@ -20,8 +20,8 @@
 9. [Phase 8 — Public API](#9-phase-8--public-api)
 10. [Phase 9 — CLI](#10-phase-9--cli)
 11. [Phase 10 — Integration Tests & Polish](#11-phase-10--integration-tests--polish)
-12. [Appendix A — Wire Format Quick Reference](#appendix-a--wire-format-quick-reference)
-13. [Appendix B — Test Data](#appendix-b--test-data)
+- [Appendix A — Wire Format Quick Reference](#appendix-a--wire-format-quick-reference)
+- [Appendix B — Test Data](#appendix-b--test-data)
 
 ---
 

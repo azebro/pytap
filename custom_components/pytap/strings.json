@@ -27,12 +27,14 @@
         "data": {
           "string": "String group",
           "name": "Name",
-          "barcode": "Barcode"
+          "barcode": "Barcode",
+          "peak_power": "Peak power (Wp)"
         },
         "data_description": {
           "string": "String group label (e.g. A, B, East, West). Required for aggregate energy tracking.",
           "name": "A friendly name for this optimizer (e.g. Panel_01).",
-          "barcode": "The Tigo optimizer barcode (e.g. A-1234567B)."
+          "barcode": "The Tigo optimizer barcode (e.g. A-1234567B).",
+          "peak_power": "The peak power rating of this panel in watts (STC). Used to calculate performance percentage. Default: 455 Wp."
         }
       },
       "finish": {
@@ -56,6 +58,9 @@
   },
   "entity": {
     "sensor": {
+      "performance": {
+        "name": "Performance"
+      },
       "power": {
         "name": "Power"
       },
@@ -83,8 +88,14 @@
       "total_energy": {
         "name": "Total energy"
       },
+      "readings_today": {
+        "name": "Readings today"
+      },
       "string_power": {
         "name": "Power"
+      },
+      "string_performance": {
+        "name": "Performance"
       },
       "string_daily_energy": {
         "name": "Daily energy"
@@ -94,6 +105,9 @@
       },
       "installation_power": {
         "name": "Power"
+      },
+      "installation_performance": {
+        "name": "Performance"
       },
       "installation_daily_energy": {
         "name": "Daily energy"
@@ -136,12 +150,14 @@
         "data": {
           "string": "String group",
           "name": "Name",
-          "barcode": "Barcode"
+          "barcode": "Barcode",
+          "peak_power": "Peak power (Wp)"
         },
         "data_description": {
           "string": "String group label (e.g. A, B, East, West). Required for aggregate energy tracking.",
           "name": "A friendly name for this optimizer (e.g. Panel_01).",
-          "barcode": "The Tigo optimizer barcode (e.g. A-1234567B)."
+          "barcode": "The Tigo optimizer barcode (e.g. A-1234567B).",
+          "peak_power": "The peak power rating of this panel in watts (STC). Used to calculate performance percentage. Default: 455 Wp."
         }
       },
       "remove_module": {

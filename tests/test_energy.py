@@ -140,3 +140,31 @@ def test_normal_reporting_interval_accumulates_over_hour() -> None:
     assert round(acc.daily_energy_wh, 3) == 100.0
     assert round(acc.total_energy_wh, 3) == 100.0
     assert ENERGY_GAP_THRESHOLD_SECONDS > 30
+
+
+def test_readings_today_increments_per_report() -> None:
+    """Each accepted report should increment the daily readings counter."""
+    acc = EnergyAccumulator(daily_reset_date="2026-02-22")
+    start = datetime(2026, 2, 22, 12, 0, 0)
+
+    accumulate_energy(acc, power=100.0, now=start)
+    accumulate_energy(acc, power=110.0, now=start + timedelta(seconds=30))
+    accumulate_energy(acc, power=120.0, now=start + timedelta(seconds=60))
+
+    assert acc.readings_today == 3
+
+
+def test_readings_today_resets_on_new_day() -> None:
+    """Daily readings counter should reset when date changes."""
+    acc = EnergyAccumulator(daily_reset_date="2026-02-22")
+    day1 = datetime(2026, 2, 22, 18, 0, 0)
+    day2 = datetime(2026, 2, 23, 8, 0, 0)
+
+    accumulate_energy(acc, power=90.0, now=day1)
+    accumulate_energy(acc, power=0.0, now=day1 + timedelta(seconds=30))
+    assert acc.readings_today == 2
+
+    accumulate_energy(acc, power=50.0, now=day2)
+
+    assert acc.daily_reset_date == "2026-02-23"
+    assert acc.readings_today == 1

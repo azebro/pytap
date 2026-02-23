@@ -16,8 +16,10 @@ from homeassistant.helpers import entity_registry as er
 
 from .const import (
     CONF_MODULE_BARCODE,
+    CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
     CONF_MODULES,
+    DEFAULT_PEAK_POWER,
     DEFAULT_STRING_NAME,
     DOMAIN,
 )
@@ -29,7 +31,8 @@ PLATFORMS: list[Platform] = [Platform.SENSOR]
 
 # Bumped from 1 → 2 when voltage/current were split into in/out variants.
 # Bumped from 2 → 3 when module string labels became mandatory.
-CONFIG_ENTRY_VERSION = 3
+# Bumped from 3 → 4 when module peak_power became mandatory in config.
+CONFIG_ENTRY_VERSION = 4
 
 # Old unique IDs that were replaced by the _in/_out split.
 _LEGACY_UNIQUE_ID_RENAMES: dict[str, str] = {
@@ -99,6 +102,7 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     v1 → v2: voltage/current sensors split into _in/_out variants.
     v2 → v3: module string labels are mandatory.
+    v3 → v4: module peak power is added with default value.
     """
     if entry.version == 1:
         _LOGGER.info(
@@ -128,6 +132,23 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.config_entries.async_update_entry(entry, data=new_data, version=3)
         else:
             hass.config_entries.async_update_entry(entry, version=3)
+
+    if entry.version == 3:
+        _LOGGER.info(
+            "Migrating PyTap config entry %s from version 3 to 4",
+            entry.entry_id,
+        )
+        modules = list(entry.data.get(CONF_MODULES, []))
+        updated_modules: list[dict[str, str | int]] = []
+
+        for module in modules:
+            normalized = dict(module)
+            if CONF_MODULE_PEAK_POWER not in normalized:
+                normalized[CONF_MODULE_PEAK_POWER] = DEFAULT_PEAK_POWER
+            updated_modules.append(normalized)
+
+        new_data = {**entry.data, CONF_MODULES: updated_modules}
+        hass.config_entries.async_update_entry(entry, data=new_data, version=4)
 
     return True
 

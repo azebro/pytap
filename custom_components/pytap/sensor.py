@@ -13,6 +13,7 @@ import logging
 from typing import Any
 
 from homeassistant.components.sensor import (
+    RestoreSensor,
     SensorDeviceClass,
     SensorEntity,
     SensorEntityDescription,
@@ -20,6 +21,7 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
+    EntityCategory,
     SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
     UnitOfElectricCurrent,
     UnitOfElectricPotential,
@@ -36,8 +38,10 @@ from homeassistant.util import dt as dt_util
 from .const import (
     CONF_MODULE_BARCODE,
     CONF_MODULE_NAME,
+    CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
     CONF_MODULES,
+    DEFAULT_PEAK_POWER,
     DOMAIN,
 )
 from .coordinator import PyTapDataUpdateCoordinator
@@ -60,6 +64,14 @@ class PyTapAggregateSensorDescription(SensorEntityDescription):
 
 
 SENSOR_DESCRIPTIONS: tuple[PyTapSensorEntityDescription, ...] = (
+    PyTapSensorEntityDescription(
+        key="performance",
+        translation_key="performance",
+        native_unit_of_measurement="%",
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=1,
+        value_key="performance",
+    ),
     PyTapSensorEntityDescription(
         key="power",
         translation_key="power",
@@ -141,10 +153,26 @@ SENSOR_DESCRIPTIONS: tuple[PyTapSensorEntityDescription, ...] = (
         suggested_display_precision=0,
         value_key="total_energy_wh",
     ),
+    PyTapSensorEntityDescription(
+        key="readings_today",
+        translation_key="readings_today",
+        state_class=SensorStateClass.TOTAL,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        suggested_display_precision=0,
+        value_key="readings_today",
+    ),
 )
 
 
 STRING_SENSOR_DESCRIPTIONS: tuple[PyTapAggregateSensorDescription, ...] = (
+    PyTapAggregateSensorDescription(
+        key="performance",
+        translation_key="string_performance",
+        native_unit_of_measurement="%",
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=1,
+        value_key="performance",
+    ),
     PyTapAggregateSensorDescription(
         key="power",
         translation_key="string_power",
@@ -175,6 +203,14 @@ STRING_SENSOR_DESCRIPTIONS: tuple[PyTapAggregateSensorDescription, ...] = (
 
 
 INSTALLATION_SENSOR_DESCRIPTIONS: tuple[PyTapAggregateSensorDescription, ...] = (
+    PyTapAggregateSensorDescription(
+        key="performance",
+        translation_key="installation_performance",
+        native_unit_of_measurement="%",
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=1,
+        value_key="performance",
+    ),
     PyTapAggregateSensorDescription(
         key="power",
         translation_key="installation_power",
@@ -212,7 +248,7 @@ async def async_setup_entry(
     """Set up PyTap sensors from a config entry.
 
     Creates sensor entities deterministically from the configured module list.
-    Each configured module gets the full set of 10 sensor entities.
+    Each configured module gets the full set of 12 sensor entities.
     """
     coordinator: PyTapDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
     modules: list[dict[str, str]] = entry.data.get(CONF_MODULES, [])
@@ -283,7 +319,7 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], SensorEntity):
+class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
     """Representation of a PyTap optimizer sensor.
 
     Each sensor reads a specific measurement (power, voltage, etc.) for
@@ -319,6 +355,18 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], SensorEntity):
             model="TS4",
             serial_number=self._barcode,
         )
+        self._restored_native_value = False
+
+    async def async_added_to_hass(self) -> None:
+        """Restore last known native value from Home Assistant state cache."""
+        await super().async_added_to_hass()
+        if self.coordinator.data.get("nodes", {}).get(self._barcode) is not None:
+            return
+
+        if restored := await self.async_get_last_sensor_data():
+            if restored.native_value is not None:
+                self._attr_native_value = restored.native_value
+                self._restored_native_value = True
 
     @property
     def available(self) -> bool:
@@ -326,7 +374,7 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], SensorEntity):
         if not self.coordinator.data:
             return False
         node_data = self.coordinator.data.get("nodes", {}).get(self._barcode)
-        return node_data is not None
+        return node_data is not None or self._restored_native_value
 
     @callback
     def _handle_coordinator_update(self) -> None:
@@ -338,8 +386,10 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], SensorEntity):
             if self.entity_description.key == "dc_dc_duty_cycle" and value is not None:
                 value = round(value * 100, 2)
             self._attr_native_value = value
+            self._restored_native_value = False
         else:
-            self._attr_native_value = None
+            if not self._restored_native_value:
+                self._attr_native_value = None
         self.async_write_ha_state()
 
     @property
@@ -362,7 +412,7 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], SensorEntity):
     @property
     def last_reset(self) -> datetime | None:
         """Return last reset for daily energy sensor cycles."""
-        if self.entity_description.key != "daily_energy":
+        if self.entity_description.key not in ("daily_energy", "readings_today"):
             return None
 
         node_data = self.coordinator.data.get("nodes", {}).get(self._barcode)
@@ -385,7 +435,9 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], SensorEntity):
         return datetime.combine(reset_day, time.min, tzinfo=timezone)
 
 
-class PyTapAggregateSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], SensorEntity):
+class PyTapAggregateSensor(
+    CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor
+):
     """Aggregate sensor that sums values across multiple optimizers."""
 
     _attr_has_entity_name = True
@@ -405,6 +457,20 @@ class PyTapAggregateSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], Sensor
         self._barcodes = barcodes
         self._attr_unique_id = unique_id
         self._attr_device_info = device_info
+        self._restored_native_value = False
+
+    async def async_added_to_hass(self) -> None:
+        """Restore last known aggregate value from Home Assistant state cache."""
+        await super().async_added_to_hass()
+
+        nodes = self.coordinator.data.get("nodes", {})
+        if any(nodes.get(barcode) is not None for barcode in self._barcodes):
+            return
+
+        if restored := await self.async_get_last_sensor_data():
+            if restored.native_value is not None:
+                self._attr_native_value = restored.native_value
+                self._restored_native_value = True
 
     @property
     def available(self) -> bool:
@@ -412,12 +478,61 @@ class PyTapAggregateSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], Sensor
         if not self.coordinator.data:
             return False
         nodes = self.coordinator.data.get("nodes", {})
-        return any(nodes.get(barcode) is not None for barcode in self._barcodes)
+        return (
+            any(nodes.get(barcode) is not None for barcode in self._barcodes)
+            or self._restored_native_value
+        )
 
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
         nodes = self.coordinator.data.get("nodes", {})
+        has_live_nodes = any(
+            nodes.get(barcode) is not None for barcode in self._barcodes
+        )
+
+        if not has_live_nodes:
+            if not self._restored_native_value:
+                self._attr_native_value = None
+            self.async_write_ha_state()
+            return
+
+        if self.entity_description.key == "performance":
+            total_power = 0.0
+            total_peak_power = 0.0
+
+            for barcode in self._barcodes:
+                node_data = nodes.get(barcode)
+                if node_data is None:
+                    continue
+
+                power = node_data.get("power")
+                peak_power = node_data.get(CONF_MODULE_PEAK_POWER, DEFAULT_PEAK_POWER)
+                if power is None:
+                    continue
+
+                try:
+                    peak_power_value = float(peak_power)
+                except (TypeError, ValueError):
+                    peak_power_value = float(DEFAULT_PEAK_POWER)
+
+                if peak_power_value <= 0:
+                    continue
+
+                total_power += max(power, 0.0)
+                total_peak_power += peak_power_value
+
+            if total_peak_power > 0:
+                self._attr_native_value = round(
+                    (total_power / total_peak_power) * 100.0, 2
+                )
+            else:
+                self._attr_native_value = None
+            self._restored_native_value = False
+
+            self.async_write_ha_state()
+            return
+
         total: float | None = None
 
         for barcode in self._barcodes:
@@ -429,6 +544,7 @@ class PyTapAggregateSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], Sensor
                 total = (total or 0.0) + value
 
         self._attr_native_value = total
+        self._restored_native_value = False
         self.async_write_ha_state()
 
     @property

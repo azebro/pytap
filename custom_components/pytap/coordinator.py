@@ -24,8 +24,10 @@ from homeassistant.util import dt as dt_util
 from .const import (
     CONF_MODULE_BARCODE,
     CONF_MODULE_NAME,
+    CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
     CONF_MODULES,
+    DEFAULT_PEAK_POWER,
     DEFAULT_PORT,
     DOMAIN,
     ENERGY_GAP_THRESHOLD_SECONDS,
@@ -70,14 +72,14 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self._host: str = entry.data[CONF_HOST]
         self._port: int = entry.data.get(CONF_PORT, DEFAULT_PORT)
-        self._modules: list[dict[str, str]] = entry.data.get(CONF_MODULES, [])
+        self._modules: list[dict[str, Any]] = entry.data.get(CONF_MODULES, [])
 
         # Build barcode allowlist from configured modules
         self._configured_barcodes: set[str] = {
             m[CONF_MODULE_BARCODE] for m in self._modules if m.get(CONF_MODULE_BARCODE)
         }
         # Module lookup by barcode for name/string metadata
-        self._module_lookup: dict[str, dict[str, str]] = {
+        self._module_lookup: dict[str, dict[str, Any]] = {
             m[CONF_MODULE_BARCODE]: m
             for m in self._modules
             if m.get(CONF_MODULE_BARCODE)
@@ -134,6 +136,39 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_update_data(self) -> dict[str, Any]:
         """Return current data (push-based, no polling needed)."""
         return self.data
+
+    def get_diagnostics_data(self) -> dict[str, Any]:
+        """Return coordinator diagnostics snapshot."""
+        return {
+            "node_mappings": {
+                "barcode_to_node": dict(self._barcode_to_node),
+                "node_to_barcode": {
+                    str(node_id): barcode
+                    for node_id, barcode in self._node_to_barcode.items()
+                },
+            },
+            "connection_state": {
+                "infra_received": self._infra_received,
+                "pending_power_reports": self._pending_power_reports,
+                "host": self._host,
+                "port": self._port,
+            },
+            "energy_state": {
+                barcode: {
+                    "daily_energy_wh": round(acc.daily_energy_wh, 2),
+                    "total_energy_wh": round(acc.total_energy_wh, 2),
+                    "daily_reset_date": acc.daily_reset_date,
+                    "last_power_w": acc.last_power_w,
+                    "last_reading_ts": (
+                        acc.last_reading_ts.isoformat()
+                        if acc.last_reading_ts is not None
+                        else None
+                    ),
+                    "readings_today": acc.readings_today,
+                }
+                for barcode, acc in self._energy_state.items()
+            },
+        }
 
     async def async_start_listener(self) -> None:
         """Start the background listener task."""
@@ -393,6 +428,17 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Get module metadata
         module_meta = self._module_lookup.get(barcode, {})
+        peak_power_raw = module_meta.get(CONF_MODULE_PEAK_POWER, DEFAULT_PEAK_POWER)
+        try:
+            peak_power = int(peak_power_raw)
+        except (TypeError, ValueError):
+            peak_power = DEFAULT_PEAK_POWER
+        if peak_power <= 0:
+            peak_power = DEFAULT_PEAK_POWER
+
+        performance: float | None = None
+        if event.power is not None:
+            performance = (max(event.power, 0.0) / peak_power) * 100.0
         now = dt_util.now()
 
         acc = self._energy_state.setdefault(
@@ -418,16 +464,19 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "barcode": barcode,
             "name": module_meta.get(CONF_MODULE_NAME, barcode),
             "string": module_meta.get(CONF_MODULE_STRING, ""),
+            "peak_power": peak_power,
             "voltage_in": event.voltage_in,
             "voltage_out": event.voltage_out,
             "current_in": event.current_in,
             "current_out": event.current_out,
             "power": event.power,
+            "performance": round(performance, 2) if performance is not None else None,
             "temperature": event.temperature,
             "dc_dc_duty_cycle": event.dc_dc_duty_cycle,
             "rssi": event.rssi,
             "daily_energy_wh": round(acc.daily_energy_wh, 2),
             "total_energy_wh": round(acc.total_energy_wh, 2),
+            "readings_today": acc.readings_today,
             "daily_reset_date": acc.daily_reset_date,
             "last_update": now.isoformat(),
         }
@@ -630,9 +679,11 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             daily_reset_date = str(energy_data.get("daily_reset_date", ""))
             daily_energy_wh = float(energy_data.get("daily_energy_wh", 0.0))
+            readings_today = int(energy_data.get("readings_today", 0))
             if daily_reset_date != today:
                 daily_reset_date = today
                 daily_energy_wh = 0.0
+                readings_today = 0
 
             self._energy_state[barcode] = EnergyAccumulator(
                 daily_energy_wh=daily_energy_wh,
@@ -640,6 +691,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 daily_reset_date=daily_reset_date,
                 last_power_w=float(energy_data.get("last_power_w", 0.0)),
                 last_reading_ts=last_reading_ts,
+                readings_today=readings_today,
             )
 
         _LOGGER.info(
@@ -665,6 +717,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "daily_energy_wh": acc.daily_energy_wh,
                     "daily_reset_date": acc.daily_reset_date,
                     "total_energy_wh": acc.total_energy_wh,
+                    "readings_today": acc.readings_today,
                     "last_power_w": acc.last_power_w,
                     "last_reading_ts": (
                         acc.last_reading_ts.isoformat()
@@ -699,7 +752,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         self.hass.loop.call_soon_threadsafe(_do_schedule)
 
-    def reload_modules(self, modules: list[dict[str, str]]) -> None:
+    def reload_modules(self, modules: list[dict[str, Any]]) -> None:
         """Reload the module configuration (called from options flow).
 
         After updating the allowlist, checks whether any newly-configured
@@ -737,16 +790,21 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "barcode": barcode,
                     "name": module_meta.get(CONF_MODULE_NAME, barcode),
                     "string": module_meta.get(CONF_MODULE_STRING, ""),
+                    "peak_power": module_meta.get(
+                        CONF_MODULE_PEAK_POWER, DEFAULT_PEAK_POWER
+                    ),
                     "voltage_in": None,
                     "voltage_out": None,
                     "current_in": None,
                     "current_out": None,
                     "power": None,
+                    "performance": None,
                     "temperature": None,
                     "dc_dc_duty_cycle": None,
                     "rssi": None,
                     "daily_energy_wh": round(acc.daily_energy_wh, 2),
                     "total_energy_wh": round(acc.total_energy_wh, 2),
+                    "readings_today": acc.readings_today,
                     "daily_reset_date": acc.daily_reset_date,
                     "last_update": None,
                 }
