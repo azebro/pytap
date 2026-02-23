@@ -46,13 +46,17 @@ Status: ✅ Implemented in Feature 5.
 
 5.2 **Per-sensor readings counter** — Each optimizer now has a `readings_today` daily meter (`SensorStateClass.TOTAL`, diagnostic category) to support per-module connectivity troubleshooting.
 
-## 6. Binary Sensor Platform
+## 6. Binary Sensor Platform - low priority
 
 Add binary sensors for node connectivity (available/unavailable based on `last_update` age) and gateway online status.
 
 ## 7. HACS Distribution
 
-Package for distribution via [HACS](https://hacs.xyz/) with a `hacs.json` manifest for one-click installation.
+Status: ✅ Implemented in v1.0.0.
+
+- `hacs.json` manifest added for HACS compatibility.
+- GitHub Actions workflows: hassfest validation, HACS validation, ruff lint, pytest, and release asset packaging.
+- README updated with HACS installation instructions and badges.
 
 ## 8. Configuration
 - Add ability to bulk load devices
