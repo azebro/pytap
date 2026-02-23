@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
-from .core.parser import Parser
 from .core.events import Event
+from .core.parser import Parser
+from .core.source import SerialSource, TcpSource
 from .core.state import PersistentState
-from .core.source import TcpSource, SerialSource
 
 logger = logging.getLogger(__name__)
 
 
 def create_parser(
-    persistent_state: Optional[PersistentState] = None,
+    persistent_state: PersistentState | None = None,
 ) -> Parser:
     """Create a new protocol parser instance.
 

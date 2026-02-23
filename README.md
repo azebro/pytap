@@ -2,6 +2,8 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![HA Version](https://img.shields.io/badge/Home%20Assistant-2024.1%2B-blue.svg)](https://www.home-assistant.io/)
+[![HACS Custom](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://hacs.xyz/)
+[![Validate](https://github.com/azebro/pytap/actions/workflows/validate.yml/badge.svg)](https://github.com/azebro/pytap/actions/workflows/validate.yml)
 
 A Home Assistant custom integration for monitoring **Tigo TAP solar energy systems**. PyTap connects to your Tigo gateway over TCP, passively listens to the RS-485 bus protocol, and exposes real-time per-optimizer sensor entities — power, voltage, current, temperature, and more.
 
@@ -62,9 +64,13 @@ PyTap also creates aggregate virtual devices:
 1. Copy the `custom_components/pytap` folder into your Home Assistant `config/custom_components/` directory.
 2. Restart Home Assistant.
 
-### HACS (coming soon)
+### HACS (Recommended)
 
-HACS distribution is planned for a future release.
+1. Open **HACS** in your Home Assistant instance.
+2. Click the **three dots** menu in the top right and select **Custom repositories**.
+3. Add `https://github.com/azebro/pytap` with category **Integration**.
+4. Search for **PyTap** and click **Download**.
+5. Restart Home Assistant.
 
 ---
 

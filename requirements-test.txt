@@ -1,0 +1,5 @@
+# Test dependencies
+# pytest-homeassistant-custom-component pulls in pytest, pytest-asyncio,
+# and all HA core dependencies transitively.
+pytest-homeassistant-custom-component==0.13.315
+pytest_freezer==0.4.9

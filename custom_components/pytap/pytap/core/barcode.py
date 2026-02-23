@@ -8,8 +8,6 @@ Implements the Tigo barcode format: X-NNNNNNNC
 Only addresses with prefix 04:C0:5B are barcode-eligible.
 """
 
-from typing import Optional
-
 
 # 16-character barcode alphabet (no vowels)
 _ALPHABET = 'GHJKLMNPRSTVWXYZ'
@@ -43,7 +41,7 @@ def _compute_barcode_crc(address_bytes: bytes) -> int:
     return crc
 
 
-def encode_barcode(address_bytes: bytes) -> Optional[str]:
+def encode_barcode(address_bytes: bytes) -> str | None:
     """Encode an 8-byte MAC address to a Tigo barcode string.
 
     Returns None if the address doesn't have the 04:C0:5B prefix.
@@ -116,7 +114,7 @@ def decode_barcode(barcode: str) -> bytes:
     return address
 
 
-def barcode_from_address(address_bytes: bytes) -> Optional[str]:
+def barcode_from_address(address_bytes: bytes) -> str | None:
     """Convenience: encode barcode from address bytes, returning None if not eligible."""
     try:
         return encode_barcode(address_bytes)

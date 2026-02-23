@@ -5,33 +5,32 @@ PV application, and observer) into a single Parser class with a
 feed(bytes) -> list[Event] interface.
 """
 
-import logging
-import struct
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from enum import Enum, auto
-from typing import Optional
+import logging
+import struct
 
 from .barcode import barcode_from_address
 from .crc import crc
 from .events import (
     Event,
-    PowerReportEvent,
     InfrastructureEvent,
-    TopologyEvent,
+    PowerReportEvent,
     StringEvent,
+    TopologyEvent,
 )
-from .state import SlotClock, NodeTableBuilder, PersistentState
+from .state import NodeTableBuilder, PersistentState, SlotClock
 from .types import (
     Address,
-    FrameType,
     Frame,
-    NodeAddress,
+    FrameType,
     LongAddress,
-    SlotCounter,
+    NodeAddress,
     PacketType,
-    ReceivedPacketHeader,
     PowerReport,
+    ReceivedPacketHeader,
+    SlotCounter,
     iter_received_packets,
 )
 
@@ -131,7 +130,7 @@ class Parser:
 
     def __init__(
         self,
-        persistent_state: Optional[PersistentState] = None,
+        persistent_state: PersistentState | None = None,
     ):
         # Frame accumulator state
         self._state: _FrameState = _FrameState.IDLE
@@ -147,7 +146,7 @@ class Parser:
         self._captured_slot_times: dict[int, datetime] = {}
 
         # Enumeration state
-        self._enum_state: Optional[_EnumerationState] = None
+        self._enum_state: _EnumerationState | None = None
 
         # Infrastructure — caller owns persistence; parser only mutates in memory
         self._persistent_state: PersistentState = (
@@ -208,7 +207,7 @@ class Parser:
     #  Frame Accumulation State Machine
     # -------------------------------------------------------------------
 
-    def _accumulate(self, byte: int) -> Optional[Frame]:
+    def _accumulate(self, byte: int) -> Frame | None:
         """Process a single byte. Returns a Frame when a complete valid frame is found."""
         old_state = self._state
 
@@ -299,7 +298,7 @@ class Parser:
         self._state = next_state
         return None
 
-    def _decode_frame(self, buffer: bytearray) -> Optional[Frame]:
+    def _decode_frame(self, buffer: bytearray) -> Frame | None:
         """Decode a completed frame from the buffer."""
         if len(buffer) < 6:
             self._counters.runts += 1

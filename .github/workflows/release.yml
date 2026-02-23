@@ -1,0 +1,26 @@
+name: Release
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create release archive
+        run: |
+          cd custom_components/pytap
+          zip -r ../../pytap.zip . -x '__pycache__/*' '*/__pycache__/*' '.pytest_cache/*' '*/.pytest_cache/*'
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ./pytap.zip
