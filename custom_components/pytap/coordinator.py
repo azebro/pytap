@@ -606,7 +606,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         configured_missing = self._configured_barcodes - set(new_barcode_to_node)
 
         if first_infra_with_nodes:
-            _LOGGER.warning(
+            _LOGGER.info(
                 "First node table this session — barcode "
                 "resolution now active. %d/%d configured barcodes matched "
                 "in node table.",
@@ -620,14 +620,14 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     ", ".join(sorted(configured_missing)),
                 )
         elif mappings_changed and new_barcode_to_node:
-            _LOGGER.warning(
+            _LOGGER.info(
                 "Barcode mappings updated — %d/%d configured barcodes now "
                 "matched in node table.",
                 len(configured_matched),
                 len(self._configured_barcodes),
             )
             if configured_missing:
-                _LOGGER.warning(
+                _LOGGER.info(
                     "Configured barcodes still NOT found in node table: %s",
                     ", ".join(sorted(configured_missing)),
                 )

@@ -850,7 +850,7 @@ class Parser:
         builder = self._node_table_builders.setdefault(gw_id, NodeTableBuilder())
         result = builder.push(start_address, entries)
         if result is not None:
-            logger.warning(
+            logger.info(
                 "NODE_TABLE complete for gw=%d: %d nodes resolved",
                 gw_id,
                 len(result),
