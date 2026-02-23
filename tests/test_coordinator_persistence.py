@@ -22,7 +22,10 @@ from custom_components.pytap.const import (
     DEFAULT_PORT,
     DOMAIN,
 )
-from custom_components.pytap.coordinator import PyTapDataUpdateCoordinator
+from custom_components.pytap.coordinator import (
+    PyTapDataUpdateCoordinator,
+    _MigratingStore,
+)
 from custom_components.pytap.energy import EnergyAccumulator
 from custom_components.pytap.pytap.core.events import (
     InfrastructureEvent,
@@ -727,3 +730,205 @@ class TestPowerReportPerformance:
 
         node = coordinator.data["nodes"]["A-1234567B"]
         assert node["peak_power"] == DEFAULT_PEAK_POWER
+
+
+class TestStoreMigration:
+    """Test that _MigratingStore handles version mismatches without data loss."""
+
+    def test_store_is_migrating_store(self, hass: HomeAssistant) -> None:
+        """Coordinator should use _MigratingStore, not the base Store."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+
+        assert isinstance(coordinator._store, _MigratingStore)
+
+    async def test_v1_store_data_loads_successfully(self, hass: HomeAssistant) -> None:
+        """V1 store data (no energy_data key) should load without error."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+
+        # Simulate v1 store data — no energy_data key
+        v1_data = {
+            "barcode_to_node": {"A-1234567B": 10},
+            "discovered_barcodes": ["X-9999999Z"],
+        }
+        coordinator._store.async_load = AsyncMock(return_value=v1_data)
+
+        await coordinator._async_load_coordinator_state()
+
+        assert coordinator._barcode_to_node == {"A-1234567B": 10}
+        assert coordinator._discovered_barcodes == {"X-9999999Z"}
+        assert coordinator._energy_state == {}
+
+    async def test_migrate_func_returns_data_as_is(self, hass: HomeAssistant) -> None:
+        """_async_migrate_func should return old data unchanged."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+
+        old_data = {
+            "barcode_to_node": {"A-1234567B": 10},
+            "discovered_barcodes": [],
+        }
+        result = await coordinator._store._async_migrate_func(1, 1, old_data)
+        assert result == old_data
+
+
+class TestEnergyPrePopulation:
+    """Test that coordinator.data['nodes'] is pre-populated from loaded energy state."""
+
+    async def test_load_prepopulates_node_data(self, hass: HomeAssistant) -> None:
+        """After loading energy state, coordinator.data['nodes'] should have energy values."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+
+        today = datetime.now().date().isoformat()
+        stored_data = {
+            "barcode_to_node": {"A-1234567B": 10},
+            "discovered_barcodes": [],
+            "energy_data": {
+                "A-1234567B": {
+                    "daily_energy_wh": 42.5,
+                    "daily_reset_date": today,
+                    "total_energy_wh": 5000.0,
+                    "readings_today": 100,
+                    "last_power_w": 250.0,
+                    "last_reading_ts": "2026-02-23T10:00:00",
+                }
+            },
+        }
+        coordinator._store.async_load = AsyncMock(return_value=stored_data)
+
+        await coordinator._async_load_coordinator_state()
+
+        # Node data should be pre-populated with energy values
+        node = coordinator.data["nodes"].get("A-1234567B")
+        assert node is not None
+        assert node["total_energy_wh"] == 5000.0
+        assert node["daily_energy_wh"] == 42.5
+        assert node["readings_today"] == 100
+        assert node["barcode"] == "A-1234567B"
+
+    async def test_prepopulated_node_has_none_for_live_fields(
+        self, hass: HomeAssistant
+    ) -> None:
+        """Pre-populated node data should have None for fields that require live data."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+
+        today = datetime.now().date().isoformat()
+        stored_data = {
+            "barcode_to_node": {},
+            "discovered_barcodes": [],
+            "energy_data": {
+                "A-1234567B": {
+                    "daily_energy_wh": 10.0,
+                    "daily_reset_date": today,
+                    "total_energy_wh": 100.0,
+                    "readings_today": 5,
+                    "last_power_w": 100.0,
+                    "last_reading_ts": None,
+                }
+            },
+        }
+        coordinator._store.async_load = AsyncMock(return_value=stored_data)
+
+        await coordinator._async_load_coordinator_state()
+
+        node = coordinator.data["nodes"]["A-1234567B"]
+        assert node["power"] is None
+        assert node["voltage_in"] is None
+        assert node["voltage_out"] is None
+        assert node["current_in"] is None
+        assert node["current_out"] is None
+        assert node["temperature"] is None
+        assert node["rssi"] is None
+        assert node["performance"] is None
+
+    async def test_prepopulation_skips_unconfigured_barcodes(
+        self, hass: HomeAssistant
+    ) -> None:
+        """Only configured barcodes should be pre-populated in node data."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+
+        today = datetime.now().date().isoformat()
+        stored_data = {
+            "barcode_to_node": {},
+            "discovered_barcodes": [],
+            "energy_data": {
+                "A-1234567B": {
+                    "daily_energy_wh": 10.0,
+                    "daily_reset_date": today,
+                    "total_energy_wh": 100.0,
+                    "readings_today": 5,
+                    "last_power_w": 100.0,
+                    "last_reading_ts": None,
+                },
+                "UNCONFIGURED-BARCODE": {
+                    "daily_energy_wh": 20.0,
+                    "daily_reset_date": today,
+                    "total_energy_wh": 200.0,
+                    "readings_today": 10,
+                    "last_power_w": 200.0,
+                    "last_reading_ts": None,
+                },
+            },
+        }
+        coordinator._store.async_load = AsyncMock(return_value=stored_data)
+
+        await coordinator._async_load_coordinator_state()
+
+        assert "A-1234567B" in coordinator.data["nodes"]
+        assert "UNCONFIGURED-BARCODE" not in coordinator.data["nodes"]
+
+    async def test_power_report_overwrites_prepopulated_data(
+        self, hass: HomeAssistant
+    ) -> None:
+        """A live power report should fully replace pre-populated node data."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+
+        today = datetime.now().date().isoformat()
+        stored_data = {
+            "barcode_to_node": {"A-1234567B": 10},
+            "discovered_barcodes": [],
+            "energy_data": {
+                "A-1234567B": {
+                    "daily_energy_wh": 42.5,
+                    "daily_reset_date": today,
+                    "total_energy_wh": 5000.0,
+                    "readings_today": 100,
+                    "last_power_w": 250.0,
+                    "last_reading_ts": None,
+                }
+            },
+        }
+        coordinator._store.async_load = AsyncMock(return_value=stored_data)
+        await coordinator._async_load_coordinator_state()
+
+        # Pre-populated: power is None
+        assert coordinator.data["nodes"]["A-1234567B"]["power"] is None
+
+        # Live power report arrives
+        coordinator._infra_received = True
+        coordinator._schedule_save = MagicMock()
+        event = PowerReportEvent(
+            gateway_id=1,
+            node_id=10,
+            barcode="A-1234567B",
+            voltage_in=60.0,
+            voltage_out=30.0,
+            current_in=5.0,
+            temperature=40.0,
+            dc_dc_duty_cycle=0.9,
+            rssi=-60,
+            timestamp=datetime.now(),
+        )
+        coordinator._handle_power_report(event)
+
+        node = coordinator.data["nodes"]["A-1234567B"]
+        # Live fields should now be populated
+        assert node["power"] is not None
+        assert node["voltage_in"] == 60.0
+        # Energy should continue from the loaded accumulator, not reset
+        assert node["total_energy_wh"] >= 5000.0
