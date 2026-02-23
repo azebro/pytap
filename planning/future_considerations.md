@@ -22,9 +22,11 @@ Aggregate entities now expose power, daily energy, and total energy at two level
 
 ## 3. Performance
 
- - Panel configuration should be extended to add peak panel power. Based on that there should be entity in each sensor to show performance in % which will represent 'Power'/'Peak Power'.
+Status: ✅ Implemented in Feature 3.
 
- - The 3.1 concept should be extended to per string and total.
+3.1 **Peak panel power configuration** — Panel configuration extended to add peak panel power. Based on that, each sensor shows performance in % representing `Power / Peak Power`. Default value set to 455 W for migrations or when user does not input a value.
+
+3.2 **Aggregate performance** — The per-optimizer performance concept extended to per-string and installation-wide totals.
 
 ## 4. Energy Dashboard Integration
 
@@ -38,7 +40,11 @@ These are compatible with the Home Assistant energy dashboard without requiring 
 
 ## 5. Diagnostics Platform
 
-Expose parser counters (`frames_received`, `crc_errors`, `noise_bytes`) and infrastructure state as a diagnostics download for troubleshooting.
+Status: ✅ Implemented in Feature 5.
+
+5.1 **Diagnostics download** — Exposes parser counters (`frames_received`, `crc_errors`, `noise_bytes`, `runts`, `giants`), infrastructure state, barcode↔node mappings, discovered barcodes, connection state, and per-node summaries via Home Assistant's integration diagnostics download.
+
+5.2 **Per-sensor readings counter** — Each optimizer now has a `readings_today` daily meter (`SensorStateClass.TOTAL`, diagnostic category) to support per-module connectivity troubleshooting.
 
 ## 6. Binary Sensor Platform
 

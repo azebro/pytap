@@ -6,15 +6,17 @@ import pytest
 
 from homeassistant import config_entries
 from homeassistant.core import HomeAssistant
-from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.data_entry_flow import InvalidData, FlowResultType
 
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.pytap.const import (
     CONF_MODULE_BARCODE,
     CONF_MODULE_NAME,
+    CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
     CONF_MODULES,
+    DEFAULT_PEAK_POWER,
     DEFAULT_PORT,
     DOMAIN,
 )
@@ -128,6 +130,7 @@ async def test_full_flow_add_one_module(hass: HomeAssistant) -> None:
         CONF_MODULE_STRING: "A",
         CONF_MODULE_NAME: "Panel_01",
         CONF_MODULE_BARCODE: "A-1234567B",
+        CONF_MODULE_PEAK_POWER: DEFAULT_PEAK_POWER,
     }
 
 
@@ -474,3 +477,72 @@ async def test_options_change_connection_preserves_modules(
         )
 
     assert entry.data[CONF_MODULES] == original_modules
+
+
+async def test_add_module_with_custom_peak_power(hass: HomeAssistant) -> None:
+    """Custom peak power should be persisted in module config."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+
+    with patch(
+        "custom_components.pytap.config_flow.validate_connection",
+        return_value={"title": f"PyTap ({MOCK_HOST})"},
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {"host": MOCK_HOST, "port": MOCK_PORT},
+        )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "add_module"}
+    )
+    assert result["step_id"] == "add_module"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_MODULE_STRING: "A",
+            CONF_MODULE_NAME: "Panel_01",
+            CONF_MODULE_BARCODE: "A-1234567B",
+            CONF_MODULE_PEAK_POWER: 400,
+        },
+    )
+    assert result["type"] is FlowResultType.MENU
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "finish"}
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_MODULES][0][CONF_MODULE_PEAK_POWER] == 400
+
+
+async def test_add_module_peak_power_validation(hass: HomeAssistant) -> None:
+    """Peak power must satisfy schema range constraints."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+
+    with patch(
+        "custom_components.pytap.config_flow.validate_connection",
+        return_value={"title": f"PyTap ({MOCK_HOST})"},
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {"host": MOCK_HOST, "port": MOCK_PORT},
+        )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "add_module"}
+    )
+
+    with pytest.raises(InvalidData):
+        await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                CONF_MODULE_STRING: "A",
+                CONF_MODULE_NAME: "Panel_01",
+                CONF_MODULE_BARCODE: "A-1234567B",
+                CONF_MODULE_PEAK_POWER: 0,
+            },
+        )

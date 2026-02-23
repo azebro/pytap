@@ -20,8 +20,10 @@ from custom_components.pytap import (
 from custom_components.pytap.const import (
     CONF_MODULE_BARCODE,
     CONF_MODULE_NAME,
+    CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
     CONF_MODULES,
+    DEFAULT_PEAK_POWER,
     DEFAULT_STRING_NAME,
     DEFAULT_PORT,
     DOMAIN,
@@ -191,13 +193,15 @@ class TestConfigEntryMigration:
     async def test_migrate_v2_to_v3_existing_strings(self, hass: HomeAssistant) -> None:
         """Existing string labels should be preserved."""
         entry = _make_entry(hass, version=2)
-        original_modules = list(entry.data[CONF_MODULES])
 
         result = await async_migrate_entry(hass, entry)
 
         assert result is True
         assert entry.version == CONFIG_ENTRY_VERSION
-        assert entry.data[CONF_MODULES] == original_modules
+        assert entry.data[CONF_MODULES][0][CONF_MODULE_STRING] == "A"
+        assert entry.data[CONF_MODULES][1][CONF_MODULE_STRING] == "B"
+        assert entry.data[CONF_MODULES][0][CONF_MODULE_PEAK_POWER] == DEFAULT_PEAK_POWER
+        assert entry.data[CONF_MODULES][1][CONF_MODULE_PEAK_POWER] == DEFAULT_PEAK_POWER
 
     async def test_migrate_v2_to_v3_mixed(self, hass: HomeAssistant) -> None:
         """Only missing string labels should be defaulted in mixed lists."""
@@ -224,3 +228,73 @@ class TestConfigEntryMigration:
         assert entry.version == CONFIG_ENTRY_VERSION
         assert entry.data[CONF_MODULES][0][CONF_MODULE_STRING] == "A"
         assert entry.data[CONF_MODULES][1][CONF_MODULE_STRING] == DEFAULT_STRING_NAME
+
+    async def test_migrate_v3_to_v4_adds_peak_power(self, hass: HomeAssistant) -> None:
+        """Modules without peak power get the default value on migration."""
+        entry = _make_entry(
+            hass,
+            version=3,
+            modules=[
+                {
+                    CONF_MODULE_STRING: "A",
+                    CONF_MODULE_NAME: "Panel_01",
+                    CONF_MODULE_BARCODE: "A-1234567B",
+                }
+            ],
+        )
+
+        result = await async_migrate_entry(hass, entry)
+
+        assert result is True
+        assert entry.version == CONFIG_ENTRY_VERSION
+        assert entry.data[CONF_MODULES][0][CONF_MODULE_PEAK_POWER] == DEFAULT_PEAK_POWER
+
+    async def test_migrate_v3_to_v4_preserves_peak_power(
+        self, hass: HomeAssistant
+    ) -> None:
+        """Existing peak power values should not be overwritten."""
+        entry = _make_entry(
+            hass,
+            version=3,
+            modules=[
+                {
+                    CONF_MODULE_STRING: "A",
+                    CONF_MODULE_NAME: "Panel_01",
+                    CONF_MODULE_BARCODE: "A-1234567B",
+                    CONF_MODULE_PEAK_POWER: 400,
+                }
+            ],
+        )
+
+        result = await async_migrate_entry(hass, entry)
+
+        assert result is True
+        assert entry.version == CONFIG_ENTRY_VERSION
+        assert entry.data[CONF_MODULES][0][CONF_MODULE_PEAK_POWER] == 400
+
+    async def test_migrate_v3_to_v4_mixed(self, hass: HomeAssistant) -> None:
+        """Mixed modules: missing peak_power gets default, existing is preserved."""
+        entry = _make_entry(
+            hass,
+            version=3,
+            modules=[
+                {
+                    CONF_MODULE_STRING: "A",
+                    CONF_MODULE_NAME: "Panel_01",
+                    CONF_MODULE_BARCODE: "A-1234567B",
+                    CONF_MODULE_PEAK_POWER: 400,
+                },
+                {
+                    CONF_MODULE_STRING: "A",
+                    CONF_MODULE_NAME: "Panel_02",
+                    CONF_MODULE_BARCODE: "C-2345678D",
+                },
+            ],
+        )
+
+        result = await async_migrate_entry(hass, entry)
+
+        assert result is True
+        assert entry.version == CONFIG_ENTRY_VERSION
+        assert entry.data[CONF_MODULES][0][CONF_MODULE_PEAK_POWER] == 400
+        assert entry.data[CONF_MODULES][1][CONF_MODULE_PEAK_POWER] == DEFAULT_PEAK_POWER

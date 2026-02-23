@@ -53,5 +53,3 @@ docker-compose.override.yml
 
 # Deploy credentials
 deploy/.deploy.env
-feature1.md
-feature2.md

@@ -15,8 +15,10 @@ from homeassistant.core import HomeAssistant
 from custom_components.pytap.const import (
     CONF_MODULE_BARCODE,
     CONF_MODULE_NAME,
+    CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
     CONF_MODULES,
+    DEFAULT_PEAK_POWER,
     DEFAULT_PORT,
     DOMAIN,
 )
@@ -34,6 +36,7 @@ MOCK_MODULES = [
         CONF_MODULE_STRING: "A",
         CONF_MODULE_NAME: "Panel_01",
         CONF_MODULE_BARCODE: "A-1234567B",
+        CONF_MODULE_PEAK_POWER: 455,
     },
 ]
 
@@ -199,6 +202,7 @@ class TestLoadCoordinatorState:
                     "daily_energy_wh": 10.5,
                     "daily_reset_date": datetime.now().date().isoformat(),
                     "total_energy_wh": 1234.5,
+                    "readings_today": 17,
                     "last_power_w": 250.0,
                     "last_reading_ts": "2025-01-01T10:00:00",
                 }
@@ -211,6 +215,7 @@ class TestLoadCoordinatorState:
         acc = coordinator._energy_state["A-1234567B"]
         assert acc.daily_energy_wh == 10.5
         assert acc.total_energy_wh == 1234.5
+        assert acc.readings_today == 17
         assert acc.last_power_w == 250.0
 
     async def test_load_resets_daily_energy_on_new_day(
@@ -228,6 +233,7 @@ class TestLoadCoordinatorState:
                     "daily_energy_wh": 99.0,
                     "daily_reset_date": "2000-01-01",
                     "total_energy_wh": 555.0,
+                    "readings_today": 44,
                     "last_power_w": 100.0,
                     "last_reading_ts": "2025-01-01T10:00:00",
                 }
@@ -239,6 +245,7 @@ class TestLoadCoordinatorState:
 
         acc = coordinator._energy_state["A-1234567B"]
         assert acc.daily_energy_wh == 0.0
+        assert acc.readings_today == 0
         assert acc.total_energy_wh == 555.0
         assert acc.daily_reset_date == datetime.now().date().isoformat()
 
@@ -281,6 +288,7 @@ class TestSaveCoordinatorState:
                 daily_energy_wh=1.25,
                 daily_reset_date=datetime.now().date().isoformat(),
                 total_energy_wh=100.75,
+                readings_today=9,
                 last_power_w=250.0,
                 last_reading_ts=datetime.now(),
             )
@@ -298,6 +306,7 @@ class TestSaveCoordinatorState:
         assert "parser_state" in saved
         assert "energy_data" in saved
         assert "A-1234567B" in saved["energy_data"]
+        assert saved["energy_data"]["A-1234567B"]["readings_today"] == 9
         assert coordinator._unsaved_changes is False
 
     async def test_save_handles_exception(self, hass: HomeAssistant) -> None:
@@ -636,3 +645,85 @@ class TestStopFlushesState:
         await coordinator.async_stop_listener()
 
         coordinator._store.async_save.assert_not_called()
+
+
+class TestPowerReportPerformance:
+    """Test power report performance field behavior."""
+
+    def test_power_report_includes_performance(self, hass: HomeAssistant) -> None:
+        """Power report should populate performance in node payload."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+
+        event = PowerReportEvent(
+            gateway_id=1,
+            node_id=10,
+            barcode="A-1234567B",
+            voltage_in=30.0,
+            voltage_out=29.0,
+            current_in=8.0,
+            temperature=40.0,
+            dc_dc_duty_cycle=0.9,
+            rssi=-60,
+            timestamp=datetime.now(),
+        )
+        result = coordinator._handle_power_report(event)
+
+        assert result is True
+        node = coordinator.data["nodes"]["A-1234567B"]
+        assert "performance" in node
+        assert node["peak_power"] == 455
+
+    def test_power_report_performance_calculation(self, hass: HomeAssistant) -> None:
+        """Performance should be power/peak_power*100 rounded to 2 decimals."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+
+        event = PowerReportEvent(
+            gateway_id=1,
+            node_id=10,
+            barcode="A-1234567B",
+            voltage_in=50.0,
+            voltage_out=25.0,
+            current_in=5.0,
+            temperature=40.0,
+            dc_dc_duty_cycle=0.9,
+            rssi=-60,
+            timestamp=datetime.now(),
+        )
+        coordinator._handle_power_report(event)
+
+        node = coordinator.data["nodes"]["A-1234567B"]
+        assert node["performance"] == 54.95
+
+    def test_power_report_default_peak_power(self, hass: HomeAssistant) -> None:
+        """Missing module peak_power should fall back to default."""
+        entry = _make_entry(hass)
+        entry.data = {
+            **entry.data,
+            CONF_MODULES: [
+                {
+                    CONF_MODULE_STRING: "A",
+                    CONF_MODULE_NAME: "Panel_01",
+                    CONF_MODULE_BARCODE: "A-1234567B",
+                }
+            ],
+        }
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+
+        event = PowerReportEvent(
+            gateway_id=1,
+            node_id=10,
+            barcode="A-1234567B",
+            voltage_in=60.0,
+            voltage_out=30.0,
+            current_in=5.0,
+            temperature=40.0,
+            dc_dc_duty_cycle=0.9,
+            rssi=-60,
+            timestamp=datetime.now(),
+        )
+        coordinator._handle_power_report(event)
+
+        node = coordinator.data["nodes"]["A-1234567B"]
+        assert node["peak_power"] == DEFAULT_PEAK_POWER

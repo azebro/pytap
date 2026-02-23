@@ -1,6 +1,6 @@
 # PyTap — Implementation Document
 
-> Version 0.2.0 · Last updated: February 2026
+> Version 0.3.0 · Last updated: February 2026
 
 This document captures the current implementation state of the PyTap Home Assistant custom component. It describes what has been built, how each module works, the design decisions made during development, and the test coverage in place.
 
@@ -17,7 +17,9 @@ For the high-level architecture and design rationale, see [architecture.md](arch
    - [manifest.json — Integration Metadata](#manifestjson--integration-metadata)
    - [config_flow.py — Configuration Flow](#config_flowpy--configuration-flow)
    - [coordinator.py — Data Coordinator](#coordinatorpy--data-coordinator)
+   - [energy.py — Energy Accumulation](#energypy--energy-accumulation)
    - [sensor.py — Sensor Platform](#sensorpy--sensor-platform)
+   - [diagnostics.py — Diagnostics Platform](#diagnosticspy--diagnostics-platform)
    - [\_\_init\_\_.py — Integration Lifecycle](#__init__py--integration-lifecycle)
    - [strings.json / translations — UI Strings](#stringsjson--translations--ui-strings)
 4. [Config Flow UX Design](#config-flow-ux-design)
@@ -44,8 +46,8 @@ PyTap is a Home Assistant custom component that passively monitors Tigo TAP sola
 | Config flow | Menu-driven: add modules one at a time via individual form fields |
 | Threading model | Blocking parser in executor thread, bridged to async event loop |
 | External dependencies | None — parser library embedded, stdlib only |
-| Sensor types | 10 per optimizer + aggregate sensors per string and per installation (power, daily energy, total energy) |
-| Test coverage | Expanded integration + parser coverage, including aggregate sensor and v2→v3 migration behavior |
+| Sensor types | 12 per optimizer + aggregate sensors per string and per installation (performance, power, daily energy, total energy) |
+| Test coverage | Expanded integration + parser coverage, including aggregate sensor, performance, and v3→v4 migration behavior |
 
 ---
 
@@ -53,13 +55,14 @@ PyTap is a Home Assistant custom component that passively monitors Tigo TAP sola
 
 ```
 custom_components/pytap/
-├── __init__.py          # ~135 lines — Integration lifecycle (setup, teardown, migration, options listener)
+├── __init__.py          # ~187 lines — Integration lifecycle (setup, teardown, migration, options listener)
 ├── config_flow.py       # 369 lines  — Menu-driven config & options flows
-├── const.py             # ~27 lines  — Domain, config keys, defaults, energy tuning constants
-├── coordinator.py       # ~635 lines — Push-based DataUpdateCoordinator
+├── const.py             # ~28 lines  — Domain, config keys, defaults, energy tuning constants
+├── coordinator.py       # ~826 lines — Push-based DataUpdateCoordinator
+├── diagnostics.py       # ~46 lines  — Diagnostics download (config entry diagnostics)
 ├── energy.py            # ~80 lines  — Pure trapezoidal energy accumulation helpers
 ├── manifest.json        # 13 lines   — HA integration metadata
-├── sensor.py            # ~270 lines — 10 sensor entity types, CoordinatorEntity pattern
+├── sensor.py            # ~572 lines — 12 sensor entity types, CoordinatorEntity pattern
 ├── strings.json         # ~100 lines — UI strings (source of truth)
 ├── translations/
 │   └── en.json          # ~100 lines — English translations (mirrors strings.json)
@@ -76,11 +79,12 @@ custom_components/pytap/
 
 tests/
 ├── conftest.py                    # 14 lines  — Auto-enable custom integrations fixture
-├── test_config_flow.py            # 445 lines — 13 config flow tests
-├── test_coordinator_persistence.py # ~570 lines — 28 coordinator & persistence tests
-├── test_migration.py              # ~120 lines — 5 entity migration tests
-├── test_sensor.py                 # ~250 lines — 9 sensor platform tests
-└── test_energy.py                 # 142 lines  — 10 pure energy accumulation tests
+├── test_config_flow.py            # 548 lines — 16 config flow tests
+├── test_coordinator_persistence.py # ~729 lines — 32 coordinator & persistence tests
+├── test_diagnostics.py            # ~172 lines — 4 diagnostics platform tests
+├── test_energy.py                 # ~170 lines — 13 pure energy accumulation tests
+├── test_migration.py              # ~300 lines — 11 entity migration tests
+└── test_sensor.py                 # ~875 lines — 32 sensor platform tests
 
 docs/
 ├── architecture.md      # 656 lines — Architecture & design document
@@ -104,6 +108,10 @@ CONF_MODULES = "modules"          # List of module dicts in ConfigEntry.data
 CONF_MODULE_STRING = "string"     # Required string/group label
 CONF_MODULE_NAME = "name"         # User-friendly optimizer name
 CONF_MODULE_BARCODE = "barcode"   # Tigo hardware barcode (stable ID)
+CONF_MODULE_PEAK_POWER = "peak_power"  # Peak panel power in Wp
+
+# Defaults
+DEFAULT_PEAK_POWER = 455          # Wp (watts peak) — STC rating
 
 # Reconnection tuning
 RECONNECT_TIMEOUT = 60            # Seconds of silence → reconnect
@@ -128,7 +136,7 @@ These constants are imported by every other module in the integration.
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/azebro/pytap/issues",
   "requirements": [],
-  "version": "0.2.0"
+  "version": "0.3.0"
 }
 ```
 
@@ -163,6 +171,7 @@ Key choices:
    - **String group** (`string`) — Optional grouping label (e.g., "A", "East").
    - **Name** (`name`) — Required user-friendly label (e.g., "Panel_01").
    - **Barcode** (`barcode`) — Required Tigo hardware barcode.
+   - **Peak power** (`peak_power`) — Optional peak panel power in Wp (default: 455). Used to calculate performance percentage.
 
    Validation:
    - Name must be non-empty → `missing_name` error on the name field.
@@ -308,10 +317,16 @@ The data dict stored per node:
     "current_in": float,
     "current_out": float,
     "power": float,
+    "peak_power": int,
+    "performance": float,     # (power / peak_power) × 100
     "temperature": float,
     "dc_dc_duty_cycle": float,  # 0.0–1.0
     "rssi": int,
-    "last_update": str,    # ISO 8601
+    "daily_energy_wh": float,   # accumulated daily Wh (trapezoidal)
+    "total_energy_wh": float,   # lifetime accumulated Wh
+    "readings_today": int,      # power-report count since midnight
+    "daily_reset_date": str,    # ISO date of last daily reset
+    "last_update": str,         # ISO 8601
 }
 ```
 
@@ -359,11 +374,30 @@ All persistent state is consolidated into a single HA Store, written via `homeas
 - **`barcode_to_node`** — Barcode↔node_id mappings learned from infrastructure events.
 - **`discovered_barcodes`** — Set of unconfigured barcodes seen on the bus.
 - **`parser_state`** — Serialised parser infrastructure state (gateway identities, versions, node tables) via `PersistentState.to_dict()`.
-- **`energy_data`** — Per-barcode accumulator state (`daily_energy_wh`, `daily_reset_date`, `total_energy_wh`, `last_power_w`, `last_reading_ts`).
+- **`energy_data`** — Per-barcode accumulator state (`daily_energy_wh`, `daily_reset_date`, `total_energy_wh`, `readings_today`, `last_power_w`, `last_reading_ts`).
 
 On startup, coordinator state is loaded from the HA Store (via `_async_load_coordinator_state`), including the parser's `PersistentState` which is deserialized via `PersistentState.from_dict()`. The parser receives a shared `PersistentState` object and mutates it in memory — the parser never performs file I/O. The coordinator schedules debounced saves (10-second delay) when mappings or infrastructure change, and flushes immediately on shutdown.
 
 The `_init_mappings_from_parser` method pre-populates barcode↔node mappings from the parser's infrastructure on reconnect. Parser mappings take precedence when non-empty; when the parser state has no node table (first run), the coordinator-saved mappings are preserved as fallback.
+
+---
+
+### `energy.py` — Energy Accumulation
+
+Pure-logic module implementing trapezoidal energy integration. Intentionally HA-independent so it can be unit-tested without coordinator or event-loop setup.
+
+**`EnergyAccumulator` dataclass** — Per-barcode mutable state: `daily_energy_wh`, `total_energy_wh`, `daily_reset_date`, `last_power_w`, `last_reading_ts`, `readings_today`.
+
+**`EnergyUpdateResult` dataclass** — Immutable result metadata per accumulation step: `increment_wh`, `discarded_gap_during_production`.
+
+**`accumulate_energy(acc, power, now, …) → EnergyUpdateResult`:**
+1. Clamps power to non-negative.
+2. Resets `daily_energy_wh` and `readings_today` to zero on date change.
+3. If a previous reading exists and the interval is within the gap threshold, applies trapezoidal integration: `((prev_power + power) / 2) × (Δt / 3600)`.
+4. Flags intervals exceeding the gap threshold during production as discarded.
+5. Unconditionally increments `readings_today` and updates `last_power_w` / `last_reading_ts`.
+
+The coordinator calls `accumulate_energy()` from `_handle_power_report` and merges the result into the node data dict.
 
 ---
 
@@ -375,6 +409,8 @@ Implements per-optimizer sensors and aggregate sensors using the `CoordinatorEnt
 
 ```python
 SENSOR_DESCRIPTIONS = (
+    PyTapSensorEntityDescription(key="performance",       value_key="performance",
+        unit="%",                          state_class=MEASUREMENT),
     PyTapSensorEntityDescription(key="power",             value_key="power",
         unit=UnitOfPower.WATT,            device_class=POWER),
     PyTapSensorEntityDescription(key="voltage_in",        value_key="voltage_in",
@@ -395,6 +431,8 @@ SENSOR_DESCRIPTIONS = (
         unit=UnitOfEnergy.WATT_HOUR,       device_class=ENERGY, state_class=TOTAL),
     PyTapSensorEntityDescription(key="total_energy",      value_key="total_energy_wh",
         unit=UnitOfEnergy.WATT_HOUR,       device_class=ENERGY, state_class=TOTAL_INCREASING),
+    PyTapSensorEntityDescription(key="readings_today",    value_key="readings_today",
+        state_class=TOTAL, entity_category=DIAGNOSTIC),
 )
 ```
 
@@ -415,10 +453,10 @@ for module_config in modules:
 
 For two modules on two strings, entity creation is:
 
-- Per-optimizer: `2 × 10 = 20`
-- Per-string aggregate: `2 × 3 = 6`
-- Installation aggregate: `3`
-- Total: `29`
+- Per-optimizer: `2 × 12 = 24`
+- Per-string aggregate: `2 × 4 = 8`
+- Installation aggregate: `4`
+- Total: `36`
 
 #### `PyTapSensor` Class
 
@@ -440,7 +478,7 @@ DeviceInfo(
 )
 ```
 
-All 10 sensors for the same barcode are grouped under one device.
+All 12 sensors for the same barcode are grouped under one device.
 
 **Availability:**
 Returns `True` only when `coordinator.data["nodes"][barcode]` exists (i.e., at least one `PowerReportEvent` has been received for this optimizer). There is no unavailable timeout — sensors hold their last received value indefinitely.
@@ -457,22 +495,42 @@ Returns `True` only when `coordinator.data["nodes"][barcode]` exists (i.e., at l
 
 ---
 
+### `diagnostics.py` — Diagnostics Platform
+
+Implements the HA diagnostics download endpoint via `async_get_config_entry_diagnostics()`. HA auto-discovers this module — no `PLATFORMS` entry is needed.
+
+**Redaction:** Uses `async_redact_data` with `TO_REDACT = {CONF_HOST}` to strip the host IP from the config entry snapshot. Port and all other data remain visible.
+
+**Payload structure:**
+- `config_entry` — Redacted config entry dict.
+- `counters` — Internal event counters from coordinator data.
+- `gateways` — Gateway identity data.
+- `discovered_barcodes` — Unconfigured barcodes seen on the bus.
+- `nodes` — Per-barcode summary (last_update, gateway_id, node_id, daily_energy_wh, total_energy_wh, readings_today).
+- Plus all keys from `coordinator.get_diagnostics_data()` (node_mappings, connection_state, energy_state), also redacted.
+
+The node summaries intentionally omit raw power/voltage fields to keep the diagnostics download focused on integration health rather than instantaneous electrical data.
+
+---
+
 ### `__init__.py` — Integration Lifecycle
 
 Handles integration lifecycle, config entry migration, and legacy entity cleanup.
 
 #### Config Entry Version
 
-`CONFIG_ENTRY_VERSION = 3`:
+`CONFIG_ENTRY_VERSION = 4`:
 
 - `v1 → v2`: voltage/current split to `_in`/`_out`
 - `v2 → v3`: module string labels became mandatory (defaulted to `"Default"` during migration)
+- `v3 → v4`: peak power added to module config (defaulted to 455 Wp during migration)
 
 #### `async_migrate_entry(hass, entry) → bool`
 
 Handles config entry version migration:
 - **v1 → v2:** Updates `entry.version` to 2.
 - **v2 → v3:** Ensures each module has a non-empty string label, defaulting missing/empty values to `"Default"`.
+- **v3 → v4:** Adds `peak_power` to each module, defaulting to `DEFAULT_PEAK_POWER` (455 Wp) for modules that don't have it.
 
 #### `async_setup_entry(hass, entry) → bool`
 
@@ -646,29 +704,48 @@ All tests mock `validate_connection` to avoid real TCP connections.
 
 | Test | What it verifies |
 | --- | --- |
-| `test_sensor_entities_created` | 2 modules, 2 strings create 29 entities including aggregate sensors |
+| `test_sensor_entities_created` | 2 modules, 2 strings create 36 entities including aggregate sensors |
 | `test_sensor_unique_ids` | IDs include per-optimizer and aggregate unique ID formats |
 | `test_sensor_available_with_data` | Sensor available when node data exists |
 | `test_sensor_unavailable_without_data` | Sensor unavailable when data dict is empty |
 | `test_sensor_skips_modules_without_barcode` | Modules with empty barcode don't create entities |
 | `test_sensor_device_info` | Device identifiers, manufacturer, model, serial_number |
-| `test_sensor_descriptions_count` | Exactly 10 sensor descriptions defined |
+| `test_sensor_descriptions_count` | Exactly 12 sensor descriptions defined |
 | `test_energy_sensor_descriptions` | Daily/total energy sensor metadata and state classes |
 | `test_daily_energy_last_reset` | Daily energy exposes `last_reset` from `daily_reset_date` |
 | `test_string_daily_energy_sums` | String daily aggregate sums constituent `daily_energy_wh` |
 | `test_installation_total_energy_sums_all` | Installation total aggregate sums constituent `total_energy_wh` |
 | `test_string_aggregate_device_info` | String aggregate uses virtual string device metadata |
 | `test_installation_aggregate_device_info` | Installation aggregate uses installation virtual device metadata |
+| `test_performance_sensor_value` | Per-optimizer performance sensor exposes stored percentage |
+| `test_string_performance_weighted` | String aggregate uses capacity-weighted formula |
+| `test_installation_performance_partial_data` | Aggregate performance includes only reporting nodes |
+| `test_installation_performance_unavailable_without_data` | Aggregate performance unavailable when no nodes report power |
+| `test_performance_sensor_zero_power` | Power=0W produces performance=0.0% |
+| `test_readings_today_sensor_metadata` | `readings_today` has `TOTAL` state class and `DIAGNOSTIC` category |
+| `test_readings_today_value_and_last_reset` | Value read from node data, `last_reset` from `daily_reset_date` |
+| `test_performance_sensor_above_100` | Power > peak produces >100% (no clamping) |
 
 Tests use `MagicMock(spec=PyTapDataUpdateCoordinator)` to avoid real coordinator initialization.
 
-### Coordinator Persistence Tests (28 tests)
+### Coordinator Persistence Tests (32 tests)
 
 Coverage includes coordinator initialization, barcode mapping restoration and purging, deferred power-report handling before infrastructure, save/load behavior, parser-state restore/fallback, stop-flush behavior, and energy-data persistence (`energy_data` save/load with daily reset on new day).
 
-### Energy Accumulation Unit Tests (10 tests)
+### Diagnostics Platform Tests (4 tests)
 
-`tests/test_energy.py` validates trapezoidal integration in isolation across baseline behavior, nominal interval integration, gap handling during production, overnight gaps, daily resets with preserved total accumulation, and related edge cases.
+`tests/test_diagnostics.py` validates the diagnostics download endpoint:
+
+| Test | What it verifies |
+| --- | --- |
+| `test_config_entry_diagnostics_redacts_host` | Host is redacted, port and barcodes are visible |
+| `test_config_entry_diagnostics_includes_unredacted_barcodes` | Discovered barcodes pass through unredacted |
+| `test_config_entry_diagnostics_fresh_install` | Empty coordinator (no data) doesn't raise |
+| `test_config_entry_diagnostics_all_keys_present` | All expected top-level keys present, `energy_state`/`discovered_barcodes` pass-through |
+
+### Energy Accumulation Unit Tests (13 tests)
+
+`tests/test_energy.py` validates trapezoidal integration in isolation across baseline behavior, nominal interval integration, gap handling during production, overnight gaps, daily resets with preserved total accumulation, `readings_today` incrementing and daily-reset behaviour, and related edge cases.
 
 ### Entity Migration Tests
 
@@ -679,6 +756,11 @@ Coverage includes coordinator initialization, barcode mapping restoration and pu
 | `test_no_op_when_no_legacy_entities` | No errors when no legacy entities exist |
 | `test_migrates_v1_to_v2` | Config entry version migrates forward to current version |
 | `test_migrate_v2_to_v3_empty_strings` | Empty/missing module strings are defaulted during migration |
+| `test_migrate_v2_to_v3_existing_strings` | Existing string labels preserved during migration |
+| `test_migrate_v2_to_v3_mixed` | Only missing string labels defaulted in mixed lists |
+| `test_migrate_v3_to_v4_adds_peak_power` | Modules without peak_power get DEFAULT_PEAK_POWER |
+| `test_migrate_v3_to_v4_preserves_peak_power` | Existing peak_power values not overwritten |
+| `test_migrate_v3_to_v4_mixed` | Mixed modules: missing gets default, existing preserved |
 | `test_already_current_version` | Current-version entries pass through migration unchanged |
 
 ### Parser Library Tests (in `custom_components/pytap/pytap/tests/`)
@@ -777,10 +859,10 @@ The architecture document (`architecture.md`) was written during initial design 
 | Gateway device registration | Described as separate DeviceInfo | Not yet implemented (sensors have device info per optimizer only) |
 | `via_device` on nodes | Linked to gateway device | Not implemented (no gateway device yet) |
 | Unavailable timeout | Described as configurable via options | Removed — sensors hold last value indefinitely |
-| Sensor count | Historical counts | 10 per optimizer, plus string/installation aggregate sensors |
-| Config entry version | Not mentioned | v3 with v1→v2 and v2→v3 migration steps |
+| Sensor count | Historical counts | 12 per optimizer, plus string/installation aggregate sensors |
+| Config entry version | Not mentioned | v4 with v1→v2, v2→v3, and v3→v4 migration steps |
 | Threading primitives | Not specified | threading.Event + threading.Lock (not asyncio.Event) |
-| Diagnostics platform | Mentioned for discovered barcodes | Not implemented yet (data stored in coordinator) |
+| Diagnostics platform | Mentioned for discovered barcodes | Implemented via `diagnostics.py` config-entry download |
 
 ---
 
@@ -800,7 +882,7 @@ Implemented all core files:
 - `const.py`, `manifest.json` — Constants and metadata.
 - `config_flow.py` — Menu-driven flow (host/port → modules menu → add/remove modules).
 - `coordinator.py` — Push-based streaming with barcode filtering.
-- `sensor.py` — 10 per-optimizer sensor types plus aggregate sensor platform entities.
+- `sensor.py` — 12 per-optimizer sensor types plus aggregate sensor platform entities.
 - `__init__.py` — Lifecycle management.
 - `strings.json`, `translations/en.json` — UI strings.
 - Test suite — 14 tests passing.
@@ -845,6 +927,7 @@ Created this implementation document capturing all development work to date.
 - `async_stop_listener()` now uses `asyncio.timeout(5)` to prevent indefinite blocking if the listener task doesn't exit.
 - Registered `coordinator.async_stop_listener` via `entry.async_on_unload()` so the listener is stopped on HA shutdown/reload, not just explicit unload.
 - Added 17 coordinator persistence and lifecycle tests.
+
 ### Phase 10 — Barcode Persistence & Node Table Fix
 
 - **Node table sentinel tolerance** — Fixed parser `_handle_node_table_command` to tolerate trailing bytes on the end-of-table sentinel page (`entries_count=0`). The gateway commonly sends padding/CRC bytes after the zero count, which was previously rejected as "corrupt", preventing the node table from completing and barcodes from being resolved.
@@ -880,6 +963,34 @@ Created this implementation document capturing all development work to date.
 - Made module `string` mandatory in config and options flow (`missing_string` validation).
 - Bumped config entry version to 3 with `v2 → v3` migration defaulting missing strings to `"Default"`.
 - Added aggregate and migration tests to validate sums, IDs, availability, metadata, and migration behavior.
+
+### Phase 14 — Performance Sensors & Peak Power Configuration
+
+- Added `CONF_MODULE_PEAK_POWER` and `DEFAULT_PEAK_POWER` (455 Wp) constants to `const.py`.
+- Extended `ADD_MODULE_SCHEMA` in `config_flow.py` with optional `peak_power` field (`vol.Range(min=1, max=1000)`).
+- Updated `_modules_description` to display peak power per module.
+- Bumped `PyTapConfigFlow.VERSION` and `CONFIG_ENTRY_VERSION` to 4, aligning the previously mismatched versions.
+- Added v3→v4 migration in `async_migrate_entry` to backfill `DEFAULT_PEAK_POWER` on existing modules.
+- Extended `coordinator._handle_power_report` to compute `performance = (power / peak_power) × 100` with defensive parsing and fallback for invalid peak_power values.
+- Added `peak_power` and `performance` to coordinator node data dict and `reload_modules` placeholder.
+- Added `performance` sensor description to all three description tuples (`SENSOR_DESCRIPTIONS`, `STRING_SENSOR_DESCRIPTIONS`, `INSTALLATION_SENSOR_DESCRIPTIONS`).
+- Implemented capacity-weighted aggregate performance in `PyTapAggregateSensor._handle_coordinator_update` (sensor-side).
+- Updated entity count formula: `M × 11 + S × 4 + 4` (was `M × 10 + S × 3 + 3`).
+- Added 3 sensor translation keys (`performance`, `string_performance`, `installation_performance`) and `peak_power` config field to `strings.json` and `translations/en.json`.
+- Added tests: v3→v4 migration (3 tests), config flow peak_power (2 tests), sensor performance (6 tests), coordinator performance (3 tests).
+- Bumped `manifest.json` version to 0.3.0.
+- 99 tests passing, ruff clean.
+
+### Phase 15 — Diagnostics Platform & Readings Counter
+
+- Added `custom_components/pytap/diagnostics.py` with `async_get_config_entry_diagnostics`.
+- Added coordinator `get_diagnostics_data()` snapshot including node mappings, connection state, and per-barcode accumulator summary.
+- Redacted host/IP in diagnostics output while preserving barcodes for troubleshooting.
+- Added per-optimizer `readings_today` as a diagnostic sensor (`SensorStateClass.TOTAL`, unitless).
+- Extended `EnergyAccumulator` with `readings_today`, increment-on-report, and reset-on-new-day behavior.
+- Persisted `readings_today` in coordinator store load/save, including date-rollover reset on restore.
+- Added tests in `tests/test_diagnostics.py` and extended sensor/coordinator/energy tests.
+- Full suite status after feature: 105 tests passing, ruff clean.
 ---
 
 ## Future Work
@@ -887,6 +998,5 @@ Created this implementation document capturing all development work to date.
 Items identified but not yet implemented:
 
 1. **Gateway device registration** — Create a device per gateway for the `via_device` hierarchy.
-2. **Diagnostics platform** — Expose `discovered_barcodes`, parser counters, and connection state as a diagnostics download.
-3. **Binary sensors** — Node connectivity and gateway online status.
-4. **HACS distribution** — Package with `hacs.json` for one-click installation.
+2. **Binary sensors** — Node connectivity and gateway online status.
+3. **HACS distribution** — Package with `hacs.json` for one-click installation.

@@ -56,6 +56,8 @@ pytap/                              # Repository root
 │       ├── config_flow.py          # UI-based configuration
 │       ├── const.py                # Domain, defaults, config keys
 │       ├── coordinator.py          # DataUpdateCoordinator (async bridge)
+│       ├── diagnostics.py          # HA diagnostics platform download
+│       ├── energy.py               # Pure energy accumulation helpers
 │       ├── sensor.py               # Sensor entities (power, voltage, etc.)
 │       ├── manifest.json           # HA integration metadata
 │       ├── strings.json            # UI strings (source)
@@ -76,6 +78,8 @@ pytap/                              # Repository root
 │   ├── conftest.py                 # HA test fixtures
 │   ├── test_config_flow.py         # Config flow tests
 │   ├── test_coordinator_persistence.py  # Coordinator & persistence tests
+│   ├── test_diagnostics.py         # Diagnostics platform tests
+│   ├── test_energy.py              # Energy accumulation unit tests
 │   ├── test_migration.py           # Entity migration tests
 │   └── test_sensor.py              # Sensor platform tests
 ├── requirements.txt                # Pinned HA + dev dependencies
@@ -159,7 +163,7 @@ Implements a multi-step `ConfigFlow` to collect connection parameters and module
 | --- | --- | --- |
 | `user` | `host` (required), `port` (default: 502) | Attempt TCP connection to validate reachability |
 | `modules_menu` | Menu (`add_module` / `finish`) | Ensures explicit module-by-module setup |
-| `add_module` | `string` (required), `name` (required), `barcode` (required) | Non-empty fields, barcode format, duplicate prevention |
+| `add_module` | `string` (required), `name` (required), `barcode` (required), `peak_power` (optional, default: 455 Wp) | Non-empty fields, barcode format, duplicate prevention, peak power range 1–1000 |
 
 **Step 1 — Connection:** The user provides the gateway host and port. Validation opens a short-lived TCP connection using `pytap.api.connect()` (run in the executor). On success, proceeds to step 2. On failure, shows "cannot_connect".
 
@@ -173,9 +177,9 @@ Barcodes are validated against the `X-NNNNNNNC` format and duplicates are reject
 
 ```python
 [
-    {"string": "A", "name": "Panel_01", "barcode": "A-1234567B"},
-    {"string": "A", "name": "Panel_02", "barcode": "C-2345678D"},
-    {"string": "B", "name": "Panel_03", "barcode": "E-3456789F"},
+    {"string": "A", "name": "Panel_01", "barcode": "A-1234567B", "peak_power": 455},
+    {"string": "A", "name": "Panel_02", "barcode": "C-2345678D", "peak_power": 455},
+    {"string": "B", "name": "Panel_03", "barcode": "E-3456789F", "peak_power": 400},
 ]
 ```
 
@@ -189,6 +193,8 @@ Barcodes are validated against the `X-NNNNNNNC` format and duplicates are reject
 DOMAIN = "pytap"
 DEFAULT_PORT = 502           # Tigo TAP default Modbus/TCP port
 DEFAULT_SCAN_INTERVAL = 30   # Coordinator poll fallback (seconds)
+CONF_MODULE_PEAK_POWER = "peak_power"
+DEFAULT_PEAK_POWER = 455     # Wp (watts peak) — STC rating
 ```
 
 ### 4. `coordinator.py` — Data Update Coordinator
@@ -225,7 +231,9 @@ The coordinator is the central bridge between the blocking `pytap` parser and Ho
 │  │        "barcode": "S-1234567A",          │   │
 │  │        "name": "Panel_01",               │   │
 │  │        "string": "A",                    │   │
+│  │        "peak_power": 455,                │   │
 │  │        "power": 343.0,                   │   │
+│  │        "performance": 75.38,             │   │
 │  │        "voltage_in": 38.5,               │   │
 │  │        "voltage_out": 39.2,              │   │
 │  │        "current": 8.75,                  │   │
@@ -298,6 +306,7 @@ All persistent state is consolidated into a single **HA Store** (`<config>/.stor
 - **`barcode_to_node`** — Barcode↔node_id mappings learned from infrastructure events.
 - **`discovered_barcodes`** — Set of unconfigured barcodes seen on the bus.
 - **`parser_state`** — Serialised parser infrastructure state (gateway identities, versions, node tables) via `PersistentState.to_dict()`.
+- **`energy_data`** — Per-barcode accumulator state (`daily_energy_wh`, `daily_reset_date`, `total_energy_wh`, `readings_today`, `last_power_w`, `last_reading_ts`).
 
 Saves are debounced (10s delay) to avoid excessive writes. On shutdown, any pending unsaved changes are flushed immediately.
 
@@ -333,26 +342,28 @@ Creates sensor entities **only** for optimizer modules explicitly listed in the 
 
 #### Entity Model
 
-Each configured Tigo TS4 optimizer module becomes a **device** in the HA device registry, with 10 sensor entities:
+Each configured Tigo TS4 optimizer module becomes a **device** in the HA device registry, with 12 sensor entities:
 
 ```
 Device: "Tigo TS4 Panel_01" (user-defined name from config)
-  ├── Sensor: Power          (W)   — SensorDeviceClass.POWER
-  ├── Sensor: Voltage In     (V)   — SensorDeviceClass.VOLTAGE
-  ├── Sensor: Voltage Out    (V)   — SensorDeviceClass.VOLTAGE
-    ├── Sensor: Current In     (A)   — SensorDeviceClass.CURRENT
-    ├── Sensor: Current Out    (A)   — SensorDeviceClass.CURRENT
-  ├── Sensor: Temperature    (°C)  — SensorDeviceClass.TEMPERATURE
-  ├── Sensor: DC-DC Duty Cycle (%) — SensorStateClass.MEASUREMENT
-    ├── Sensor: RSSI           (dBm) — SensorDeviceClass.SIGNAL_STRENGTH
-    ├── Sensor: Daily Energy   (Wh)  — SensorDeviceClass.ENERGY
-    └── Sensor: Total Energy   (Wh)  — SensorDeviceClass.ENERGY
+  ├── Sensor: Performance      (%)   — SensorStateClass.MEASUREMENT
+  ├── Sensor: Power            (W)   — SensorDeviceClass.POWER
+  ├── Sensor: Voltage In       (V)   — SensorDeviceClass.VOLTAGE
+  ├── Sensor: Voltage Out      (V)   — SensorDeviceClass.VOLTAGE
+  ├── Sensor: Current In       (A)   — SensorDeviceClass.CURRENT
+  ├── Sensor: Current Out      (A)   — SensorDeviceClass.CURRENT
+  ├── Sensor: Temperature      (°C)  — SensorDeviceClass.TEMPERATURE
+  ├── Sensor: DC-DC Duty Cycle (%)   — SensorStateClass.MEASUREMENT
+  ├── Sensor: RSSI             (dBm) — SensorDeviceClass.SIGNAL_STRENGTH
+  ├── Sensor: Daily Energy     (Wh)  — SensorDeviceClass.ENERGY
+  ├── Sensor: Total Energy     (Wh)  — SensorDeviceClass.ENERGY
+  └── Sensor: Readings Today   (—)   — EntityCategory.DIAGNOSTIC, SensorStateClass.TOTAL
 ```
 
 Aggregate virtual devices are also created:
 
-- `Tigo String <name>`: 3 sensors (`power`, `daily_energy`, `total_energy`)
-- `Tigo Installation`: 3 sensors (`power`, `daily_energy`, `total_energy`)
+- `Tigo String <name>`: 4 sensors (`performance`, `power`, `daily_energy`, `total_energy`)
+- `Tigo Installation`: 4 sensors (`performance`, `power`, `daily_energy`, `total_energy`)
 
 #### Device Info
 
@@ -373,7 +384,7 @@ DeviceInfo(
 Unlike auto-discovery integrations, entities are created **deterministically** from the configured module list:
 
 1. At `async_setup_entry`, the sensor platform reads `ConfigEntry.data["modules"]`.
-2. For each configured module, it creates the full set of 10 per-optimizer sensor entities immediately.
+2. For each configured module, it creates the full set of 12 per-optimizer sensor entities immediately.
 3. It also creates aggregate sensors per distinct string and for the whole installation.
 4. Entities start in an **unavailable** state until the first matching `PowerReportEvent` arrives from the bus.
 5. When the coordinator receives a `PowerReportEvent` with a barcode matching a configured module, the corresponding entities become available and display live data.
@@ -442,7 +453,7 @@ Once a sensor receives its first value, it remains available and holds the last 
   "integration_type": "hub",
   "iot_class": "local_push",
   "requirements": [],
-  "version": "0.1.0"
+  "version": "0.3.0"
 }
 ```
 
@@ -578,12 +589,13 @@ The coordinator stores node data as a flat dictionary keyed by `barcode` (not `n
 | --- | --- | --- | --- |
 | `host` | string | (required) | IP address or hostname of the Tigo gateway |
 | `port` | int | 502 | TCP port for the gateway's RS-485 bridge |
-| `modules` | list | (required) | List of optimizer modules as `STRING:NAME:BARCODE` triplets |
+| `modules` | list | (required) | List of optimizer modules as `STRING:NAME:BARCODE:PEAK_POWER` dicts |
 
-**Module format:** Each module is a triplet `STRING:NAME:BARCODE` where:
-- `STRING` — Optional group name (e.g., `A`, `East`). Omit if not grouping.
+**Module format:** Each module is a dict with fields:
+- `STRING` — Required group name (e.g., `A`, `East`).
 - `NAME` — Required user-friendly label.
-- `BARCODE` — Optional Tigo barcode (e.g., `S-1234567A`). If omitted, matched by discovery order.
+- `BARCODE` — Required Tigo barcode (e.g., `S-1234567A`).
+- `PEAK_POWER` — Optional peak panel power in Wp (default: 455).
 
 Example: `A:Panel_01:S-1234567A, A:Panel_02:S-1234568B, B:Panel_03:S-2345678C`
 
@@ -630,10 +642,10 @@ Changes trigger a full integration reload. Previously-discovered barcode mapping
 
 | Test File | Scope |
 | --- | --- |
-| `test_config_flow.py` | Config flow form rendering, validation, error handling (13 tests) |
-| `test_coordinator_persistence.py` | Event processing, persistence, barcode mapping lifecycle (19 tests) |
-| `test_migration.py` | Config entry migration and legacy entity cleanup (5 tests) |
-| `test_sensor.py` | Entity creation, state updates, availability (7 tests) |
+| `test_config_flow.py` | Config flow form rendering, validation, error handling (16 tests) |
+| `test_coordinator_persistence.py` | Event processing, persistence, barcode mapping lifecycle (32 tests) |
+| `test_migration.py` | Config entry migration and legacy entity cleanup (11 tests) |
+| `test_sensor.py` | Entity creation, state updates, availability (30 tests) |
 
 ### Parser Tests (`custom_components/pytap/pytap/tests/`)
 

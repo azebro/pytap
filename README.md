@@ -13,10 +13,12 @@ Please note that this integration requires RS485 to TCP converter that needs to 
 ## Features
 
 - **Real-time streaming** — Push-based data delivery with sub-second latency (no polling).
-- **Per-optimizer sensors** — 10 sensor entities per Tigo TS4 module: power,
-  voltage in/out, current in/out, temperature, DC-DC duty cycle, RSSI,
-  daily energy, and total energy.
-- **Aggregate sensors** — 3 sensors per string and 3 for the full installation: power, daily energy, total energy.
+- **Per-optimizer sensors** — 12 sensor entities per Tigo TS4 module: performance,
+  power, voltage in/out, current in/out, temperature, DC-DC duty cycle, RSSI,
+  daily energy, total energy, and readings today.
+- **Aggregate sensors** — 4 sensors per string and 4 for the full installation: performance, power, daily energy, total energy.
+- **Performance tracking** — Per-optimizer, per-string, and installation-wide performance percentage based on configurable peak panel power (Wp).
+- **Diagnostics download** — Integration diagnostics export includes parser counters, infrastructure/mapping state, and per-node summaries.
 - **Menu-driven setup** — Add optimizer modules one at a time with guided form fields.
 - **Barcode-based identification** — Stable hardware barcodes as entity identifiers (survives gateway restarts).
 - **Discovery logging** — Unconfigured barcodes seen on the bus are logged for easy identification.
@@ -33,6 +35,7 @@ Each configured Tigo TS4 optimizer exposes the following sensors:
 
 | Sensor | Unit | Device Class |
 | --- | --- | --- |
+| Performance | % | — |
 | Power | W | `power` |
 | Voltage In | V | `voltage` |
 | Voltage Out | V | `voltage` |
@@ -43,11 +46,12 @@ Each configured Tigo TS4 optimizer exposes the following sensors:
 | RSSI | dBm | `signal_strength` |
 | Daily Energy | Wh | `energy` |
 | Total Energy | Wh | `energy` |
+| Readings Today | — | — |
 
 PyTap also creates aggregate virtual devices:
 
-- **Tigo String <name>** — `power`, `daily_energy`, `total_energy`
-- **Tigo Installation** — `power`, `daily_energy`, `total_energy`
+- **Tigo String <name>** — `performance`, `power`, `daily_energy`, `total_energy`
+- **Tigo Installation** — `performance`, `power`, `daily_energy`, `total_energy`
 
 ---
 
@@ -87,6 +91,7 @@ After entering connection details, you'll see a modules menu:
     - **String group** — Required label to group optimizers by string (e.g., `A`, `East`).
    - **Name** — A friendly name for the optimizer (e.g., `Roof_Panel_01`).
    - **Barcode** — The Tigo optimizer barcode printed on the module (e.g., `A-1234567B`).
+   - **Peak power (Wp)** — The panel's peak power rating in watts (default: 455 Wp). Used to calculate performance percentage.
 3. Repeat for each optimizer you want to monitor.
 4. Click **"Finish setup"** when done.
 
@@ -109,6 +114,17 @@ Go to **Settings → Devices & Services → PyTap → Configure** to:
 - **Add** new optimizer modules (if the barcode was previously seen on the bus, it resolves instantly).
 - **Remove** modules you no longer want to track.
 - **Save and close** to apply changes.
+
+### Diagnostics Download
+
+PyTap diagnostics are available from the integration page:
+
+1. Go to **Settings → Devices & Services → Integrations**.
+2. Open **PyTap**.
+3. Use the menu (⋮) and select **Download diagnostics**.
+
+The diagnostics JSON includes parser counters, infrastructure and node mappings,
+discovered barcodes, connection state, and per-node summaries. Host/IP is redacted.
 
 ---
 
@@ -149,7 +165,7 @@ pytap/
 │   ├── config_flow.py           # Config & options flows
 │   ├── const.py                 # Constants
 │   ├── coordinator.py           # Push-based data coordinator
-│   ├── sensor.py                # Sensor platform (10 entity types)
+│   ├── sensor.py                # Sensor platform (12 entity types)
 │   ├── manifest.json            # Integration metadata
 │   ├── strings.json             # UI strings
 │   ├── translations/en.json     # English translations

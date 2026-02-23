@@ -30,8 +30,10 @@ from homeassistant.exceptions import HomeAssistantError
 from .const import (
     CONF_MODULE_BARCODE,
     CONF_MODULE_NAME,
+    CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
     CONF_MODULES,
+    DEFAULT_PEAK_POWER,
     DEFAULT_PORT,
     DOMAIN,
 )
@@ -53,6 +55,9 @@ ADD_MODULE_SCHEMA = vol.Schema(
         vol.Required(CONF_MODULE_STRING): str,
         vol.Required(CONF_MODULE_NAME): str,
         vol.Required(CONF_MODULE_BARCODE): str,
+        vol.Optional(CONF_MODULE_PEAK_POWER, default=DEFAULT_PEAK_POWER): vol.All(
+            vol.Coerce(int), vol.Range(min=1, max=1000)
+        ),
     }
 )
 
@@ -86,7 +91,7 @@ async def validate_connection(
     return {"title": f"PyTap ({host})"}
 
 
-def _modules_description(modules: list[dict[str, str]]) -> str:
+def _modules_description(modules: list[dict[str, Any]]) -> str:
     """Build a human-readable summary of currently added modules."""
     if not modules:
         return "No modules added yet."
@@ -97,14 +102,15 @@ def _modules_description(modules: list[dict[str, str]]) -> str:
             parts.append(f"string={m[CONF_MODULE_STRING]}")
         parts.append(m[CONF_MODULE_NAME])
         parts.append(m.get(CONF_MODULE_BARCODE, ""))
-        lines.append(f"  {i}. {' / '.join(parts)}")
+        peak_power = m.get(CONF_MODULE_PEAK_POWER, DEFAULT_PEAK_POWER)
+        lines.append(f"  {i}. {' / '.join(parts)} ({peak_power}Wp)")
     return f"**Modules ({len(modules)}):**\n" + "\n".join(lines)
 
 
 class PyTapConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for PyTap."""
 
-    VERSION = 2
+    VERSION = 4
 
     def __init__(self) -> None:
         """Initialize the config flow."""
@@ -194,6 +200,9 @@ class PyTapConfigFlow(ConfigFlow, domain=DOMAIN):
                         CONF_MODULE_STRING: string_group,
                         CONF_MODULE_NAME: name,
                         CONF_MODULE_BARCODE: barcode,
+                        CONF_MODULE_PEAK_POWER: user_input.get(
+                            CONF_MODULE_PEAK_POWER, DEFAULT_PEAK_POWER
+                        ),
                     }
                 )
                 return await self.async_step_modules_menu()
@@ -334,6 +343,9 @@ class PyTapOptionsFlow(OptionsFlow):
                         CONF_MODULE_STRING: string_group,
                         CONF_MODULE_NAME: name,
                         CONF_MODULE_BARCODE: barcode,
+                        CONF_MODULE_PEAK_POWER: user_input.get(
+                            CONF_MODULE_PEAK_POWER, DEFAULT_PEAK_POWER
+                        ),
                     }
                 )
                 return await self.async_step_init()

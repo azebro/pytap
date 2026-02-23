@@ -21,6 +21,7 @@ class EnergyAccumulator:
     daily_reset_date: str = ""
     last_power_w: float = 0.0
     last_reading_ts: datetime | None = None
+    readings_today: int = 0
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,7 @@ def accumulate_energy(
 
     if acc.daily_reset_date != today:
         acc.daily_energy_wh = 0.0
+        acc.readings_today = 0
         acc.daily_reset_date = today
 
     increment_wh = 0.0
@@ -70,6 +72,7 @@ def accumulate_energy(
 
     acc.last_power_w = power_w
     acc.last_reading_ts = now
+    acc.readings_today += 1
 
     return EnergyUpdateResult(
         increment_wh=increment_wh,
