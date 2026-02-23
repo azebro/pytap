@@ -1,20 +1,21 @@
 """Tests for protocol types."""
 
 import struct
+
 import pytest
+
 from pytap.core.types import (
-    GatewayID,
     Address,
     FrameType,
-    NodeID,
+    GatewayID,
     LongAddress,
-    SlotCounter,
-    ReceivedPacketHeader,
-    U12Pair,
+    NodeID,
     PowerReport,
+    ReceivedPacketHeader,
+    SlotCounter,
+    U12Pair,
     iter_received_packets,
 )
-
 
 # ---- GatewayID ----
 

@@ -4,7 +4,6 @@ Sources have no protocol knowledge — they just provide raw bytes.
 """
 
 import socket
-from typing import Optional
 
 
 class TcpSource:
@@ -13,7 +12,7 @@ class TcpSource:
     def __init__(self, host: str, port: int = 502):
         self._host = host
         self._port = port
-        self._socket: Optional[socket.socket] = None
+        self._socket: socket.socket | None = None
 
     def connect(self):
         """Open a TCP connection to the host."""
@@ -43,7 +42,7 @@ class TcpSource:
                 # Peer closed connection
                 raise ConnectionResetError("Connection closed by peer")
             return data
-        except socket.timeout:
+        except TimeoutError:
             return b""
 
     def close(self):

@@ -3,9 +3,8 @@
 All events are dataclass instances with a to_dict() method for JSON serialization.
 """
 
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
-from typing import Optional
 
 
 @dataclass
@@ -28,7 +27,7 @@ class PowerReportEvent(Event):
 
     gateway_id: int
     node_id: int
-    barcode: Optional[str]
+    barcode: str | None
     voltage_in: float
     voltage_out: float
     current_in: float
@@ -43,7 +42,7 @@ class PowerReportEvent(Event):
         *,
         gateway_id: int,
         node_id: int,
-        barcode: Optional[str],
+        barcode: str | None,
         voltage_in: float,
         voltage_out: float,
         current_in: float,
