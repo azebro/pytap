@@ -52,6 +52,26 @@ STORE_VERSION = 2
 SAVE_DELAY_SECONDS = 10
 
 
+class _MigratingStore(Store):
+    """Store subclass with explicit migration support.
+
+    The default Store raises NotImplementedError on major-version
+    mismatches, which silently drops all persisted state.  This subclass
+    returns old data as-is because all format changes between v1 and v2
+    are backward-compatible (the ``energy_data`` key was added and the
+    load code already handles its absence via ``.get()``).
+    """
+
+    async def _async_migrate_func(
+        self,
+        old_major_version: int,
+        old_minor_version: int,
+        old_data: dict,
+    ) -> dict:
+        """Migrate v1 → v2: return data as-is (format is backward-compatible)."""
+        return old_data
+
+
 class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Manage streaming data from the Tigo gateway via pytap parser.
 
@@ -113,7 +133,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._source_lock = threading.Lock()
 
         # --- Persistence (single HA Store for all state) ---
-        self._store: Store = Store(
+        self._store = _MigratingStore(
             hass, STORE_VERSION, f"pytap_{entry.entry_id}_coordinator"
         )
         self._unsaved_changes: bool = False
@@ -693,6 +713,42 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 last_reading_ts=last_reading_ts,
                 readings_today=readings_today,
             )
+
+        # Pre-populate coordinator.data["nodes"] for configured barcodes
+        # that have persisted energy state.  This makes energy values
+        # available to sensors immediately on startup instead of waiting
+        # for the first live power report (which would otherwise cause a
+        # visible drop while RestoreSensor is the only fallback).
+        for barcode in self._configured_barcodes:
+            acc = self._energy_state.get(barcode)
+            if acc is None:
+                continue
+            module_meta = self._module_lookup.get(barcode, {})
+            node_id = self._barcode_to_node.get(barcode)
+            self.data["nodes"][barcode] = {
+                "gateway_id": None,
+                "node_id": node_id,
+                "barcode": barcode,
+                "name": module_meta.get(CONF_MODULE_NAME, barcode),
+                "string": module_meta.get(CONF_MODULE_STRING, ""),
+                "peak_power": module_meta.get(
+                    CONF_MODULE_PEAK_POWER, DEFAULT_PEAK_POWER
+                ),
+                "voltage_in": None,
+                "voltage_out": None,
+                "current_in": None,
+                "current_out": None,
+                "power": None,
+                "performance": None,
+                "temperature": None,
+                "dc_dc_duty_cycle": None,
+                "rssi": None,
+                "daily_energy_wh": round(acc.daily_energy_wh, 2),
+                "total_energy_wh": round(acc.total_energy_wh, 2),
+                "readings_today": acc.readings_today,
+                "daily_reset_date": acc.daily_reset_date,
+                "last_update": None,
+            }
 
         _LOGGER.info(
             "Restored coordinator state: %d barcode mappings, %d discovered barcodes, "
