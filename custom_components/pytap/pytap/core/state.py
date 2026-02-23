@@ -6,15 +6,13 @@ node table pages), and PersistentState (in-memory infrastructure state).
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional
 
 from .types import (
-    SlotCounter,
+    SLOTS_PER_EPOCH,
     LongAddress,
     NodeAddress,
-    SLOTS_PER_EPOCH,
+    SlotCounter,
 )
-
 
 # ---------------------------------------------------------------------------
 #  SlotClock
@@ -33,7 +31,7 @@ class SlotClock:
     NUM_INDICES = 48  # 4 epochs x 12 indices each
 
     def __init__(self, slot_counter: SlotCounter, time: datetime):
-        self._times: list[Optional[datetime]] = [None] * self.NUM_INDICES
+        self._times: list[datetime | None] = [None] * self.NUM_INDICES
         self._last_index: int = -1
         self._last_time: datetime = time
         self._initialize(slot_counter, time)
@@ -104,7 +102,7 @@ class NodeTableBuilder:
         self,
         start_address: NodeAddress,
         entries: list[tuple[NodeAddress, LongAddress]],
-    ) -> Optional[dict[int, LongAddress]]:
+    ) -> dict[int, LongAddress] | None:
         """Add a page. Returns the complete table when an empty page arrives."""
         if len(entries) == 0:
             result = dict(self._entries)

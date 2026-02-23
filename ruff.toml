@@ -1,0 +1,19 @@
+line-length = 110
+
+[lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+]
+ignore = []
+
+[format]
+quote-style = "double"
+indent-style = "space"
+
+[lint.isort]
+force-sort-within-sections = true
+known-first-party = ["custom_components.pytap"]

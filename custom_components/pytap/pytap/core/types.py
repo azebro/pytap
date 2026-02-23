@@ -7,11 +7,11 @@ All protocol types are defined in this single module:
 - Infrastructure: GatewayInfo, NodeInfo
 """
 
-import struct
+from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import ClassVar, Iterator
-
+import struct
+from typing import ClassVar
 
 # ---------------------------------------------------------------------------
 #  Constants

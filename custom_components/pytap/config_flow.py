@@ -12,10 +12,8 @@ from __future__ import annotations
 
 import logging
 import re
-import uuid
 from typing import Any
-
-import voluptuous as vol
+import uuid
 
 from homeassistant.config_entries import (
     ConfigEntry,
@@ -26,6 +24,7 @@ from homeassistant.config_entries import (
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
+import voluptuous as vol
 
 from .const import (
     CONF_MODULE_BARCODE,

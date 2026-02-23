@@ -8,10 +8,10 @@ and filters events by user-configured barcodes.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import logging
 import threading
 import time
-from datetime import datetime
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry

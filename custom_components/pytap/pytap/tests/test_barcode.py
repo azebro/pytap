@@ -1,8 +1,8 @@
 """Tests for the barcode encoding/decoding module."""
 
 import pytest
-from pytap.core.barcode import encode_barcode, decode_barcode, barcode_from_address
 
+from pytap.core.barcode import barcode_from_address, decode_barcode, encode_barcode
 
 # Known address from ENUMERATION_SEQUENCE
 KNOWN_ADDRESS = bytes([0x04, 0xC0, 0x5B, 0x30, 0x00, 0x02, 0xBE, 0x16])

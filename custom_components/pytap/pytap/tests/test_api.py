@@ -1,8 +1,9 @@
 """Tests for the public API module."""
 
 import pytest
-from pytap.core.parser import Parser
+
 import pytap
+from pytap.core.parser import Parser
 
 
 def test_create_parser():

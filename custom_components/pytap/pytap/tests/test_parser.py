@@ -1,8 +1,7 @@
 """Tests for the core protocol parser."""
 
-from pytap.core.parser import Parser
 from pytap.core.crc import crc
-
+from pytap.core.parser import Parser
 
 # -----------------------------------------------------------------------
 #  ENUMERATION_SEQUENCE test data (from Appendix B of implementation plan)
