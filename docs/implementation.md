@@ -45,6 +45,7 @@ PyTap is a Home Assistant custom component that passively monitors Tigo TAP sola
 | Entity creation | Deterministic from user-configured barcode list (no auto-discovery) |
 | Config flow | Menu-driven: add modules one at a time via individual form fields |
 | Threading model | Blocking parser in executor thread, bridged to async event loop |
+| Restart behavior | Coordinator restores last node snapshots + energy state; sensors use restore fallback to remain available when historical data exists |
 | External dependencies | None — parser library embedded, stdlib only |
 | Sensor types | 12 per optimizer + aggregate sensors per string and per installation (performance, power, daily energy, total energy) |
 | Test coverage | Expanded integration + parser coverage, including aggregate sensor, performance, and v3→v4 migration behavior |
@@ -222,6 +223,13 @@ Four custom `HomeAssistantError` subclasses: `CannotConnect`, `InvalidAuth`, `In
 #### Class: `PyTapDataUpdateCoordinator`
 
 Inherits from `DataUpdateCoordinator[dict[str, Any]]`. Despite using the coordinator pattern, this is a **push-based** integration — `_async_update_data()` simply returns the current data dict without polling.
+
+Persistence now includes both `energy_data` and `node_snapshots`:
+
+- `energy_data` preserves accumulator continuity for `daily_energy`, `total_energy`, and `readings_today`.
+- `node_snapshots` preserves the latest known measurement payload (power/voltage/current/temperature/duty/rssi/performance and `last_update`) for configured barcodes.
+
+At startup, the coordinator restores snapshot data first and overlays normalized energy accumulator values, so entities can publish their last known readings immediately while waiting for new live frames.
 
 #### Initialization
 

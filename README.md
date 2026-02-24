@@ -27,6 +27,9 @@ Please note that this integration requires RS485 to TCP converter that needs to 
 - **Persistent barcode mapping** — Discovered barcodes and node mappings are
     saved across restarts. When you add a previously-discovered barcode,
     it resolves instantly without waiting for the next gateway enumeration.
+- **Restart-safe availability** — Last known node readings are persisted and
+    restored on startup, so sensors stay available with the most recent value
+    even before the first live frame arrives (for example after a night restart).
 - **Energy accumulation** — Trapezoidal Wh integration with daily reset semantics and monotonic lifetime totals.
 - **No external dependencies** — The protocol parser library is fully embedded; nothing to install from PyPI.
 - **Options flow** — Add or remove optimizer modules at any time without reconfiguring.
@@ -155,6 +158,8 @@ PyTap Coordinator
 ```
 
 PyTap uses a background listener thread that streams data from the gateway, parses protocol frames, and dispatches events to the Home Assistant event loop. Only events matching your configured barcodes create or update sensor entities.
+
+On startup, PyTap restores persisted coordinator state (barcode mappings, energy accumulators, and last node snapshots). Sensor entities also use Home Assistant restore fallback if needed, so a restart during low/no production does not force entities into unavailable when prior data exists.
 
 ---
 

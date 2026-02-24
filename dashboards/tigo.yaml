@@ -1,0 +1,48 @@
+template:
+  - sensor:
+      # ══════════════════════════════════════════════════════
+      # 1. Max Energy Sensor (For Page 1)
+      # ══════════════════════════════════════════════════════
+      - name: "Tigo Max Daily Energy"
+        unique_id: tigo_max_daily_energy
+        unit_of_measurement: "kWh"
+        icon: mdi:solar-panel-large
+        state: >
+          {% set energy = [
+            states('sensor.tigo_ts4_c1_daily_energy'), states('sensor.tigo_ts4_c2_daily_energy'),
+            states('sensor.tigo_ts4_c3_daily_energy'), states('sensor.tigo_ts4_c4_daily_energy'),
+            states('sensor.tigo_ts4_c5_daily_energy'), states('sensor.tigo_ts4_c6_daily_energy'),
+            states('sensor.tigo_ts4_c7_daily_energy'), states('sensor.tigo_ts4_c8_daily_energy'),
+            states('sensor.tigo_ts4_c9_daily_energy'), states('sensor.tigo_ts4_c10_daily_energy'),
+            states('sensor.tigo_ts4_c11_daily_energy'), states('sensor.tigo_ts4_c12_daily_energy'),
+            states('sensor.tigo_ts4_c13_daily_energy'), states('sensor.tigo_ts4_d1_daily_energy'),
+            states('sensor.tigo_ts4_d2_daily_energy'), states('sensor.tigo_ts4_d3_daily_energy'),
+            states('sensor.tigo_ts4_d4_daily_energy'), states('sensor.tigo_ts4_d5_daily_energy'),
+            states('sensor.tigo_ts4_d6_daily_energy'), states('sensor.tigo_ts4_d7_daily_energy'),
+            states('sensor.tigo_ts4_d8_daily_energy'), states('sensor.tigo_ts4_d9_daily_energy'),
+            states('sensor.tigo_ts4_d10_daily_energy'), states('sensor.tigo_ts4_d11_daily_energy')
+          ] %}
+          {{ energy | map('float', 0) | max }}
+
+      # ══════════════════════════════════════════════════════
+      # 2. Max Readings Sensor (For Page 2)
+      # ══════════════════════════════════════════════════════
+      - name: "Tigo Max Readings Today"
+        unique_id: tigo_max_readings_today
+        icon: mdi:check-network
+        state: >
+          {% set readings = [
+            states('sensor.tigo_ts4_c1_readings_today'), states('sensor.tigo_ts4_c2_readings_today'),
+            states('sensor.tigo_ts4_c3_readings_today'), states('sensor.tigo_ts4_c4_readings_today'),
+            states('sensor.tigo_ts4_c5_readings_today'), states('sensor.tigo_ts4_c6_readings_today'),
+            states('sensor.tigo_ts4_c7_readings_today'), states('sensor.tigo_ts4_c8_readings_today'),
+            states('sensor.tigo_ts4_c9_readings_today'), states('sensor.tigo_ts4_c10_readings_today'),
+            states('sensor.tigo_ts4_c11_readings_today'), states('sensor.tigo_ts4_c12_readings_today'),
+            states('sensor.tigo_ts4_c13_readings_today'), states('sensor.tigo_ts4_d1_readings_today'),
+            states('sensor.tigo_ts4_d2_readings_today'), states('sensor.tigo_ts4_d3_readings_today'),
+            states('sensor.tigo_ts4_d4_readings_today'), states('sensor.tigo_ts4_d5_readings_today'),
+            states('sensor.tigo_ts4_d6_readings_today'), states('sensor.tigo_ts4_d7_readings_today'),
+            states('sensor.tigo_ts4_d8_readings_today'), states('sensor.tigo_ts4_d9_readings_today'),
+            states('sensor.tigo_ts4_d10_readings_today'), states('sensor.tigo_ts4_d11_readings_today')
+          ] %}
+          {{ readings | map('float', 0) | max }}

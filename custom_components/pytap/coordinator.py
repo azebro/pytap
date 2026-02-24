@@ -654,6 +654,75 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     #  Persistence helpers
     # -------------------------------------------------------------------
 
+    def _build_node_payload(
+        self,
+        barcode: str,
+        module_meta: dict[str, Any],
+        node_id: int | None,
+    ) -> dict[str, Any]:
+        """Build a baseline node payload for restored/startup state."""
+        return {
+            "gateway_id": None,
+            "node_id": node_id,
+            "barcode": barcode,
+            "name": module_meta.get(CONF_MODULE_NAME, barcode),
+            "string": module_meta.get(CONF_MODULE_STRING, ""),
+            "peak_power": module_meta.get(CONF_MODULE_PEAK_POWER, DEFAULT_PEAK_POWER),
+            "voltage_in": None,
+            "voltage_out": None,
+            "current_in": None,
+            "current_out": None,
+            "power": None,
+            "performance": None,
+            "temperature": None,
+            "dc_dc_duty_cycle": None,
+            "rssi": None,
+            "daily_energy_wh": 0.0,
+            "total_energy_wh": 0.0,
+            "readings_today": 0,
+            "daily_reset_date": "",
+            "last_update": None,
+        }
+
+    def _merge_snapshot_into_node(
+        self,
+        node_payload: dict[str, Any],
+        snapshot: dict[str, Any],
+    ) -> None:
+        """Merge persisted node snapshot fields into a baseline node payload."""
+        for key in (
+            "gateway_id",
+            "node_id",
+            "voltage_in",
+            "voltage_out",
+            "current_in",
+            "current_out",
+            "power",
+            "performance",
+            "temperature",
+            "dc_dc_duty_cycle",
+            "rssi",
+            "daily_energy_wh",
+            "total_energy_wh",
+            "readings_today",
+            "daily_reset_date",
+            "last_update",
+            "topology",
+        ):
+            if key in snapshot:
+                node_payload[key] = snapshot[key]
+
+    def _merge_energy_into_node(
+        self,
+        node_payload: dict[str, Any],
+        acc: EnergyAccumulator,
+    ) -> None:
+        """Merge persisted accumulator values into a node payload."""
+        node_payload["daily_energy_wh"] = round(acc.daily_energy_wh, 2)
+        node_payload["total_energy_wh"] = round(acc.total_energy_wh, 2)
+        node_payload["readings_today"] = acc.readings_today
+        node_payload["daily_reset_date"] = acc.daily_reset_date
+
     async def _async_load_coordinator_state(self) -> None:
         """Load all persisted state (barcode mappings, discovered barcodes, parser state) from HA Store."""
         try:
@@ -714,49 +783,35 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 readings_today=readings_today,
             )
 
-        # Pre-populate coordinator.data["nodes"] for configured barcodes
-        # that have persisted energy state.  This makes energy values
-        # available to sensors immediately on startup instead of waiting
-        # for the first live power report (which would otherwise cause a
-        # visible drop while RestoreSensor is the only fallback).
+        # Restore last known node snapshots for configured barcodes, and
+        # merge energy accumulator values where available.
+        node_snapshots = stored.get("node_snapshots", {})
         for barcode in self._configured_barcodes:
+            snapshot = node_snapshots.get(barcode)
             acc = self._energy_state.get(barcode)
-            if acc is None:
+            if not isinstance(snapshot, dict) and acc is None:
                 continue
+
             module_meta = self._module_lookup.get(barcode, {})
             node_id = self._barcode_to_node.get(barcode)
-            self.data["nodes"][barcode] = {
-                "gateway_id": None,
-                "node_id": node_id,
-                "barcode": barcode,
-                "name": module_meta.get(CONF_MODULE_NAME, barcode),
-                "string": module_meta.get(CONF_MODULE_STRING, ""),
-                "peak_power": module_meta.get(
-                    CONF_MODULE_PEAK_POWER, DEFAULT_PEAK_POWER
-                ),
-                "voltage_in": None,
-                "voltage_out": None,
-                "current_in": None,
-                "current_out": None,
-                "power": None,
-                "performance": None,
-                "temperature": None,
-                "dc_dc_duty_cycle": None,
-                "rssi": None,
-                "daily_energy_wh": round(acc.daily_energy_wh, 2),
-                "total_energy_wh": round(acc.total_energy_wh, 2),
-                "readings_today": acc.readings_today,
-                "daily_reset_date": acc.daily_reset_date,
-                "last_update": None,
-            }
+            node_payload = self._build_node_payload(barcode, module_meta, node_id)
+
+            if isinstance(snapshot, dict):
+                self._merge_snapshot_into_node(node_payload, snapshot)
+
+            if acc is not None:
+                self._merge_energy_into_node(node_payload, acc)
+
+            self.data["nodes"][barcode] = node_payload
 
         _LOGGER.info(
             "Restored coordinator state: %d barcode mappings, %d discovered barcodes, "
-            "%d gateway identities, %d energy states",
+            "%d gateway identities, %d energy states, %d node snapshots",
             len(barcode_to_node),
             len(discovered),
             len(self._persistent_state.gateway_identities),
             len(self._energy_state),
+            len(node_snapshots),
         )
 
     async def _async_save_coordinator_state(self) -> None:
@@ -782,6 +837,34 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     ),
                 }
                 for barcode, acc in self._energy_state.items()
+            },
+            "node_snapshots": {
+                barcode: {
+                    key: value
+                    for key, value in node.items()
+                    if key
+                    in {
+                        "gateway_id",
+                        "node_id",
+                        "voltage_in",
+                        "voltage_out",
+                        "current_in",
+                        "current_out",
+                        "power",
+                        "performance",
+                        "temperature",
+                        "dc_dc_duty_cycle",
+                        "rssi",
+                        "daily_energy_wh",
+                        "total_energy_wh",
+                        "readings_today",
+                        "daily_reset_date",
+                        "last_update",
+                        "topology",
+                    }
+                }
+                for barcode, node in self.data["nodes"].items()
+                if barcode in self._configured_barcodes and isinstance(node, dict)
             },
         }
         try:

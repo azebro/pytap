@@ -22,6 +22,8 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
     EntityCategory,
     UnitOfElectricCurrent,
     UnitOfElectricPotential,
@@ -47,6 +49,22 @@ from .const import (
 from .coordinator import PyTapDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _coerce_restored_state_value(raw_state: str, sensor_key: str) -> int | float | None:
+    """Convert a restored state string to a native numeric sensor value."""
+    if raw_state in (STATE_UNKNOWN, STATE_UNAVAILABLE, "None", "none", ""):
+        return None
+
+    try:
+        numeric_value = float(raw_state)
+    except (TypeError, ValueError):
+        return None
+
+    if sensor_key == "readings_today":
+        return int(numeric_value)
+
+    return numeric_value
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -361,12 +379,26 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
         """Restore last known native value from Home Assistant state cache."""
         await super().async_added_to_hass()
         if self.coordinator.data.get("nodes", {}).get(self._barcode) is not None:
+            self._handle_coordinator_update()
             return
 
         if restored := await self.async_get_last_sensor_data():
             if restored.native_value is not None:
                 self._attr_native_value = restored.native_value
                 self._restored_native_value = True
+                return
+
+        restored_state = await self.async_get_last_state()
+        if restored_state is None:
+            return
+
+        native_value = _coerce_restored_state_value(
+            restored_state.state,
+            self.entity_description.key,
+        )
+        if native_value is not None:
+            self._attr_native_value = native_value
+            self._restored_native_value = True
 
     @property
     def available(self) -> bool:
@@ -465,12 +497,26 @@ class PyTapAggregateSensor(
 
         nodes = self.coordinator.data.get("nodes", {})
         if any(nodes.get(barcode) is not None for barcode in self._barcodes):
+            self._handle_coordinator_update()
             return
 
         if restored := await self.async_get_last_sensor_data():
             if restored.native_value is not None:
                 self._attr_native_value = restored.native_value
                 self._restored_native_value = True
+                return
+
+        restored_state = await self.async_get_last_state()
+        if restored_state is None:
+            return
+
+        native_value = _coerce_restored_state_value(
+            restored_state.state,
+            self.entity_description.key,
+        )
+        if native_value is not None:
+            self._attr_native_value = native_value
+            self._restored_native_value = True
 
     @property
     def available(self) -> bool:

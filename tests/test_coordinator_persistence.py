@@ -274,6 +274,42 @@ class TestLoadCoordinatorState:
         assert coordinator._discovered_barcodes == {"X-9999999Z"}
         assert coordinator._energy_state == {}
 
+    async def test_load_restores_node_snapshot_without_energy(
+        self, hass: HomeAssistant
+    ) -> None:
+        """Node snapshot should restore live fields even without energy_data."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+
+        stored_data = {
+            "barcode_to_node": {"A-1234567B": 10},
+            "discovered_barcodes": [],
+            "node_snapshots": {
+                "A-1234567B": {
+                    "gateway_id": 1,
+                    "node_id": 10,
+                    "voltage_in": 35.2,
+                    "voltage_out": 34.8,
+                    "current_in": 8.5,
+                    "current_out": 8.4,
+                    "power": 299.2,
+                    "performance": 65.76,
+                    "temperature": 42.0,
+                    "dc_dc_duty_cycle": 0.95,
+                    "rssi": -65,
+                    "last_update": "2026-02-24T20:00:00",
+                }
+            },
+        }
+        coordinator._store.async_load = AsyncMock(return_value=stored_data)
+
+        await coordinator._async_load_coordinator_state()
+
+        node = coordinator.data["nodes"]["A-1234567B"]
+        assert node["power"] == 299.2
+        assert node["voltage_in"] == 35.2
+        assert node["last_update"] == "2026-02-24T20:00:00"
+
 
 class TestSaveCoordinatorState:
     """Test _async_save_coordinator_state persists data."""
@@ -296,6 +332,28 @@ class TestSaveCoordinatorState:
                 last_reading_ts=datetime.now(),
             )
         }
+        coordinator.data["nodes"]["A-1234567B"] = {
+            "gateway_id": 1,
+            "node_id": 10,
+            "barcode": "A-1234567B",
+            "name": "Panel_01",
+            "string": "A",
+            "peak_power": 455,
+            "voltage_in": 35.2,
+            "voltage_out": 34.8,
+            "current_in": 8.5,
+            "current_out": 8.4,
+            "power": 299.2,
+            "performance": 65.76,
+            "temperature": 42.0,
+            "dc_dc_duty_cycle": 0.95,
+            "rssi": -65,
+            "daily_energy_wh": 1.25,
+            "total_energy_wh": 100.75,
+            "readings_today": 9,
+            "daily_reset_date": datetime.now().date().isoformat(),
+            "last_update": "2026-02-24T20:00:00",
+        }
         coordinator._unsaved_changes = True
 
         coordinator._store.async_save = AsyncMock()
@@ -308,7 +366,10 @@ class TestSaveCoordinatorState:
         assert saved["discovered_barcodes"] == ["X-9999999Z"]
         assert "parser_state" in saved
         assert "energy_data" in saved
+        assert "node_snapshots" in saved
         assert "A-1234567B" in saved["energy_data"]
+        assert "A-1234567B" in saved["node_snapshots"]
+        assert saved["node_snapshots"]["A-1234567B"]["power"] == 299.2
         assert saved["energy_data"]["A-1234567B"]["readings_today"] == 9
         assert coordinator._unsaved_changes is False
 
