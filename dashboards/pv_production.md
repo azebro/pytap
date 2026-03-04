@@ -20,8 +20,8 @@ Home Assistant Lovelace dashboard displaying the physical solar panel layout wit
 
 | Sensor | Entity ID | Purpose |
 |--------|-----------|---------|
-| Tigo Max Daily Energy | `sensor.tigo_max_daily_energy` | Highest `_daily_energy` across all 24 panels (kWh) |
-| Tigo Max Readings Today | `sensor.tigo_max_readings_today` | Highest `_readings_today` across all 24 panels |
+| Tigo Max Daily Energy | `sensor.tigo_max_daily_energy` | Highest `_daily_energy` across all 26 panels (kWh) |
+| Tigo Max Readings Today | `sensor.tigo_max_readings_today` | Highest `_readings_today` across all 26 panels |
 
 These are computed server-side with Jinja2 templates so each button-card only needs a single `states[]` lookup instead of scanning all 24 sensors in JavaScript.
 
@@ -47,14 +47,14 @@ Both views mirror the actual roof panel arrangement using a 26-column CSS grid. 
 - **Portrait (2:3)** — all other panels
 
 ```
-               col 11        col 14
-                 ┌──────────┐ ┌──────────┐
-     Row 1       │  C2 (L)  │ │  C3 (L)  │
-                 └──────────┘ └──────────┘
-        col 9   col 11  col 13  col 15  col 17
-         ┌──┐    ┌──┐    ┌──┐    ┌──┐    ┌──┐
-  Row 2  │C4│    │C10│   │C9 │   │C8 │   │C7 │
-         └──┘    └──┘    └──┘    └──┘    └──┘
+               col 11        col 14                           col 21
+                 ┌──────────┐ ┌──────────┐                     ┌──┐
+     Row 1       │  C2 (L)  │ │  C3 (L)  │                     │D12│
+                 └──────────┘ └──────────┘                     └──┘
+        col 9   col 11  col 13  col 15  col 17                col 21
+         ┌──┐    ┌──┐    ┌──┐    ┌──┐    ┌──┐                  ┌──┐
+  Row 2  │C4│    │C10│   │C9 │   │C8 │   │C7 │                 │D13│
+         └──┘    └──┘    └──┘    └──┘    └──┘                  └──┘
 
     col 4  col 6  col 8  col 10 col 12 col 14 col 16 col 18 col 20 col 22
                    ┌──┐    ┌──┐   ┌──┐   ┌──┐   ┌──┐   ┌──┐   ┌──┐
@@ -66,10 +66,10 @@ Both views mirror the actual roof panel arrangement using a 26-column CSS grid. 
      Row 4
 ```
 
-- **Top section** (`grid-layout`): Row 1 has C2/C3 centered (landscape); Row 2 has C4, C10, C9, C8, C7 (portrait)
+- **Top section** (`grid-layout`): Row 1 has C2/C3 centered (landscape) + D12 (portrait, south-facing, separated by spacer); Row 2 has C4, C10, C9, C8, C7 (portrait) + D13 (portrait, south-facing)
 - **Bottom section** (`grid-layout`): Row 3 has C1–C11 main array; Row 4 extends left with D11/D5 and continues through D10
 
-## Panels (24 total)
+## Panels (26 total)
 
 | String C       | String D       |
 |----------------|----------------|
@@ -77,7 +77,7 @@ Both views mirror the actual roof panel arrangement using a 26-column CSS grid. 
 | C4, C5, C6     | D4, D5, D6     |
 | C7, C8, C9     | D7, D8, D9     |
 | C10, C11, C12  | D10, D11       |
-| C13            |                |
+| C13            | D12, D13       |
 
 ## Tile Rendering
 

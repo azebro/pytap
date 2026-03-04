@@ -132,6 +132,23 @@ views:
                 view_layout: { grid-row: 2, grid-column: 17 / 19 }
                 styles: *tile_portrait
 
+              # D12 & D13 — South-facing, separated by spacer gap
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_d12_daily_energy
+                name: D12
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 1, grid-column: 21 / 24 }
+                styles: *tile_landscape
+
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_d13_daily_energy
+                name: D13
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 2, grid-column: 21 / 24 }
+                styles: *tile_landscape
+
           # Smaller Spacer
           - type: custom:button-card
             color_type: blank-card
@@ -421,6 +438,23 @@ views:
                 view_layout: { grid-row: 2, grid-column: 17 / 19 }
                 styles: *conn_tile_portrait
 
+              # D12 & D13 — South-facing, separated by spacer gap
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_d12_readings_today
+                name: D12
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 1, grid-column: 21 / 24 }
+                styles: *conn_tile_landscape
+
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_d13_readings_today
+                name: D13
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 2, grid-column: 21 / 24 }
+                styles: *conn_tile_landscape
+
           - type: custom:button-card
             color_type: blank-card
             styles:
@@ -569,3 +603,299 @@ views:
                 show_icon: false
                 view_layout: { grid-row: 2, grid-column: 22 / 24 }
                 styles: *conn_tile_portrait
+
+  # ═══════════════════════════════════════════════════════════
+  # PAGE 3 — Panel Power (Live)
+  # ═══════════════════════════════════════════════════════════
+  - title: Panel Power
+    path: panel-power
+    panel: true
+    cards:
+      - type: vertical-stack
+        cards:
+          - type: custom:layout-card
+            layout_type: custom:grid-layout
+            layout:
+              grid-template-columns: repeat(26, 1fr)
+              grid-gap: 6px
+              margin: 0
+            cards:
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_c2_power
+                name: C2
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 1, grid-column: 11 / 14 }
+                styles: &pwr_tile_landscape
+                  card:
+                    - aspect-ratio: 3/2
+                    - border-radius: 4px
+                    - border: "1px solid #3b4252"
+                    - background: >
+                        [[[
+                          const max = parseFloat(states['sensor.tigo_max_power']?.state) || 1;
+                          const val = parseFloat(entity.state) || 0;
+                          const pct = Math.min(Math.max(val, 0) / max, 1);
+                          const alpha = pct * 0.7;
+                          return `linear-gradient(rgba(0, 220, 50, ${alpha}), rgba(0, 220, 50, ${alpha})), linear-gradient(135deg, rgba(255,255,255,0.15) 0%, rgba(255,255,255,0) 40%, rgba(0,0,0,0.6) 100%), repeating-linear-gradient(0deg, transparent, transparent 18%, rgba(255,255,255,0.1) 18%, rgba(255,255,255,0.1) 20%), repeating-linear-gradient(90deg, transparent, transparent 18%, rgba(255,255,255,0.1) 18%, rgba(255,255,255,0.1) 20%), #0a111a`;
+                        ]]]
+                    - box-shadow: >
+                        [[[
+                          const max = parseFloat(states['sensor.tigo_max_power']?.state) || 1;
+                          const val = parseFloat(entity.state) || 0;
+                          const pct = Math.min(Math.max(val, 0) / max, 1);
+                          return `0 4px 8px rgba(0,0,0,0.5), inset 0 0 ${15 * pct}px rgba(0, 255, 50, ${0.8 * pct})`;
+                        ]]]
+                  name:
+                    - font-size: 1.0em
+                    - font-weight: 800
+                    - color: white
+                    - text-shadow: "1px 1px 2px rgba(0,0,0,0.8)"
+                  state:
+                    - font-size: 0.85em
+                    - font-weight: 600
+                    - color: "#e5e9f0"
+                    - text-shadow: "1px 1px 2px rgba(0,0,0,0.8)"
+
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_c3_power
+                name: C3
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 1, grid-column: 14 / 17 }
+                styles: *pwr_tile_landscape
+
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_c4_power
+                name: C4
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 2, grid-column: 9 / 11 }
+                styles: &pwr_tile_portrait
+                  card:
+                    - aspect-ratio: 2/3
+                    - border-radius: 4px
+                    - border: "1px solid #3b4252"
+                    - background: >
+                        [[[
+                          const max = parseFloat(states['sensor.tigo_max_power']?.state) || 1;
+                          const val = parseFloat(entity.state) || 0;
+                          const pct = Math.min(Math.max(val, 0) / max, 1);
+                          const alpha = pct * 0.7;
+                          return `linear-gradient(rgba(0, 220, 50, ${alpha}), rgba(0, 220, 50, ${alpha})), linear-gradient(135deg, rgba(255,255,255,0.15) 0%, rgba(255,255,255,0) 40%, rgba(0,0,0,0.6) 100%), repeating-linear-gradient(0deg, transparent, transparent 18%, rgba(255,255,255,0.1) 18%, rgba(255,255,255,0.1) 20%), repeating-linear-gradient(90deg, transparent, transparent 18%, rgba(255,255,255,0.1) 18%, rgba(255,255,255,0.1) 20%), #0a111a`;
+                        ]]]
+                    - box-shadow: >
+                        [[[
+                          const max = parseFloat(states['sensor.tigo_max_power']?.state) || 1;
+                          const val = parseFloat(entity.state) || 0;
+                          const pct = Math.min(Math.max(val, 0) / max, 1);
+                          return `0 4px 8px rgba(0,0,0,0.5), inset 0 0 ${15 * pct}px rgba(0, 255, 50, ${0.8 * pct})`;
+                        ]]]
+                  name:
+                    - font-size: 1.0em
+                    - font-weight: 800
+                    - color: white
+                    - text-shadow: "1px 1px 2px rgba(0,0,0,0.8)"
+                  state:
+                    - font-size: 0.85em
+                    - font-weight: 600
+                    - color: "#e5e9f0"
+                    - text-shadow: "1px 1px 2px rgba(0,0,0,0.8)"
+
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_c10_power
+                name: C10
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 2, grid-column: 11 / 13 }
+                styles: *pwr_tile_portrait
+
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_c9_power
+                name: C9
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 2, grid-column: 13 / 15 }
+                styles: *pwr_tile_portrait
+
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_c8_power
+                name: C8
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 2, grid-column: 15 / 17 }
+                styles: *pwr_tile_portrait
+
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_c7_power
+                name: C7
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 2, grid-column: 17 / 19 }
+                styles: *pwr_tile_portrait
+
+              # D12 & D13 — South-facing, separated by spacer gap
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_d12_power
+                name: D12
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 1, grid-column: 21 / 24 }
+                styles: *pwr_tile_landscape
+
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_d13_power
+                name: D13
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 2, grid-column: 21 / 24 }
+                styles: *pwr_tile_landscape
+
+          - type: custom:button-card
+            color_type: blank-card
+            styles:
+              card:
+                [height: 20px, background: none, box-shadow: none, border: none]
+
+          - type: custom:layout-card
+            layout_type: custom:grid-layout
+            layout:
+              grid-template-columns: repeat(26, 1fr)
+              grid-gap: 6px
+              margin: 0
+            cards:
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_c1_power
+                name: C1
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 1, grid-column: 8 / 10 }
+                styles: *pwr_tile_portrait
+
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_c6_power
+                name: C6
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 1, grid-column: 10 / 12 }
+                styles: *pwr_tile_portrait
+
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_d6_power
+                name: D6
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 1, grid-column: 12 / 14 }
+                styles: *pwr_tile_portrait
+
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_d7_power
+                name: D7
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 1, grid-column: 14 / 16 }
+                styles: *pwr_tile_portrait
+
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_d8_power
+                name: D8
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 1, grid-column: 16 / 18 }
+                styles: *pwr_tile_portrait
+
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_d9_power
+                name: D9
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 1, grid-column: 18 / 20 }
+                styles: *pwr_tile_portrait
+
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_c11_power
+                name: C11
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 1, grid-column: 20 / 22 }
+                styles: *pwr_tile_portrait
+
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_d11_power
+                name: D11
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 2, grid-column: 4 / 6 }
+                styles: *pwr_tile_portrait
+
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_d5_power
+                name: D5
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 2, grid-column: 6 / 8 }
+                styles: *pwr_tile_portrait
+
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_c12_power
+                name: C12
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 2, grid-column: 8 / 10 }
+                styles: *pwr_tile_portrait
+
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_d4_power
+                name: D4
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 2, grid-column: 10 / 12 }
+                styles: *pwr_tile_portrait
+
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_d3_power
+                name: D3
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 2, grid-column: 12 / 14 }
+                styles: *pwr_tile_portrait
+
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_d1_power
+                name: D1
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 2, grid-column: 14 / 16 }
+                styles: *pwr_tile_portrait
+
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_d2_power
+                name: D2
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 2, grid-column: 16 / 18 }
+                styles: *pwr_tile_portrait
+
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_c5_power
+                name: C5
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 2, grid-column: 18 / 20 }
+                styles: *pwr_tile_portrait
+
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_c13_power
+                name: C13
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 2, grid-column: 20 / 22 }
+                styles: *pwr_tile_portrait
+
+              - type: custom:button-card
+                entity: sensor.tigo_ts4_d10_power
+                name: D10
+                show_state: true
+                show_icon: false
+                view_layout: { grid-row: 2, grid-column: 22 / 24 }
+                styles: *pwr_tile_portrait
