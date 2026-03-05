@@ -3,7 +3,7 @@
 Public surface re-exports from core modules and the api module.
 """
 
-__version__ = "0.1.0"
+__version__ = "1.1.1"
 
 # Core types
 # API functions
