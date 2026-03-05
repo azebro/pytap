@@ -23,7 +23,7 @@ Home Assistant Lovelace dashboard displaying the physical solar panel layout wit
 | Tigo Max Daily Energy | `sensor.tigo_max_daily_energy` | Highest `_daily_energy` across all 26 panels (kWh) |
 | Tigo Max Readings Today | `sensor.tigo_max_readings_today` | Highest `_readings_today` across all 26 panels |
 
-These are computed server-side with Jinja2 templates so each button-card only needs a single `states[]` lookup instead of scanning all 24 sensors in JavaScript.
+These are computed server-side with Jinja2 templates so each button-card only needs a single `states[]` lookup instead of scanning all 26 sensors in JavaScript.
 
 ## Views
 
