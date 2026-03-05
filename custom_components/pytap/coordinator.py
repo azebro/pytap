@@ -8,7 +8,8 @@ and filters events by user-configured barcodes.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, time as dt_time, timedelta
+from datetime import datetime, timedelta
+from datetime import time as dt_time
 import logging
 import threading
 import time
