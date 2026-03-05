@@ -22,8 +22,9 @@ Home Assistant Lovelace dashboard displaying the physical solar panel layout wit
 |--------|-----------|---------|
 | Tigo Max Daily Energy | `sensor.tigo_max_daily_energy` | Highest `_daily_energy` across all 26 panels (kWh) |
 | Tigo Max Readings Today | `sensor.tigo_max_readings_today` | Highest `_readings_today` across all 26 panels |
+| Tigo Max Power | `sensor.tigo_max_power` | Highest live `_power` across all 26 panels (W) |
 
-These are computed server-side with Jinja2 templates so each button-card only needs a single `states[]` lookup instead of scanning all 24 sensors in JavaScript.
+These are computed server-side with Jinja2 templates so each button-card only needs a single `states[]` lookup instead of scanning all 26 sensors in JavaScript.
 
 ## Views
 
@@ -38,6 +39,12 @@ Shows daily energy production per panel. Each tile displays the panel name and `
 Shows the number of readings received today per panel using `sensor.tigo_ts4_<panel>_readings_today`.
 
 **Color scale:** Red → Green. HSL hue scales 0° (red) → 120° (green) relative to `sensor.tigo_max_readings_today`. Low-connectivity panels are immediately visible in red.
+
+### 3. Panel Power (`/panel-power`)
+
+Shows the live power output per panel using `sensor.tigo_ts4_<panel>_power`.
+
+**Color scale:** Transparent → Green. Green overlay alpha scales from 0 to 0.7 relative to `sensor.tigo_max_power`. An inner green glow intensifies with output.
 
 ## Physical Layout
 
@@ -110,6 +117,16 @@ const hue = Math.round(pct * 120);  // 0°=red → 120°=green
 // Inner glow:    hsla(hue, 80%, 50%, 0.7)
 ```
 
+### Page 3 color formula (Power)
+
+```javascript
+const max = parseFloat(states['sensor.tigo_max_power']?.state) || 1;
+const pct = Math.min(Math.max(val, 0) / max, 1);
+const alpha = pct * 0.7;
+// Green overlay: rgba(0, 220, 50, alpha)
+// Inner glow:    rgba(0, 255, 50, 0.8 * pct)
+```
+
 ## YAML Structure
 
 YAML anchors keep the file DRY:
@@ -120,6 +137,8 @@ YAML anchors keep the file DRY:
 | `&tile_portrait` | Energy | Portrait (2:3) | All other tiles |
 | `&conn_tile_landscape` | Connectivity | Landscape (3:2) | C2, C3 tiles (red→green) |
 | `&conn_tile_portrait` | Connectivity | Portrait (2:3) | All other tiles (red→green) |
+| `&pwr_tile_landscape` | Power | Landscape (3:2) | C2, C3 tiles (green by power) |
+| `&pwr_tile_portrait` | Power | Portrait (2:3) | All other tiles (green by power) |
 
 Both views use the same structural approach:
 
@@ -131,16 +150,19 @@ Each panel card specifies its exact position via `view_layout: { grid-row, grid-
 
 ## tigo.yaml — Template Sensors
 
-Server-side Jinja2 template sensors that aggregate all 24 panel values:
+Server-side Jinja2 template sensors that aggregate all 26 panel values:
 
 ```yaml
 template:
   - sensor:
       - name: "Tigo Max Daily Energy"         # sensor.tigo_max_daily_energy
-        state: "{{ [all 24 _daily_energy states] | map('float', 0) | max }}"
+        state: "{{ [all 26 _daily_energy states] | map('float', 0) | max }}"
 
       - name: "Tigo Max Readings Today"       # sensor.tigo_max_readings_today
-        state: "{{ [all 24 _readings_today states] | map('float', 0) | max }}"
+        state: "{{ [all 26 _readings_today states] | map('float', 0) | max }}"
+
+      - name: "Tigo Max Power"                # sensor.tigo_max_power
+        state: "{{ [all 26 _power states] | map('float', 0) | max }}"
 ```
 
-This offloads the max-value computation from the frontend (previously each of the 48 button-cards scanned all 24 sensors in JS) to a single HA template sensor that updates automatically.
+This offloads the max-value computation from the frontend (previously each of the 78 button-cards scanned all 26 sensors in JS) to a single HA template sensor that updates automatically.
