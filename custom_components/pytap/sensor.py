@@ -501,7 +501,26 @@ class PyTapAggregateSensor(
         await super().async_added_to_hass()
 
         nodes = self.coordinator.data.get("nodes", {})
-        if any(nodes.get(barcode) is not None for barcode in self._barcodes):
+        # Only short-circuit to live data if at least one node already has
+        # a non-None value for the aggregate's underlying field. This avoids
+        # overwriting a restored value with None from placeholder node dicts.
+        value_key = getattr(self.entity_description, "value_key", None)
+        if self.entity_description.key == "performance":
+            has_fresh_data = any(
+                (node := nodes.get(barcode)) is not None
+                and node.get("power") is not None
+                for barcode in self._barcodes
+            )
+        elif value_key:
+            has_fresh_data = any(
+                (node := nodes.get(barcode)) is not None
+                and node.get(value_key) is not None
+                for barcode in self._barcodes
+            )
+        else:
+            has_fresh_data = False
+
+        if has_fresh_data:
             self._handle_coordinator_update()
             return
 
