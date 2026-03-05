@@ -378,9 +378,14 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
     async def async_added_to_hass(self) -> None:
         """Restore last known native value from Home Assistant state cache."""
         await super().async_added_to_hass()
-        if self.coordinator.data.get("nodes", {}).get(self._barcode) is not None:
-            self._handle_coordinator_update()
-            return
+        nodes = self.coordinator.data.get("nodes", {})
+        node = nodes.get(self._barcode)
+        # Only short-circuit to coordinator data if this sensor has a non-None value.
+        if node is not None:
+            coordinator_value = node.get(self.entity_description.key)
+            if coordinator_value is not None:
+                self._handle_coordinator_update()
+                return
 
         if restored := await self.async_get_last_sensor_data():
             if restored.native_value is not None:
