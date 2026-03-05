@@ -14,6 +14,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers import entity_registry as er
+from homeassistant.util import dt as dt_util
 
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -921,7 +922,7 @@ async def test_restart_restores_snapshot_before_live_stream(
     )
     entry.add_to_hass(hass)
 
-    today = "2026-02-24"
+    today = dt_util.now().date().isoformat()
     stored_state = {
         "barcode_to_node": {"A-1234567B": 10},
         "discovered_barcodes": [],
@@ -976,6 +977,25 @@ async def test_restart_restores_snapshot_before_live_stream(
     assert power_state is not None
     assert power_state.state != STATE_UNAVAILABLE
     assert float(power_state.state) == 299.2
+
+    # Verify energy sensors restore from coordinator snapshot (not zeroed)
+    daily_energy_entity_id = ent_reg.async_get_entity_id(
+        "sensor", DOMAIN, f"{DOMAIN}_A-1234567B_daily_energy"
+    )
+    assert daily_energy_entity_id is not None
+    daily_energy_state = hass.states.get(daily_energy_entity_id)
+    assert daily_energy_state is not None
+    assert daily_energy_state.state != STATE_UNAVAILABLE
+    assert float(daily_energy_state.state) == 12.5
+
+    total_energy_entity_id = ent_reg.async_get_entity_id(
+        "sensor", DOMAIN, f"{DOMAIN}_A-1234567B_total_energy"
+    )
+    assert total_energy_entity_id is not None
+    total_energy_state = hass.states.get(total_energy_entity_id)
+    assert total_energy_state is not None
+    assert total_energy_state.state != STATE_UNAVAILABLE
+    assert float(total_energy_state.state) == 2000.0
 
     installation_power_entity_id = ent_reg.async_get_entity_id(
         "sensor", DOMAIN, f"{DOMAIN}_{entry.entry_id}_installation_power"

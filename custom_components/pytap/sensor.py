@@ -382,7 +382,7 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
         node = nodes.get(self._barcode)
         # Only short-circuit to coordinator data if this sensor has a non-None value.
         if node is not None:
-            coordinator_value = node.get(self.entity_description.key)
+            coordinator_value = node.get(self.entity_description.value_key)
             if coordinator_value is not None:
                 self._handle_coordinator_update()
                 return
