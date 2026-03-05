@@ -11,6 +11,7 @@ import pytest
 
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
 from custom_components.pytap.const import (
     CONF_MODULE_BARCODE,
@@ -203,7 +204,7 @@ class TestLoadCoordinatorState:
             "energy_data": {
                 "A-1234567B": {
                     "daily_energy_wh": 10.5,
-                    "daily_reset_date": datetime.now().date().isoformat(),
+                    "daily_reset_date": dt_util.now().date().isoformat(),
                     "total_energy_wh": 1234.5,
                     "readings_today": 17,
                     "last_power_w": 250.0,
@@ -250,7 +251,7 @@ class TestLoadCoordinatorState:
         assert acc.daily_energy_wh == 0.0
         assert acc.readings_today == 0
         assert acc.total_energy_wh == 555.0
-        assert acc.daily_reset_date == datetime.now().date().isoformat()
+        assert acc.daily_reset_date == dt_util.now().date().isoformat()
 
     async def test_load_handles_missing_energy_data(self, hass: HomeAssistant) -> None:
         """Missing energy_data key should leave energy state empty."""
@@ -325,7 +326,7 @@ class TestSaveCoordinatorState:
         coordinator._energy_state = {
             "A-1234567B": EnergyAccumulator(
                 daily_energy_wh=1.25,
-                daily_reset_date=datetime.now().date().isoformat(),
+                daily_reset_date=dt_util.now().date().isoformat(),
                 total_energy_wh=100.75,
                 readings_today=9,
                 last_power_w=250.0,
@@ -351,7 +352,7 @@ class TestSaveCoordinatorState:
             "daily_energy_wh": 1.25,
             "total_energy_wh": 100.75,
             "readings_today": 9,
-            "daily_reset_date": datetime.now().date().isoformat(),
+            "daily_reset_date": dt_util.now().date().isoformat(),
             "last_update": "2026-02-24T20:00:00",
         }
         coordinator._unsaved_changes = True
@@ -842,7 +843,7 @@ class TestEnergyPrePopulation:
         entry = _make_entry(hass)
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
 
-        today = datetime.now().date().isoformat()
+        today = dt_util.now().date().isoformat()
         stored_data = {
             "barcode_to_node": {"A-1234567B": 10},
             "discovered_barcodes": [],
@@ -876,7 +877,7 @@ class TestEnergyPrePopulation:
         entry = _make_entry(hass)
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
 
-        today = datetime.now().date().isoformat()
+        today = dt_util.now().date().isoformat()
         stored_data = {
             "barcode_to_node": {},
             "discovered_barcodes": [],
@@ -912,7 +913,7 @@ class TestEnergyPrePopulation:
         entry = _make_entry(hass)
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
 
-        today = datetime.now().date().isoformat()
+        today = dt_util.now().date().isoformat()
         stored_data = {
             "barcode_to_node": {},
             "discovered_barcodes": [],
@@ -949,7 +950,7 @@ class TestEnergyPrePopulation:
         entry = _make_entry(hass)
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
 
-        today = datetime.now().date().isoformat()
+        today = dt_util.now().date().isoformat()
         stored_data = {
             "barcode_to_node": {"A-1234567B": 10},
             "discovered_barcodes": [],
