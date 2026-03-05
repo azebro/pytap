@@ -8,7 +8,7 @@ and filters events by user-configured barcodes.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, time as dt_time, timedelta
 import logging
 import threading
 import time
@@ -16,7 +16,7 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PORT
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
@@ -128,6 +128,9 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._listener_task: asyncio.Task | None = None
         self._stop_event = threading.Event()
 
+        # Midnight reset timer handle
+        self._midnight_reset_unsub: asyncio.TimerHandle | None = None
+
         # Source handle for cancellation — accessed from both threads
         self._source: Any = None
         self._source_lock = threading.Lock()
@@ -199,6 +202,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._async_listen(),
             name="pytap_listener",
         )
+        self._schedule_midnight_reset()
 
     async def _async_listen(self) -> None:
         """Async wrapper to run the blocking listener in an executor."""
@@ -207,6 +211,10 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_stop_listener(self) -> None:
         """Stop the background listener task."""
         self._stop_event.set()
+        # Cancel midnight reset timer
+        if self._midnight_reset_unsub is not None:
+            self._midnight_reset_unsub.cancel()
+            self._midnight_reset_unsub = None
         # Flush any pending state save
         if self._save_task is not None:
             self._save_task.cancel()
@@ -228,6 +236,49 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             except (asyncio.CancelledError, TimeoutError, Exception):
                 pass
             self._listener_task = None
+
+    def _schedule_midnight_reset(self) -> None:
+        """Schedule a callback at the next local midnight to reset daily accumulators."""
+        now = dt_util.now()
+        next_midnight = datetime.combine(
+            now.date() + timedelta(days=1), dt_time.min, tzinfo=now.tzinfo
+        )
+        delay = (next_midnight - now).total_seconds()
+        self._midnight_reset_unsub = self.hass.loop.call_later(
+            delay, self._perform_midnight_reset
+        )
+        _LOGGER.debug(
+            "Scheduled daily reset in %.0f seconds (at %s)", delay, next_midnight
+        )
+
+    @callback
+    def _perform_midnight_reset(self) -> None:
+        """Reset all daily accumulators and push updated data to sensors."""
+        self._midnight_reset_unsub = None
+        today = dt_util.now().date().isoformat()
+        _LOGGER.info("Midnight daily reset — resetting daily accumulators for %s", today)
+
+        data_changed = False
+        for barcode, acc in self._energy_state.items():
+            if acc.daily_reset_date == today:
+                continue
+            acc.daily_energy_wh = 0.0
+            acc.readings_today = 0
+            acc.daily_reset_date = today
+
+            node_data = self.data.get("nodes", {}).get(barcode)
+            if node_data is not None:
+                node_data["daily_energy_wh"] = 0.0
+                node_data["readings_today"] = 0
+                node_data["daily_reset_date"] = today
+                data_changed = True
+
+        if data_changed:
+            self._schedule_save()
+            self.async_set_updated_data(dict(self.data))
+
+        # Re-schedule for the next midnight
+        self._schedule_midnight_reset()
 
     def _listen(self) -> None:
         """Blocking listener loop (runs in executor thread).

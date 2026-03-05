@@ -4,7 +4,7 @@ Validates that barcode\u2194node mappings, discovered barcodes, and parser
 infrastructure state survive restarts via the consolidated HA Store.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -994,3 +994,107 @@ class TestEnergyPrePopulation:
         assert node["voltage_in"] == 60.0
         # Energy should continue from the loaded accumulator, not reset
         assert node["total_energy_wh"] >= 5000.0
+
+
+class TestMidnightReset:
+    """Test that the midnight reset timer proactively resets daily accumulators."""
+
+    def test_perform_midnight_reset_zeros_daily_values(
+        self, hass: HomeAssistant
+    ) -> None:
+        """Daily energy and readings should be zeroed by midnight reset."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+        coordinator._schedule_save = MagicMock()
+        coordinator.async_set_updated_data = MagicMock()
+
+        today = dt_util.now().date().isoformat()
+        yesterday = (dt_util.now().date() - timedelta(days=1)).isoformat()
+
+        coordinator._energy_state["A-1234567B"] = EnergyAccumulator(
+            daily_energy_wh=150.0,
+            total_energy_wh=5000.0,
+            daily_reset_date=yesterday,
+            last_power_w=0.0,
+            last_reading_ts=None,
+            readings_today=42,
+        )
+        coordinator.data["nodes"]["A-1234567B"] = {
+            "daily_energy_wh": 150.0,
+            "total_energy_wh": 5000.0,
+            "readings_today": 42,
+            "daily_reset_date": yesterday,
+        }
+
+        coordinator._perform_midnight_reset()
+
+        acc = coordinator._energy_state["A-1234567B"]
+        assert acc.daily_energy_wh == 0.0
+        assert acc.readings_today == 0
+        assert acc.daily_reset_date == today
+        assert acc.total_energy_wh == 5000.0
+
+        node = coordinator.data["nodes"]["A-1234567B"]
+        assert node["daily_energy_wh"] == 0.0
+        assert node["readings_today"] == 0
+        assert node["daily_reset_date"] == today
+        assert node["total_energy_wh"] == 5000.0
+
+        coordinator._schedule_save.assert_called_once()
+        coordinator.async_set_updated_data.assert_called_once()
+
+    def test_perform_midnight_reset_skips_already_reset(
+        self, hass: HomeAssistant
+    ) -> None:
+        """Accumulators already reset for today should not be modified again."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+        coordinator._schedule_save = MagicMock()
+        coordinator.async_set_updated_data = MagicMock()
+
+        today = dt_util.now().date().isoformat()
+
+        coordinator._energy_state["A-1234567B"] = EnergyAccumulator(
+            daily_energy_wh=50.0,
+            total_energy_wh=2000.0,
+            daily_reset_date=today,
+            last_power_w=100.0,
+            last_reading_ts=None,
+            readings_today=10,
+        )
+
+        coordinator._perform_midnight_reset()
+
+        acc = coordinator._energy_state["A-1234567B"]
+        assert acc.daily_energy_wh == 50.0
+        assert acc.readings_today == 10
+
+        coordinator._schedule_save.assert_not_called()
+        coordinator.async_set_updated_data.assert_not_called()
+
+    def test_perform_midnight_reset_reschedules(self, hass: HomeAssistant) -> None:
+        """Midnight reset should reschedule itself for the next midnight."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+        coordinator._schedule_save = MagicMock()
+        coordinator.async_set_updated_data = MagicMock()
+
+        coordinator._perform_midnight_reset()
+
+        assert coordinator._midnight_reset_unsub is not None
+
+    def test_stop_cancels_midnight_timer(self, hass: HomeAssistant) -> None:
+        """Stopping the listener should cancel the midnight reset timer."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+
+        mock_timer = MagicMock()
+        coordinator._midnight_reset_unsub = mock_timer
+
+        # async_stop_listener cancels the timer
+        import asyncio
+
+        asyncio.get_event_loop().run_until_complete(coordinator.async_stop_listener())
+
+        mock_timer.cancel.assert_called_once()
+        assert coordinator._midnight_reset_unsub is None
