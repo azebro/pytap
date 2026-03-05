@@ -1,6 +1,6 @@
 # PyTap — Implementation Document
 
-> Version 0.3.0 · Last updated: February 2026
+> Version 0.3.1 · Last updated: March 2026
 
 This document captures the current implementation state of the PyTap Home Assistant custom component. It describes what has been built, how each module works, the design decisions made during development, and the test coverage in place.
 
@@ -59,7 +59,7 @@ custom_components/pytap/
 ├── __init__.py          # ~187 lines — Integration lifecycle (setup, teardown, migration, options listener)
 ├── config_flow.py       # 369 lines  — Menu-driven config & options flows
 ├── const.py             # ~28 lines  — Domain, config keys, defaults, energy tuning constants
-├── coordinator.py       # ~826 lines — Push-based DataUpdateCoordinator
+├── coordinator.py       # ~1016 lines — Push-based DataUpdateCoordinator
 ├── diagnostics.py       # ~46 lines  — Diagnostics download (config entry diagnostics)
 ├── energy.py            # ~80 lines  — Pure trapezoidal energy accumulation helpers
 ├── manifest.json        # 13 lines   — HA integration metadata
@@ -81,7 +81,7 @@ custom_components/pytap/
 tests/
 ├── conftest.py                    # 14 lines  — Auto-enable custom integrations fixture
 ├── test_config_flow.py            # 548 lines — 16 config flow tests
-├── test_coordinator_persistence.py # ~729 lines — 32 coordinator & persistence tests
+├── test_coordinator_persistence.py # ~1100 lines — 36 coordinator & persistence tests
 ├── test_diagnostics.py            # ~172 lines — 4 diagnostics platform tests
 ├── test_energy.py                 # ~170 lines — 13 pure energy accumulation tests
 ├── test_migration.py              # ~300 lines — 11 entity migration tests
@@ -218,7 +218,7 @@ Four custom `HomeAssistantError` subclasses: `CannotConnect`, `InvalidAuth`, `In
 
 ### `coordinator.py` — Data Coordinator
 
-**~680 lines** implementing `PyTapDataUpdateCoordinator`, the core runtime engine.
+**~1016 lines** implementing `PyTapDataUpdateCoordinator`, the core runtime engine.
 
 #### Class: `PyTapDataUpdateCoordinator`
 
@@ -264,11 +264,13 @@ def __init__(self, hass, entry):
 
 ```
 async_start_listener()
-    └── creates background task → _async_listen()
-                                       └── executor job → _listen()
+    ├── creates background task → _async_listen()
+    │                                  └── executor job → _listen()
+    └── schedules midnight reset timer → _schedule_midnight_reset()
 
 async_stop_listener()
     └── sets _stop_event (threading.Event)
+    └── cancels midnight reset timer
     └── acquires _source_lock, closes _source (unblocks socket.read)
     └── awaits task with asyncio.timeout(5)
 ```
@@ -406,6 +408,10 @@ Pure-logic module implementing trapezoidal energy integration. Intentionally HA-
 5. Unconditionally increments `readings_today` and updates `last_power_w` / `last_reading_ts`.
 
 The coordinator calls `accumulate_energy()` from `_handle_power_report` and merges the result into the node data dict.
+
+#### Proactive midnight reset
+
+In addition to the lazy date-check inside `accumulate_energy()`, the coordinator runs a **proactive midnight reset timer** (`_schedule_midnight_reset` / `_perform_midnight_reset`). This ensures daily sensors (`daily_energy`, `readings_today`) zero at exactly midnight local time, even when no power reports arrive overnight (typical for solar installations). The timer uses `hass.loop.call_later()` and reschedules itself after each reset.
 
 ---
 
@@ -736,9 +742,9 @@ All tests mock `validate_connection` to avoid real TCP connections.
 
 Tests use `MagicMock(spec=PyTapDataUpdateCoordinator)` to avoid real coordinator initialization.
 
-### Coordinator Persistence Tests (32 tests)
+### Coordinator Persistence Tests (36 tests)
 
-Coverage includes coordinator initialization, barcode mapping restoration and purging, deferred power-report handling before infrastructure, save/load behavior, parser-state restore/fallback, stop-flush behavior, and energy-data persistence (`energy_data` save/load with daily reset on new day).
+Coverage includes coordinator initialization, barcode mapping restoration and purging, deferred power-report handling before infrastructure, save/load behavior, parser-state restore/fallback, stop-flush behavior, energy-data persistence (`energy_data` save/load with daily reset on new day), and proactive midnight reset behavior (zeroing daily accumulators, skip-if-already-reset, timer rescheduling, and cancellation on stop).
 
 ### Diagnostics Platform Tests (4 tests)
 
@@ -999,6 +1005,15 @@ Created this implementation document capturing all development work to date.
 - Persisted `readings_today` in coordinator store load/save, including date-rollover reset on restore.
 - Added tests in `tests/test_diagnostics.py` and extended sensor/coordinator/energy tests.
 - Full suite status after feature: 105 tests passing, ruff clean.
+
+### Phase 16 — Proactive Midnight Daily Reset
+
+- **Bug fix:** Daily sensors (`daily_energy`, `readings_today`) previously reset lazily on the first power report after midnight. Since solar panels produce no data overnight, the reset occurred at a random time in the morning when the first reading arrived.
+- Added `_schedule_midnight_reset()` and `_perform_midnight_reset()` to the coordinator. A `call_later` timer on the HA event loop fires at exactly midnight local time, zeroes all daily accumulators, updates node data, pushes the update to sensors, and reschedules itself for the next midnight.
+- `async_start_listener()` now schedules the midnight reset timer at startup.
+- `async_stop_listener()` cancels the midnight reset timer on shutdown.
+- Added 4 tests in `TestMidnightReset`: zeroing daily values, skip-if-already-reset, timer rescheduling, and cancellation on stop.
+
 ---
 
 ## Future Work

@@ -256,7 +256,8 @@ The `pytap` library uses blocking I/O (`socket.recv`, `serial.read`). Since Home
 
 1. **Background listener task** — An `asyncio.Task` created at setup that runs the blocking `_listen()` method in the executor via `hass.async_add_executor_job()`.
 2. **Event dispatch** — When the executor thread receives parsed events, it schedules `coordinator.async_set_updated_data()` back on the event loop via `hass.loop.call_soon_threadsafe()`.
-3. **Cancellation** — On unload, the task is cancelled and the source connection is closed, which unblocks the `read()` call.
+3. **Midnight reset timer** — A `call_later` timer on the event loop fires at local midnight to proactively reset daily accumulators, ensuring daily sensors zero at exactly midnight even when no power reports arrive overnight.
+4. **Cancellation** — On unload, the task is cancelled, the midnight timer is cancelled, and the source connection is closed, which unblocks the `read()` call.
 
 ```
  HA Event Loop (main thread)          Executor Thread
@@ -265,6 +266,7 @@ The `pytap` library uses blocking I/O (`socket.recv`, `serial.read`). Since Home
         │  async_setup_entry()               │
         │  ─► create coordinator             │
         │  ─► start listener task ──────────►│
+        │  ─► schedule midnight reset        │
         │                                    │ source = connect(config)
         │                                    │ parser = create_parser()
         │                                    │
@@ -274,10 +276,16 @@ The `pytap` library uses blocking I/O (`socket.recv`, `serial.read`). Since Home
         │  ◄── call_soon_threadsafe ─────────│   for event in events:
         │      async_set_updated_data(...)   │     dispatch(event)
         │                                    │
+        │  [midnight] _perform_midnight_     │
+        │    reset() → zero daily accum.     │
+        │    → push update to sensors        │
+        │    → reschedule for next midnight  │
+        │                                    │
         │  entities read coordinator.data    │
         │  and update their state            │
         │                                    │
         │  async_unload_entry()              │
+        │  ─► cancel midnight timer          │
         │  ─► cancel task ──────────────────►│ (source.close() → unblocks read)
         │                                    │ exits
 ```
