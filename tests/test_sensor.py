@@ -5,8 +5,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from homeassistant.components.sensor import SensorStateClass
-from homeassistant.const import CONF_HOST, CONF_PORT, EntityCategory, UnitOfEnergy
-from homeassistant.core import HomeAssistant
+from homeassistant.const import (
+    CONF_HOST,
+    CONF_PORT,
+    EntityCategory,
+    STATE_UNAVAILABLE,
+    UnitOfEnergy,
+)
+from homeassistant.core import HomeAssistant, State
+from homeassistant.helpers import entity_registry as er
+
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.pytap.const import (
     CONF_MODULE_BARCODE,
@@ -19,7 +28,11 @@ from custom_components.pytap.const import (
     DOMAIN,
 )
 from custom_components.pytap.coordinator import PyTapDataUpdateCoordinator
-from custom_components.pytap.sensor import SENSOR_DESCRIPTIONS, async_setup_entry
+from custom_components.pytap.sensor import (
+    SENSOR_DESCRIPTIONS,
+    _coerce_restored_state_value,
+    async_setup_entry,
+)
 
 
 MOCK_MODULES = [
@@ -873,3 +886,174 @@ async def test_no_string_aggregates_when_no_modules(hass: HomeAssistant) -> None
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
     assert entities == []
+
+
+def test_coerce_restored_state_value_float_sensor() -> None:
+    """Restored state should coerce to float for standard numeric sensors."""
+    assert _coerce_restored_state_value("299.2", "power") == 299.2
+
+
+def test_coerce_restored_state_value_int_sensor() -> None:
+    """Readings-today restore should coerce to int."""
+    assert _coerce_restored_state_value("42", "readings_today") == 42
+
+
+def test_coerce_restored_state_value_ignores_unavailable() -> None:
+    """Unavailable/unknown restore values should be ignored."""
+    assert _coerce_restored_state_value("unknown", "power") is None
+    assert _coerce_restored_state_value("unavailable", "power") is None
+
+
+async def test_restart_restores_snapshot_before_live_stream(
+    hass: HomeAssistant,
+) -> None:
+    """After restart, sensors should be available from restored snapshot data."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_HOST: "192.168.1.100",
+            CONF_PORT: DEFAULT_PORT,
+            CONF_MODULES: [MOCK_MODULES[0]],
+        },
+        entry_id="restart_restore_entry",
+        title="PyTap (192.168.1.100)",
+        version=4,
+    )
+    entry.add_to_hass(hass)
+
+    today = "2026-02-24"
+    stored_state = {
+        "barcode_to_node": {"A-1234567B": 10},
+        "discovered_barcodes": [],
+        "energy_data": {
+            "A-1234567B": {
+                "daily_energy_wh": 12.5,
+                "daily_reset_date": today,
+                "total_energy_wh": 2000.0,
+                "readings_today": 55,
+                "last_power_w": 299.2,
+                "last_reading_ts": "2026-02-24T20:00:00",
+            }
+        },
+        "node_snapshots": {
+            "A-1234567B": {
+                "gateway_id": 1,
+                "node_id": 10,
+                "voltage_in": 35.2,
+                "voltage_out": 34.8,
+                "current_in": 8.5,
+                "current_out": 8.4,
+                "power": 299.2,
+                "performance": 65.76,
+                "temperature": 42.0,
+                "dc_dc_duty_cycle": 0.95,
+                "rssi": -65,
+                "last_update": "2026-02-24T20:00:00",
+            }
+        },
+    }
+
+    with (
+        patch(
+            "custom_components.pytap.coordinator._MigratingStore.async_load",
+            new=AsyncMock(return_value=stored_state),
+        ),
+        patch(
+            "custom_components.pytap.coordinator.PyTapDataUpdateCoordinator._listen",
+            return_value=None,
+        ),
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    ent_reg = er.async_get(hass)
+
+    power_entity_id = ent_reg.async_get_entity_id(
+        "sensor", DOMAIN, f"{DOMAIN}_A-1234567B_power"
+    )
+    assert power_entity_id is not None
+    power_state = hass.states.get(power_entity_id)
+    assert power_state is not None
+    assert power_state.state != STATE_UNAVAILABLE
+    assert float(power_state.state) == 299.2
+
+    installation_power_entity_id = ent_reg.async_get_entity_id(
+        "sensor", DOMAIN, f"{DOMAIN}_{entry.entry_id}_installation_power"
+    )
+    assert installation_power_entity_id is not None
+    installation_power_state = hass.states.get(installation_power_entity_id)
+    assert installation_power_state is not None
+    assert installation_power_state.state != STATE_UNAVAILABLE
+    assert float(installation_power_state.state) == 299.2
+
+
+async def test_restart_uses_restore_entity_fallback_without_snapshot(
+    hass: HomeAssistant,
+) -> None:
+    """When no snapshot exists, startup should restore values from HA state cache."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_HOST: "192.168.1.100",
+            CONF_PORT: DEFAULT_PORT,
+            CONF_MODULES: [MOCK_MODULES[0]],
+        },
+        entry_id="restart_restore_fallback_entry",
+        title="PyTap (192.168.1.100)",
+        version=4,
+    )
+    entry.add_to_hass(hass)
+
+    stored_state = {
+        "barcode_to_node": {},
+        "discovered_barcodes": [],
+    }
+
+    with (
+        patch(
+            "custom_components.pytap.coordinator._MigratingStore.async_load",
+            new=AsyncMock(return_value=stored_state),
+        ),
+        patch(
+            "custom_components.pytap.coordinator.PyTapDataUpdateCoordinator._listen",
+            return_value=None,
+        ),
+        patch(
+            "custom_components.pytap.sensor.PyTapSensor.async_get_last_sensor_data",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "custom_components.pytap.sensor.PyTapAggregateSensor.async_get_last_sensor_data",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "custom_components.pytap.sensor.PyTapSensor.async_get_last_state",
+            new=AsyncMock(return_value=State("sensor.fake_module", "123.4")),
+        ),
+        patch(
+            "custom_components.pytap.sensor.PyTapAggregateSensor.async_get_last_state",
+            new=AsyncMock(return_value=State("sensor.fake_aggregate", "456.7")),
+        ),
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    ent_reg = er.async_get(hass)
+
+    power_entity_id = ent_reg.async_get_entity_id(
+        "sensor", DOMAIN, f"{DOMAIN}_A-1234567B_power"
+    )
+    assert power_entity_id is not None
+    power_state = hass.states.get(power_entity_id)
+    assert power_state is not None
+    assert power_state.state != STATE_UNAVAILABLE
+    assert float(power_state.state) == 123.4
+
+    installation_power_entity_id = ent_reg.async_get_entity_id(
+        "sensor", DOMAIN, f"{DOMAIN}_{entry.entry_id}_installation_power"
+    )
+    assert installation_power_entity_id is not None
+    installation_power_state = hass.states.get(installation_power_entity_id)
+    assert installation_power_state is not None
+    assert installation_power_state.state != STATE_UNAVAILABLE
+    assert float(installation_power_state.state) == 456.7

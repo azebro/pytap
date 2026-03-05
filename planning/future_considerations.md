@@ -46,7 +46,7 @@ Status: ✅ Implemented in Feature 5.
 
 5.2 **Per-sensor readings counter** — Each optimizer now has a `readings_today` daily meter (`SensorStateClass.TOTAL`, diagnostic category) to support per-module connectivity troubleshooting.
 
-## 6. Binary Sensor Platform - low priority
+## 6. Binary Sensor Platform - will not implement
 
 Add binary sensors for node connectivity (available/unavailable based on `last_update` age) and gateway online status.
 
@@ -60,5 +60,4 @@ Status: ✅ Implemented in v1.0.0.
 
 ## 8. Configuration
 - Add ability to bulk load devices
-- Add ability to modify barcodes
 - Make energy gap threshold configurable via options flow (currently hardcoded at 120 s)
