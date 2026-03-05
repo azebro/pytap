@@ -6,7 +6,7 @@ Home Assistant Lovelace dashboard displaying the physical solar panel layout wit
 
 | File | Purpose |
 |------|---------|
-| [`pv_production_dashboard.yaml`](pv_production_dashboard.yaml) | Lovelace dashboard (2 views, 571 lines) |
+| [`pv_production_dashboard.yaml`](pv_production_dashboard.yaml) | Lovelace dashboard (3 views, ~901 lines) |
 | [`tigo.yaml`](tigo.yaml) | HA template sensors for max-value aggregation |
 
 ## Prerequisites
