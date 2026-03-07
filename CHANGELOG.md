@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.2.0] - 2026-03-07
+
+### Changed
+
+- Refactor code structure for improved readability and maintainability
+
 ## [1.1.1] - 2026-03-05
 
 ### Added
