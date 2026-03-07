@@ -1077,3 +1077,122 @@ def test_node_table_bit15_flag_masked():
     assert 32794 not in infra.nodes
     assert infra.nodes[25]["address"] == "04:C0:5B:40:00:D3:9A:3E"
     assert infra.nodes[26]["address"] == "04:C0:5B:40:00:D3:9C:B6"
+
+
+# -----------------------------------------------------------------------
+#  Test 12: H-firmware RECEIVE_RESPONSE parsing
+# -----------------------------------------------------------------------
+
+
+def _build_receive_request(gw_id: int, packet_number: int) -> bytes:
+    """Build a RECEIVE_REQUEST frame (controller→gateway) to seed packet number."""
+    addr_to = gw_id.to_bytes(2, "big")  # is_from=False (bit 15 clear)
+    # payload: unknown_1(2) + packet_number(2) + unknown_2(1)
+    payload = bytes([0x00, 0x01]) + packet_number.to_bytes(2, "big") + bytes([0x04])
+    return _build_frame(addr_to, 0x0148, payload)
+
+
+def _build_receive_response(gw_id: int, status_bytes: bytes, pv_packets: bytes) -> bytes:
+    """Build a RECEIVE_RESPONSE frame (gateway→controller)."""
+    addr_from = (gw_id | 0x8000).to_bytes(2, "big")  # is_from=True (bit 15 set)
+    payload = status_bytes + pv_packets
+    return _build_frame(addr_from, 0x0149, payload)
+
+
+def _build_power_report_packet(node_id: int) -> bytes:
+    """Build a PV network packet containing a 13-byte power report.
+
+    Returns 7-byte header + 13-byte power report data.
+    """
+    # ReceivedPacketHeader: packet_type(1) + node_address(2) + short_address(2) + dsn(1) + data_length(1)
+    header = bytes([
+        0x31,  # packet_type = POWER_REPORT
+    ]) + node_id.to_bytes(2, "big") + bytes([
+        0x00, 0x0D,  # short_address
+        0x90,  # dsn
+        0x0D,  # data_length = 13 bytes
+    ])
+    # 13-byte power report: voltage_in_out(3) + duty_cycle(1) + current_temp(3) + unknown(3) + slot_counter(2) + rssi(1)
+    data = bytes([
+        0x0F, 0x27, 0x50,  # voltage_in=486(24.3V), voltage_out=592(59.2V)
+        0xFF,  # duty_cycle = 1.0
+        0x17, 0x07, 0xE0,  # current=184(0.92A), temp=2016(201.6°C? — test value)
+        0x96, 0x93, 0x00,  # unknown
+        0x64, 0xD4,  # slot_counter
+        0x74,  # rssi
+    ])
+    return header + data
+
+
+def test_h_firmware_receive_response_power_report():
+    """H-firmware status (bits 5-7 cleared) should parse and produce power reports.
+
+    H-firmware TAPs (H1.0007) send status byte[1] values like 0x1E/0x1F
+    instead of G-firmware's 0xFE/0xFF. Both encode the same fields via bits 0-4.
+    """
+    parser = Parser()
+    gw_id = 0x1203  # TAP3
+
+    # Seed packet number with RECEIVE_REQUEST
+    parser.feed(_build_receive_request(gw_id, 0x0049))
+
+    # H-firmware status 0x011E: bit 0=0 (rx_buffers present), bits 1-4=1 (others absent)
+    # Equivalent to G-firmware 0x01FE
+    status_bytes = bytes([
+        0x01, 0x1E,  # status_type (H-firmware)
+        0x02,  # rx_buffers_used
+        0x4A,  # packet_number_lo
+        0xD4, 0x57,  # slot_counter
+    ])
+    pv_packet = _build_power_report_packet(node_id=27)
+    resp_frame = _build_receive_response(gw_id, status_bytes, pv_packet)
+
+    events = parser.feed(resp_frame)
+    power_events = [e for e in events if e.event_type == "power_report"]
+    assert len(power_events) == 1, f"Expected 1 power report, got {len(power_events)}: {events}"
+    assert power_events[0].gateway_id == gw_id
+    assert power_events[0].node_id == 27
+
+
+def test_h_firmware_empty_receive_response():
+    """H-firmware status 0x011F (no optional fields, no PV packets) should parse without error."""
+    parser = Parser()
+    gw_id = 0x1202  # TAP2
+
+    parser.feed(_build_receive_request(gw_id, 0x00AC))
+
+    # H-firmware status 0x011F: all bits 0-4 set (no optional fields)
+    status_bytes = bytes([
+        0x01, 0x1F,  # status_type (H-firmware, no optional fields)
+        0xAD,  # packet_number_lo
+        0xD3, 0xCB,  # slot_counter
+    ])
+    resp_frame = _build_receive_response(gw_id, status_bytes, b"")
+
+    events = parser.feed(resp_frame)
+    power_events = [e for e in events if e.event_type == "power_report"]
+    assert len(power_events) == 0
+
+
+def test_g_firmware_receive_response_still_works():
+    """G-firmware status (bits 5-7 set) should continue to work as before."""
+    parser = Parser()
+    gw_id = 0x1201  # TAP1
+
+    parser.feed(_build_receive_request(gw_id, 0x40FB))
+
+    # G-firmware status 0x01FE: bit 0=0 (rx_buffers present), bits 1-4=1
+    status_bytes = bytes([
+        0x01, 0xFE,  # status_type (G-firmware)
+        0x02,  # rx_buffers_used
+        0xEA,  # packet_number_lo
+        0xD2, 0x42,  # slot_counter
+    ])
+    pv_packet = _build_power_report_packet(node_id=22)
+    resp_frame = _build_receive_response(gw_id, status_bytes, pv_packet)
+
+    events = parser.feed(resp_frame)
+    power_events = [e for e in events if e.event_type == "power_report"]
+    assert len(power_events) == 1
+    assert power_events[0].gateway_id == gw_id
+    assert power_events[0].node_id == 22

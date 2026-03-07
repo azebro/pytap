@@ -396,9 +396,10 @@ class Parser:
             return []
 
         # Parse variable-length receive response header
+        # Bits 0-4 determine which optional fields are present.
+        # Bits 5-7 are firmware-dependent flags (set on G-firmware, cleared on
+        # H-firmware) and do not affect the payload structure.
         status_type = int.from_bytes(payload[0:2], "big")
-        if (status_type & 0x00E0) != 0x00E0:
-            return []
 
         offset = 2
         if not (status_type & 0x0001):

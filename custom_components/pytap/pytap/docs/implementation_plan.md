@@ -989,7 +989,9 @@ match frame.frame_type:
 
 ```
 1. status_type = int.from_bytes(payload[0:2], 'big')
-2. if (status_type & 0x00E0) != 0x00E0: return []  # invalid
+2. # Bits 0-4 determine optional fields; bits 5-7 are firmware-dependent
+   # flags (G-firmware sets them, H-firmware clears them) with no effect
+   # on payload structure — do NOT validate bits 5-7.
 3. offset = 2
 4. if not (status_type & 0x0001): offset += 1   # rx_buffers_used
 5. if not (status_type & 0x0002): offset += 1   # tx_buffers_free
@@ -1755,7 +1757,8 @@ Bits 14-0: GatewayID (0-32767)
 
 ```
 Bytes 0-1: status_type (big-endian u16, bitmask)
-  Bits 5-7 MUST be set (mask 0x00E0)
+  Bits 5-7: firmware-dependent flags (no payload effect)
+            G-firmware (G8.65) sets them; H-firmware (H1.0007) clears them
   Bit 0 clear → +1 byte rx_buffers_used
   Bit 1 clear → +1 byte tx_buffers_free
   Bit 2 clear → +2 bytes unknown_a
