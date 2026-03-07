@@ -925,7 +925,12 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.warning("Failed to save coordinator state")
 
     def _schedule_save(self) -> None:
-        """Schedule a debounced save of coordinator state.
+        """Schedule a throttled save of coordinator state.
+
+        Uses a throttle pattern: if a save is already scheduled, let it fire
+        rather than cancelling and restarting. This guarantees the store is
+        written within SAVE_DELAY_SECONDS of the first change, even under
+        continuous high-frequency updates.
 
         Safe to call from the executor thread — dispatches to the HA event loop.
         """
@@ -933,15 +938,18 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         def _do_schedule() -> None:
             if self._save_task is not None:
-                self._save_task.cancel()
+                return  # Save already pending — let it fire on time
             self._save_task = self.hass.loop.call_later(
                 SAVE_DELAY_SECONDS,
-                lambda: self.hass.async_create_task(
-                    self._async_save_coordinator_state()
-                ),
+                lambda: self.hass.async_create_task(self._do_save()),
             )
 
         self.hass.loop.call_soon_threadsafe(_do_schedule)
+
+    async def _do_save(self) -> None:
+        """Execute the scheduled save and clear the timer handle."""
+        self._save_task = None
+        await self._async_save_coordinator_state()
 
     def reload_modules(self, modules: list[dict[str, Any]]) -> None:
         """Reload the module configuration (called from options flow).
