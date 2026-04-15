@@ -28,8 +28,10 @@ from .const import (
     CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
     CONF_MODULES,
+    CONF_WRITE_INTERVAL,
     DEFAULT_PEAK_POWER,
     DEFAULT_PORT,
+    DEFAULT_WRITE_INTERVAL,
     DOMAIN,
     ENERGY_GAP_THRESHOLD_SECONDS,
     ENERGY_LOW_POWER_THRESHOLD_W,
@@ -94,6 +96,9 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._host: str = entry.data[CONF_HOST]
         self._port: int = entry.data.get(CONF_PORT, DEFAULT_PORT)
         self._modules: list[dict[str, Any]] = entry.data.get(CONF_MODULES, [])
+        self._write_interval: float = float(
+            entry.data.get(CONF_WRITE_INTERVAL, DEFAULT_WRITE_INTERVAL)
+        )
 
         # Build barcode allowlist from configured modules
         self._configured_barcodes: set[str] = {
@@ -128,6 +133,10 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Listener task handle
         self._listener_task: asyncio.Task | None = None
         self._stop_event = threading.Event()
+
+        # Write-interval throttle state (accessed only from the listener thread)
+        self._last_ha_update: float = 0.0
+        self._ha_update_pending: bool = False
 
         # Midnight reset timer handle
         self._midnight_reset_unsub: asyncio.TimerHandle | None = None
@@ -318,14 +327,21 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         last_data_time = time.monotonic()
                         events = parser.feed(data)
                         for event in events:
-                            data_changed = self._process_event(event)
-                            if data_changed:
-                                # Push each event individually to HA
-                                self.data["counters"] = parser.counters
-                                self.hass.loop.call_soon_threadsafe(
-                                    self.async_set_updated_data,
-                                    dict(self.data),
-                                )
+                            if self._process_event(event):
+                                self._ha_update_pending = True
+
+                        # Push to HA at most once per write interval
+                        now = time.monotonic()
+                        if self._ha_update_pending and (
+                            now - self._last_ha_update >= self._write_interval
+                        ):
+                            self.data["counters"] = parser.counters
+                            self.hass.loop.call_soon_threadsafe(
+                                self.async_set_updated_data,
+                                dict(self.data),
+                            )
+                            self._last_ha_update = now
+                            self._ha_update_pending = False
                     elif (
                         RECONNECT_TIMEOUT > 0
                         and (time.monotonic() - last_data_time) > RECONNECT_TIMEOUT
@@ -341,6 +357,14 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     return
                 _LOGGER.error("Connection error: %s", err)
             finally:
+                # Flush any data that was held back by the write interval
+                if self._ha_update_pending:
+                    self.data["counters"] = parser.counters
+                    self.hass.loop.call_soon_threadsafe(
+                        self.async_set_updated_data,
+                        dict(self.data),
+                    )
+                    self._ha_update_pending = False
                 with self._source_lock:
                     if self._source is not None:
                         try:

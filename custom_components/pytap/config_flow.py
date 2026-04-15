@@ -32,8 +32,10 @@ from .const import (
     CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
     CONF_MODULES,
+    CONF_WRITE_INTERVAL,
     DEFAULT_PEAK_POWER,
     DEFAULT_PORT,
+    DEFAULT_WRITE_INTERVAL,
     DOMAIN,
 )
 
@@ -46,6 +48,9 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_HOST): str,
         vol.Optional(CONF_PORT, default=DEFAULT_PORT): int,
+        vol.Optional(CONF_WRITE_INTERVAL, default=DEFAULT_WRITE_INTERVAL): vol.All(
+            vol.Coerce(int), vol.Range(min=1, max=300)
+        ),
     }
 )
 
@@ -285,6 +290,9 @@ class PyTapOptionsFlow(OptionsFlow):
                 new_data = {**self._config_entry.data}
                 new_data[CONF_HOST] = new_host
                 new_data[CONF_PORT] = new_port
+                new_data[CONF_WRITE_INTERVAL] = user_input.get(
+                    CONF_WRITE_INTERVAL, DEFAULT_WRITE_INTERVAL
+                )
                 self.hass.config_entries.async_update_entry(
                     self._config_entry,
                     data=new_data,
@@ -295,10 +303,16 @@ class PyTapOptionsFlow(OptionsFlow):
         # Pre-fill with current values
         current_host = self._config_entry.data.get(CONF_HOST, "")
         current_port = self._config_entry.data.get(CONF_PORT, DEFAULT_PORT)
+        current_write_interval = self._config_entry.data.get(
+            CONF_WRITE_INTERVAL, DEFAULT_WRITE_INTERVAL
+        )
         schema = vol.Schema(
             {
                 vol.Required(CONF_HOST, default=current_host): str,
                 vol.Optional(CONF_PORT, default=current_port): int,
+                vol.Optional(
+                    CONF_WRITE_INTERVAL, default=current_write_interval
+                ): vol.All(vol.Coerce(int), vol.Range(min=1, max=300)),
             }
         )
 

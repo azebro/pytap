@@ -6,11 +6,13 @@
         "description": "Provide the connection details for your Tigo gateway.",
         "data": {
           "host": "Host",
-          "port": "Port"
+          "port": "Port",
+          "write_interval": "Write interval (seconds)"
         },
         "data_description": {
           "host": "The hostname or IP address of your Tigo gateway.",
-          "port": "The port number (default: 502)."
+          "port": "The port number (default: 502).",
+          "write_interval": "How often (in seconds) to push updates to Home Assistant. Higher values reduce CPU load. Default: 5 seconds."
         }
       },
       "modules_menu": {
@@ -137,11 +139,13 @@
         "description": "Update the IP address and port of your Tigo gateway.",
         "data": {
           "host": "Host",
-          "port": "Port"
+          "port": "Port",
+          "write_interval": "Write interval (seconds)"
         },
         "data_description": {
           "host": "The hostname or IP address of your Tigo gateway.",
-          "port": "The port number (default: 502)."
+          "port": "The port number (default: 502).",
+          "write_interval": "How often (in seconds) to push updates to Home Assistant. Higher values reduce CPU load. Default: 5 seconds."
         }
       },
       "add_module": {
