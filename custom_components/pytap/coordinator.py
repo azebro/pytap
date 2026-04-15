@@ -357,9 +357,10 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     return
                 _LOGGER.error("Connection error: %s", err)
             finally:
-                # Flush any data that was held back by the write interval
+                # Flush any data that was held back by the write interval.
+                # Skip updating counters here - parser may not have processed
+                # any data yet, and node/gateway data is what matters for sensors.
                 if self._ha_update_pending:
-                    self.data["counters"] = parser.counters
                     self.hass.loop.call_soon_threadsafe(
                         self.async_set_updated_data,
                         dict(self.data),

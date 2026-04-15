@@ -60,13 +60,15 @@ def _make_infra_event():
 
 def _make_power_event(power=100.0):
     """Build a minimal PowerReportEvent for barcode A-1234567B."""
+    voltage_in = 30.0
+    current_in = round(power / voltage_in, 4)
     return PowerReportEvent(
         gateway_id=1,
         node_id=1,
         barcode="A-1234567B",
-        voltage_in=30.0,
-        voltage_out=30.0,
-        current_in=3.0,
+        voltage_in=voltage_in,
+        voltage_out=voltage_in,
+        current_in=current_in,
         temperature=25.0,
         dc_dc_duty_cycle=0.5,
         rssi=-60,

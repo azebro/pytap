@@ -550,9 +550,9 @@ async def test_add_module_peak_power_validation(hass: HomeAssistant) -> None:
         )
 
 
-# ──────────────────────────────────────────────────────────
+# ----------------------------------------------------------
 # Options flow: reporting settings (write interval)
-# ──────────────────────────────────────────────────────────
+# ----------------------------------------------------------
 
 
 async def test_options_menu_includes_change_reporting(hass: HomeAssistant) -> None:
