@@ -6,13 +6,11 @@
         "description": "Provide the connection details for your Tigo gateway.",
         "data": {
           "host": "Host",
-          "port": "Port",
-          "write_interval": "Write interval (seconds)"
+          "port": "Port"
         },
         "data_description": {
           "host": "The hostname or IP address of your Tigo gateway.",
-          "port": "The port number (default: 502).",
-          "write_interval": "How often (in seconds) to push updates to Home Assistant. Higher values reduce CPU load. Default: 5 seconds."
+          "port": "The port number (default: 502)."
         }
       },
       "modules_menu": {
@@ -131,7 +129,8 @@
           "change_connection": "Change connection settings",
           "add_module": "Add a module",
           "remove_module": "Remove a module",
-          "done": "Save and close"
+          "done": "Save and close",
+          "change_reporting": "Change reporting settings"
         }
       },
       "change_connection": {
@@ -139,13 +138,11 @@
         "description": "Update the IP address and port of your Tigo gateway.",
         "data": {
           "host": "Host",
-          "port": "Port",
-          "write_interval": "Write interval (seconds)"
+          "port": "Port"
         },
         "data_description": {
           "host": "The hostname or IP address of your Tigo gateway.",
-          "port": "The port number (default: 502).",
-          "write_interval": "How often (in seconds) to push updates to Home Assistant. Higher values reduce CPU load. Default: 5 seconds."
+          "port": "The port number (default: 502)."
         }
       },
       "add_module": {
@@ -168,6 +165,16 @@
         "title": "Remove Module",
         "data": {
           "remove_barcode": "Select module to remove"
+        }
+      },
+      "change_reporting": {
+        "title": "Reporting Settings",
+        "description": "Configure how often this integration pushes data to Home Assistant.",
+        "data": {
+          "write_interval": "Write interval (seconds)"
+        },
+        "data_description": {
+          "write_interval": "How often (in seconds) to push updates to Home Assistant. Higher values reduce CPU load. Default: 5 seconds."
         }
       }
     }
