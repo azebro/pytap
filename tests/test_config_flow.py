@@ -16,8 +16,10 @@ from custom_components.pytap.const import (
     CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
     CONF_MODULES,
+    CONF_WRITE_INTERVAL,
     DEFAULT_PEAK_POWER,
     DEFAULT_PORT,
+    DEFAULT_WRITE_INTERVAL,
     DOMAIN,
 )
 
@@ -546,3 +548,121 @@ async def test_add_module_peak_power_validation(hass: HomeAssistant) -> None:
                 CONF_MODULE_PEAK_POWER: 0,
             },
         )
+
+
+# ----------------------------------------------------------
+# Options flow: reporting settings (write interval)
+# ----------------------------------------------------------
+
+
+async def test_options_menu_includes_change_reporting(hass: HomeAssistant) -> None:
+    """Test the options menu includes the change_reporting option."""
+    entry = _make_config_entry(hass)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "init"
+    assert "change_reporting" in result["menu_options"]
+
+
+async def test_options_change_reporting_shows_prefilled_form(
+    hass: HomeAssistant,
+) -> None:
+    """Selecting change_reporting shows a form pre-filled with the current write_interval."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        version=2,
+        title=f"PyTap ({MOCK_HOST})",
+        data={
+            "host": MOCK_HOST,
+            "port": MOCK_PORT,
+            CONF_WRITE_INTERVAL: 10,
+            CONF_MODULES: [],
+        },
+        unique_id="pytap_test_reporting",
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {"next_step_id": "change_reporting"},
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "change_reporting"
+    schema_dict = {str(k): k for k in result["data_schema"].schema}
+    wi_key = schema_dict["write_interval"]
+    assert wi_key.default() == 10
+
+
+async def test_options_change_reporting_updates_entry(
+    hass: HomeAssistant,
+) -> None:
+    """Submitting a new write_interval saves it and returns to the menu."""
+    entry = _make_config_entry(hass)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {"next_step_id": "change_reporting"},
+    )
+    assert result["step_id"] == "change_reporting"
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {CONF_WRITE_INTERVAL: 15},
+    )
+
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "init"
+    assert entry.data[CONF_WRITE_INTERVAL] == 15
+
+
+async def test_options_change_reporting_uses_default_when_absent(
+    hass: HomeAssistant,
+) -> None:
+    """Pre-fill defaults to DEFAULT_WRITE_INTERVAL when entry has no write_interval."""
+    entry = _make_config_entry(hass)  # entry has no write_interval key
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {"next_step_id": "change_reporting"},
+    )
+
+    schema_dict = {str(k): k for k in result["data_schema"].schema}
+    wi_key = schema_dict["write_interval"]
+    assert wi_key.default() == DEFAULT_WRITE_INTERVAL
+
+
+async def test_options_change_reporting_preserves_modules(
+    hass: HomeAssistant,
+) -> None:
+    """Changing write_interval must not alter the module list."""
+    entry = _make_config_entry(hass)
+    original_modules = list(entry.data[CONF_MODULES])
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {"next_step_id": "change_reporting"},
+    )
+    await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {CONF_WRITE_INTERVAL: 20},
+    )
+
+    assert entry.data[CONF_MODULES] == original_modules
+
+
+async def test_initial_setup_does_not_expose_write_interval(
+    hass: HomeAssistant,
+) -> None:
+    """The initial user step schema must NOT contain write_interval."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    assert result["step_id"] == "user"
+    schema_keys = {str(k) for k in result["data_schema"].schema}
+    assert "write_interval" not in schema_keys

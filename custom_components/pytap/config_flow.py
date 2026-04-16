@@ -5,7 +5,8 @@ one at a time via individual form fields (string group, name, barcode),
 rather than a comma-separated text blob.
 
 Flow: user (host/port) → modules_menu → add_module (repeat) → finish
-Options: init (menu) → add_module / remove_module → done
+Options: init (menu) → add_module / remove_module / change_connection /
+         change_reporting → done
 """
 
 from __future__ import annotations
@@ -32,8 +33,10 @@ from .const import (
     CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
     CONF_MODULES,
+    CONF_WRITE_INTERVAL,
     DEFAULT_PEAK_POWER,
     DEFAULT_PORT,
+    DEFAULT_WRITE_INTERVAL,
     DOMAIN,
 )
 
@@ -242,7 +245,13 @@ class PyTapOptionsFlow(OptionsFlow):
         """Show the options menu: change connection / add / remove / done."""
         return self.async_show_menu(
             step_id="init",
-            menu_options=["change_connection", "add_module", "remove_module", "done"],
+            menu_options=[
+                "change_connection",
+                "change_reporting",
+                "add_module",
+                "remove_module",
+                "done",
+            ],
             description_placeholders={
                 "modules_list": _modules_description(self._modules),
             },
@@ -306,6 +315,36 @@ class PyTapOptionsFlow(OptionsFlow):
             step_id="change_connection",
             data_schema=schema,
             errors=errors,
+        )
+
+    async def async_step_change_reporting(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Allow the user to change reporting settings (write interval)."""
+        if user_input is not None:
+            new_data = {**self._config_entry.data}
+            new_data[CONF_WRITE_INTERVAL] = user_input.get(
+                CONF_WRITE_INTERVAL, DEFAULT_WRITE_INTERVAL
+            )
+            self.hass.config_entries.async_update_entry(
+                self._config_entry, data=new_data
+            )
+            return await self.async_step_init()
+
+        current_write_interval = self._config_entry.data.get(
+            CONF_WRITE_INTERVAL, DEFAULT_WRITE_INTERVAL
+        )
+        schema = vol.Schema(
+            {
+                vol.Optional(
+                    CONF_WRITE_INTERVAL, default=current_write_interval
+                ): vol.All(vol.Coerce(int), vol.Range(min=1, max=300)),
+            }
+        )
+
+        return self.async_show_form(
+            step_id="change_reporting",
+            data_schema=schema,
         )
 
     async def async_step_add_module(
