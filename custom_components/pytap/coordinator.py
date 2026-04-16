@@ -54,6 +54,20 @@ _LOGGER = logging.getLogger(__name__)
 STORE_VERSION = 2
 SAVE_DELAY_SECONDS = 10
 
+# Numeric node fields that are averaged over the write interval before being
+# pushed to Home Assistant.  Averaging prevents the HA database from receiving
+# every raw reading while still giving a representative value per interval.
+_AVERAGED_FIELDS = (
+    "voltage_in",
+    "voltage_out",
+    "current_in",
+    "current_out",
+    "power",
+    "temperature",
+    "dc_dc_duty_cycle",
+    "rssi",
+)
+
 
 class _MigratingStore(Store):
     """Store subclass with explicit migration support.
@@ -137,6 +151,9 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Write-interval throttle state (accessed only from the listener thread)
         self._last_ha_update: float = 0.0
         self._ha_update_pending: bool = False
+        # Per-barcode buffer of raw numeric readings accumulated between HA
+        # writes.  Flushed (averaged) each time the write interval fires.
+        self._reading_buffers: dict[str, list[dict[str, Any]]] = {}
 
         # Midnight reset timer handle
         self._midnight_reset_unsub: asyncio.TimerHandle | None = None
@@ -330,15 +347,51 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             if self._process_event(event):
                                 self._ha_update_pending = True
 
-                        # Push to HA at most once per write interval
+                        # Push to HA at most once per write interval, sending
+                        # per-barcode averages over the buffered readings rather
+                        # than the most-recent raw snapshot.
                         now = time.monotonic()
                         if self._ha_update_pending and (
                             now - self._last_ha_update >= self._write_interval
                         ):
                             self.data["counters"] = parser.counters
+                            # Build averaged node snapshots for the HA push.
+                            # self.data["nodes"] retains the latest values for
+                            # persistence; only the snapshot sent to HA is averaged.
+                            snapshot_nodes = dict(self.data["nodes"])
+                            for barcode, readings in self._reading_buffers.items():
+                                node = snapshot_nodes.get(barcode)
+                                if node is None or not readings:
+                                    continue
+                                avg_node = dict(node)
+                                for field in _AVERAGED_FIELDS:
+                                    values = [
+                                        r[field]
+                                        for r in readings
+                                        if r[field] is not None
+                                    ]
+                                    avg_node[field] = (
+                                        round(sum(values) / len(values), 3)
+                                        if values
+                                        else None
+                                    )
+                                # Recompute performance from averaged power
+                                if avg_node["power"] is not None:
+                                    avg_node["performance"] = round(
+                                        (
+                                            max(avg_node["power"], 0.0)
+                                            / avg_node["peak_power"]
+                                        )
+                                        * 100.0,
+                                        2,
+                                    )
+                                else:
+                                    avg_node["performance"] = None
+                                snapshot_nodes[barcode] = avg_node
+                            self._reading_buffers.clear()
                             self.hass.loop.call_soon_threadsafe(
                                 self.async_set_updated_data,
-                                dict(self.data),
+                                {**self.data, "nodes": snapshot_nodes},
                             )
                             self._last_ha_update = now
                             self._ha_update_pending = False
@@ -360,7 +413,9 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # Flush any data that was held back by the write interval.
                 # Skip updating counters here - parser may not have processed
                 # any data yet, and node/gateway data is what matters for sensors.
+                # On disconnect we discard the buffer and send the latest values.
                 if self._ha_update_pending:
+                    self._reading_buffers.clear()
                     self.hass.loop.call_soon_threadsafe(
                         self.async_set_updated_data,
                         dict(self.data),
@@ -577,6 +632,9 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "daily_reset_date": acc.daily_reset_date,
             "last_update": now.isoformat(),
         }
+        self._reading_buffers.setdefault(barcode, []).append(
+            {field: self.data["nodes"][barcode][field] for field in _AVERAGED_FIELDS}
+        )
         self._schedule_save()
         return True
 

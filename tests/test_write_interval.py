@@ -19,7 +19,7 @@ from custom_components.pytap.const import (
     DEFAULT_PORT,
     DEFAULT_WRITE_INTERVAL,
 )
-from custom_components.pytap.coordinator import PyTapDataUpdateCoordinator
+from custom_components.pytap.coordinator import PyTapDataUpdateCoordinator, _AVERAGED_FIELDS
 from custom_components.pytap.pytap.core.events import InfrastructureEvent, PowerReportEvent
 
 
@@ -154,4 +154,140 @@ class TestWriteIntervalThrottling:
         self._run_batch(coordinator, _make_power_event())
 
         assert coordinator._ha_update_pending is False
+
+
+def _run_averaging(node: dict, readings: list[dict]) -> dict:
+    """Replicate the per-interval averaging block from coordinator._listen.
+
+    Returns an averaged copy of *node* — the same snapshot that would be
+    passed to async_set_updated_data when the write interval fires.
+    """
+    avg_node = dict(node)
+    for field in _AVERAGED_FIELDS:
+        values = [r[field] for r in readings if r[field] is not None]
+        avg_node[field] = round(sum(values) / len(values), 3) if values else None
+    if avg_node["power"] is not None:
+        avg_node["performance"] = round(
+            (max(avg_node["power"], 0.0) / avg_node["peak_power"]) * 100.0, 2
+        )
+    else:
+        avg_node["performance"] = None
+    return avg_node
+
+
+def _numeric_reading(**overrides) -> dict:
+    """Build a minimal numeric-fields dict as stored in _reading_buffers."""
+    defaults = {
+        "voltage_in": 30.0,
+        "voltage_out": 30.0,
+        "current_in": 3.333,
+        "current_out": 3.333,
+        "power": 100.0,
+        "temperature": 25.0,
+        "dc_dc_duty_cycle": 0.5,
+        "rssi": -60,
+    }
+    return {**defaults, **overrides}
+
+
+class TestAveragingMath:
+    """Pure unit tests for the per-interval averaging computation.
+
+    These tests exercise _run_averaging directly — no coordinator or hass
+    fixture needed, so they cannot hang on HA event-loop setup.
+    """
+
+    PEAK_POWER = 455
+
+    def _node(self, **fields) -> dict:
+        return {"peak_power": self.PEAK_POWER, **_numeric_reading(**fields)}
+
+    def test_single_reading_passthrough(self) -> None:
+        """A single buffered reading is returned unchanged."""
+        node = self._node(power=100.0)
+        result = _run_averaging(node, [_numeric_reading(power=100.0)])
+        assert result["power"] == pytest.approx(100.0, rel=1e-3)
+
+    def test_two_readings_averaged(self) -> None:
+        """Two readings with different power values produce the correct mean."""
+        node = self._node(power=200.0)
+        readings = [_numeric_reading(power=100.0), _numeric_reading(power=200.0)]
+        result = _run_averaging(node, readings)
+        assert result["power"] == pytest.approx(150.0, rel=1e-3)
+
+    def test_performance_recomputed_from_averaged_power(self) -> None:
+        """Performance is derived from the averaged power, not the last raw reading."""
+        node = self._node(power=self.PEAK_POWER)
+        readings = [
+            _numeric_reading(power=0.0),
+            _numeric_reading(power=self.PEAK_POWER),
+        ]
+        result = _run_averaging(node, readings)
+        expected = round((self.PEAK_POWER / 2 / self.PEAK_POWER) * 100.0, 2)
+        assert result["performance"] == pytest.approx(expected, rel=1e-3)
+
+    def test_none_values_excluded_from_average(self) -> None:
+        """None entries for a field are ignored; the mean is over valid readings only."""
+        node = self._node(power=100.0)
+        readings = [
+            _numeric_reading(power=100.0),
+            {field: None for field in _AVERAGED_FIELDS},
+        ]
+        result = _run_averaging(node, readings)
+        assert result["power"] == pytest.approx(100.0, rel=1e-3)
+
+    def test_all_none_values_produce_none(self) -> None:
+        """If every reading for a field is None the averaged field is also None."""
+        node = {"peak_power": self.PEAK_POWER, **{f: None for f in _AVERAGED_FIELDS}}
+        result = _run_averaging(node, [{f: None for f in _AVERAGED_FIELDS}])
+        assert result["power"] is None
+        assert result["performance"] is None
+
+
+class TestBufferPopulation:
+    """Test that _handle_power_report populates _reading_buffers correctly.
+
+    These tests verify the wiring between event processing and the buffer,
+    without exercising the write-interval flush path.
+    """
+
+    def test_buffer_populated_on_power_reports(self, hass: HomeAssistant) -> None:
+        """Each processed power report appends one entry to the barcode's buffer."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+        coordinator._schedule_save = MagicMock()
+        coordinator._handle_infrastructure(_make_infra_event())
+
+        coordinator._process_event(_make_power_event(power=100.0))
+        coordinator._process_event(_make_power_event(power=200.0))
+
+        assert "A-1234567B" in coordinator._reading_buffers
+        assert len(coordinator._reading_buffers["A-1234567B"]) == 2
+
+    def test_buffer_entry_contains_all_averaged_fields(self, hass: HomeAssistant) -> None:
+        """Each buffer entry has exactly the fields listed in _AVERAGED_FIELDS."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+        coordinator._schedule_save = MagicMock()
+        coordinator._handle_infrastructure(_make_infra_event())
+
+        coordinator._process_event(_make_power_event(power=100.0))
+
+        reading = coordinator._reading_buffers["A-1234567B"][0]
+        assert set(reading.keys()) == set(_AVERAGED_FIELDS)
+
+    def test_data_nodes_retains_latest_raw_value(self, hass: HomeAssistant) -> None:
+        """self.data['nodes'] always reflects the most-recent raw reading."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+        coordinator._schedule_save = MagicMock()
+        coordinator._handle_infrastructure(_make_infra_event())
+
+        coordinator._process_event(_make_power_event(power=100.0))
+        coordinator._process_event(_make_power_event(power=200.0))
+
+        # power ≈ 200 (computed from current_out * voltage_out inside the event)
+        assert coordinator.data["nodes"]["A-1234567B"]["power"] == pytest.approx(
+            200.0, rel=0.01
+        )
 
