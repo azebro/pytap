@@ -156,92 +156,168 @@ class TestWriteIntervalThrottling:
         assert coordinator._ha_update_pending is False
 
 
-def _run_averaging(node: dict, readings: list[dict]) -> dict:
-    """Replicate the per-interval averaging block from coordinator._listen.
-
-    Returns an averaged copy of *node* — the same snapshot that would be
-    passed to async_set_updated_data when the write interval fires.
-    """
-    avg_node = dict(node)
-    for field in _AVERAGED_FIELDS:
-        values = [r[field] for r in readings if r[field] is not None]
-        avg_node[field] = round(sum(values) / len(values), 3) if values else None
-    if avg_node["power"] is not None:
-        avg_node["performance"] = round(
-            (max(avg_node["power"], 0.0) / avg_node["peak_power"]) * 100.0, 2
-        )
-    else:
-        avg_node["performance"] = None
-    return avg_node
+MOCK_MODULES_TWO = [
+    {
+        CONF_MODULE_STRING: "A",
+        CONF_MODULE_NAME: "Panel_01",
+        CONF_MODULE_BARCODE: "A-1234567B",
+        CONF_MODULE_PEAK_POWER: 455,
+    },
+    {
+        CONF_MODULE_STRING: "A",
+        CONF_MODULE_NAME: "Panel_02",
+        CONF_MODULE_BARCODE: "B-9876543C",
+        CONF_MODULE_PEAK_POWER: 455,
+    },
+]
 
 
-def _numeric_reading(**overrides) -> dict:
-    """Build a minimal numeric-fields dict as stored in _reading_buffers."""
-    defaults = {
-        "voltage_in": 30.0,
-        "voltage_out": 30.0,
-        "current_in": 3.333,
-        "current_out": 3.333,
-        "power": 100.0,
-        "temperature": 25.0,
-        "dc_dc_duty_cycle": 0.5,
-        "rssi": -60,
+def _make_entry_two_modules(hass):
+    entry = MagicMock()
+    entry.data = {
+        CONF_HOST: "192.168.1.100",
+        CONF_PORT: DEFAULT_PORT,
+        CONF_MODULES: MOCK_MODULES_TWO,
     }
-    return {**defaults, **overrides}
+    entry.entry_id = "test_snapshot_entry"
+    entry.options = {}
+    return entry
 
 
-class TestAveragingMath:
-    """Pure unit tests for the per-interval averaging computation.
+class TestAveragedSnapshot:
+    """Tests for coordinator._build_averaged_snapshot().
 
-    These tests exercise _run_averaging directly — no coordinator or hass
-    fixture needed, so they cannot hang on HA event-loop setup.
+    These call the actual production method — not a duplicate — and verify
+    that the snapshot data emitted to HA carries per-node averages.
     """
 
+    BARCODE_A = "A-1234567B"
+    BARCODE_B = "B-9876543C"
     PEAK_POWER = 455
 
-    def _node(self, **fields) -> dict:
-        return {"peak_power": self.PEAK_POWER, **_numeric_reading(**fields)}
+    def _reading(self, power: float) -> dict:
+        """Build a numeric-fields dict as stored in _reading_buffers."""
+        current = round(power / 30.0, 4)
+        return {
+            "voltage_in": 30.0,
+            "voltage_out": 30.0,
+            "current_in": current,
+            "current_out": current,
+            "power": power,
+            "temperature": 25.0,
+            "dc_dc_duty_cycle": 0.5,
+            "rssi": -60,
+        }
 
-    def test_single_reading_passthrough(self) -> None:
-        """A single buffered reading is returned unchanged."""
-        node = self._node(power=100.0)
-        result = _run_averaging(node, [_numeric_reading(power=100.0)])
-        assert result["power"] == pytest.approx(100.0, rel=1e-3)
+    def _seed(self, coordinator, barcode: str, readings: list[dict]) -> None:
+        """Plant a node entry and buffer readings directly."""
+        coordinator.data["nodes"][barcode] = {
+            "name": barcode,
+            "peak_power": self.PEAK_POWER,
+            **readings[-1],
+            "performance": None,
+            "daily_energy_wh": 0.0,
+            "total_energy_wh": 0.0,
+            "readings_today": len(readings),
+            "daily_reset_date": "",
+            "last_update": None,
+        }
+        coordinator._reading_buffers[barcode] = list(readings)
 
-    def test_two_readings_averaged(self) -> None:
-        """Two readings with different power values produce the correct mean."""
-        node = self._node(power=200.0)
-        readings = [_numeric_reading(power=100.0), _numeric_reading(power=200.0)]
-        result = _run_averaging(node, readings)
-        assert result["power"] == pytest.approx(150.0, rel=1e-3)
+    def test_single_reading_passthrough(self, hass: HomeAssistant) -> None:
+        """A single buffered reading is passed through to the snapshot unchanged."""
+        coordinator = PyTapDataUpdateCoordinator(hass, _make_entry(hass))
+        coordinator._schedule_save = MagicMock()
+        self._seed(coordinator, self.BARCODE_A, [self._reading(100.0)])
 
-    def test_performance_recomputed_from_averaged_power(self) -> None:
-        """Performance is derived from the averaged power, not the last raw reading."""
-        node = self._node(power=self.PEAK_POWER)
-        readings = [
-            _numeric_reading(power=0.0),
-            _numeric_reading(power=self.PEAK_POWER),
-        ]
-        result = _run_averaging(node, readings)
+        snapshot = coordinator._build_averaged_snapshot()
+
+        assert snapshot["nodes"][self.BARCODE_A]["power"] == pytest.approx(100.0, rel=1e-3)
+
+    def test_two_readings_averaged(self, hass: HomeAssistant) -> None:
+        """Two readings produce the correct per-node mean in the snapshot."""
+        coordinator = PyTapDataUpdateCoordinator(hass, _make_entry(hass))
+        coordinator._schedule_save = MagicMock()
+        self._seed(coordinator, self.BARCODE_A, [self._reading(100.0), self._reading(200.0)])
+
+        snapshot = coordinator._build_averaged_snapshot()
+
+        assert snapshot["nodes"][self.BARCODE_A]["power"] == pytest.approx(150.0, rel=1e-3)
+
+    def test_performance_recomputed_from_averaged_power(self, hass: HomeAssistant) -> None:
+        """Performance in the snapshot is derived from the averaged power."""
+        coordinator = PyTapDataUpdateCoordinator(hass, _make_entry(hass))
+        coordinator._schedule_save = MagicMock()
+        self._seed(
+            coordinator,
+            self.BARCODE_A,
+            [self._reading(0.0), self._reading(self.PEAK_POWER)],
+        )
+
+        snapshot = coordinator._build_averaged_snapshot()
+
         expected = round((self.PEAK_POWER / 2 / self.PEAK_POWER) * 100.0, 2)
-        assert result["performance"] == pytest.approx(expected, rel=1e-3)
+        assert snapshot["nodes"][self.BARCODE_A]["performance"] == pytest.approx(
+            expected, rel=1e-3
+        )
 
-    def test_none_values_excluded_from_average(self) -> None:
-        """None entries for a field are ignored; the mean is over valid readings only."""
-        node = self._node(power=100.0)
-        readings = [
-            _numeric_reading(power=100.0),
-            {field: None for field in _AVERAGED_FIELDS},
+    def test_none_values_excluded_from_average(self, hass: HomeAssistant) -> None:
+        """None entries for a field are excluded; mean is over valid readings only."""
+        coordinator = PyTapDataUpdateCoordinator(hass, _make_entry(hass))
+        coordinator._schedule_save = MagicMock()
+        self._seed(coordinator, self.BARCODE_A, [self._reading(100.0)])
+        coordinator._reading_buffers[self.BARCODE_A].append(
+            {f: None for f in _AVERAGED_FIELDS}
+        )
+
+        snapshot = coordinator._build_averaged_snapshot()
+
+        assert snapshot["nodes"][self.BARCODE_A]["power"] == pytest.approx(100.0, rel=1e-3)
+
+    def test_all_none_values_produce_none(self, hass: HomeAssistant) -> None:
+        """If every reading for a field is None the snapshot field is also None."""
+        coordinator = PyTapDataUpdateCoordinator(hass, _make_entry(hass))
+        coordinator._schedule_save = MagicMock()
+        coordinator.data["nodes"][self.BARCODE_A] = {
+            "name": self.BARCODE_A,
+            "peak_power": self.PEAK_POWER,
+            **{f: None for f in _AVERAGED_FIELDS},
+        }
+        coordinator._reading_buffers[self.BARCODE_A] = [
+            {f: None for f in _AVERAGED_FIELDS}
         ]
-        result = _run_averaging(node, readings)
-        assert result["power"] == pytest.approx(100.0, rel=1e-3)
 
-    def test_all_none_values_produce_none(self) -> None:
-        """If every reading for a field is None the averaged field is also None."""
-        node = {"peak_power": self.PEAK_POWER, **{f: None for f in _AVERAGED_FIELDS}}
-        result = _run_averaging(node, [{f: None for f in _AVERAGED_FIELDS}])
-        assert result["power"] is None
-        assert result["performance"] is None
+        snapshot = coordinator._build_averaged_snapshot()
+
+        assert snapshot["nodes"][self.BARCODE_A]["power"] is None
+        assert snapshot["nodes"][self.BARCODE_A]["performance"] is None
+
+    def test_per_node_isolation(self, hass: HomeAssistant) -> None:
+        """Readings from different nodes MUST NOT affect each other's averages."""
+        coordinator = PyTapDataUpdateCoordinator(hass, _make_entry_two_modules(hass))
+        coordinator._schedule_save = MagicMock()
+        # Node A: 100 + 300 → mean 200
+        self._seed(coordinator, self.BARCODE_A, [self._reading(100.0), self._reading(300.0)])
+        # Node B: 50 + 50 → mean 50  (unchanged regardless of Node A's readings)
+        self._seed(coordinator, self.BARCODE_B, [self._reading(50.0), self._reading(50.0)])
+
+        snapshot = coordinator._build_averaged_snapshot()
+
+        assert snapshot["nodes"][self.BARCODE_A]["power"] == pytest.approx(200.0, rel=1e-3)
+        assert snapshot["nodes"][self.BARCODE_B]["power"] == pytest.approx(50.0, rel=1e-3)
+
+    def test_self_data_nodes_not_mutated(self, hass: HomeAssistant) -> None:
+        """_build_averaged_snapshot must not mutate self.data['nodes']."""
+        coordinator = PyTapDataUpdateCoordinator(hass, _make_entry(hass))
+        coordinator._schedule_save = MagicMock()
+        self._seed(coordinator, self.BARCODE_A, [self._reading(100.0), self._reading(200.0)])
+
+        coordinator._build_averaged_snapshot()
+
+        # Latest raw value (200) must be preserved for persistence
+        assert coordinator.data["nodes"][self.BARCODE_A]["power"] == pytest.approx(
+            200.0, rel=1e-3
+        )
 
 
 class TestBufferPopulation:

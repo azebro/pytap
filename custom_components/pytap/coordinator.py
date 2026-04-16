@@ -355,43 +355,25 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             now - self._last_ha_update >= self._write_interval
                         ):
                             self.data["counters"] = parser.counters
-                            # Build averaged node snapshots for the HA push.
-                            # self.data["nodes"] retains the latest values for
-                            # persistence; only the snapshot sent to HA is averaged.
-                            snapshot_nodes = dict(self.data["nodes"])
-                            for barcode, readings in self._reading_buffers.items():
-                                node = snapshot_nodes.get(barcode)
-                                if node is None or not readings:
-                                    continue
-                                avg_node = dict(node)
-                                for field in _AVERAGED_FIELDS:
-                                    values = [
-                                        r[field]
-                                        for r in readings
-                                        if r[field] is not None
-                                    ]
-                                    avg_node[field] = (
-                                        round(sum(values) / len(values), 3)
-                                        if values
-                                        else None
-                                    )
-                                # Recompute performance from averaged power
-                                if avg_node["power"] is not None:
-                                    avg_node["performance"] = round(
-                                        (
-                                            max(avg_node["power"], 0.0)
-                                            / avg_node["peak_power"]
-                                        )
-                                        * 100.0,
-                                        2,
-                                    )
-                                else:
-                                    avg_node["performance"] = None
-                                snapshot_nodes[barcode] = avg_node
+                            snapshot = self._build_averaged_snapshot()
+                            per_node_counts = {
+                                barcode: len(readings)
+                                for barcode, readings in self._reading_buffers.items()
+                                if readings and barcode in snapshot["nodes"]
+                            }
+                            _LOGGER.debug(
+                                "HA update: %d node(s) — %s",
+                                len(per_node_counts),
+                                ", ".join(
+                                    f"{snapshot['nodes'][b].get('name', b)}: "
+                                    f"{n} reading(s)"
+                                    for b, n in per_node_counts.items()
+                                ),
+                            )
                             self._reading_buffers.clear()
                             self.hass.loop.call_soon_threadsafe(
                                 self.async_set_updated_data,
-                                {**self.data, "nodes": snapshot_nodes},
+                                snapshot,
                             )
                             self._last_ha_update = now
                             self._ha_update_pending = False
@@ -788,6 +770,38 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # -------------------------------------------------------------------
     #  Persistence helpers
     # -------------------------------------------------------------------
+
+    def _build_averaged_snapshot(self) -> dict[str, Any]:
+        """Return the data snapshot to push to Home Assistant.
+
+        For each barcode in ``_reading_buffers``, the buffered numeric
+        readings are averaged and written into a copy of the node dict.
+        ``self.data["nodes"]`` is **not** mutated — the raw latest values
+        are preserved there for persistence; only the returned snapshot
+        carries averaged values.
+
+        Must be called before ``_reading_buffers`` is cleared.
+        """
+        snapshot_nodes = dict(self.data["nodes"])
+        for barcode, readings in self._reading_buffers.items():
+            node = snapshot_nodes.get(barcode)
+            if node is None or not readings:
+                continue
+            avg_node = dict(node)
+            for field in _AVERAGED_FIELDS:
+                values = [r[field] for r in readings if r[field] is not None]
+                avg_node[field] = (
+                    round(sum(values) / len(values), 3) if values else None
+                )
+            if avg_node["power"] is not None:
+                avg_node["performance"] = round(
+                    (max(avg_node["power"], 0.0) / avg_node["peak_power"]) * 100.0,
+                    2,
+                )
+            else:
+                avg_node["performance"] = None
+            snapshot_nodes[barcode] = avg_node
+        return {**self.data, "nodes": snapshot_nodes}
 
     def _build_node_payload(
         self,
