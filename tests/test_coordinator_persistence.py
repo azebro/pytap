@@ -1216,7 +1216,7 @@ class TestStaleDataCheck:
 
         assert coordinator._stale_check_unsub is not None
 
-    def test_stop_cancels_stale_timer(self, hass: HomeAssistant) -> None:
+    async def test_stop_cancels_stale_timer(self, hass: HomeAssistant) -> None:
         """Stopping the listener should cancel the stale-data timer."""
         entry = _make_entry(hass)
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
@@ -1224,9 +1224,7 @@ class TestStaleDataCheck:
         mock_timer = MagicMock()
         coordinator._stale_check_unsub = mock_timer
 
-        import asyncio
-
-        asyncio.get_event_loop().run_until_complete(coordinator.async_stop_listener())
+        await coordinator.async_stop_listener()
 
         mock_timer.cancel.assert_called_once()
         assert coordinator._stale_check_unsub is None
