@@ -110,12 +110,12 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._host: str = entry.data[CONF_HOST]
         self._port: int = entry.data.get(CONF_PORT, DEFAULT_PORT)
         self._modules: list[dict[str, Any]] = entry.data.get(CONF_MODULES, [])
-        raw_write_interval = entry.data.get(CONF_WRITE_INTERVAL, DEFAULT_WRITE_INTERVAL)
-        try:
-            write_interval = float(raw_write_interval)
-        except (TypeError, ValueError):
-            write_interval = float(DEFAULT_WRITE_INTERVAL)
-        self._write_interval: float = max(0.0, write_interval)
+raw_write_interval = entry.data.get(CONF_WRITE_INTERVAL, DEFAULT_WRITE_INTERVAL)
+try:
+    self._write_interval: float = float(raw_write_interval)
+except (TypeError, ValueError):
+    self._write_interval = float(DEFAULT_WRITE_INTERVAL)
+self._write_interval = max(0.0, self._write_interval)
 
         # Build barcode allowlist from configured modules
         self._configured_barcodes: set[str] = {
@@ -350,36 +350,36 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             if self._process_event(event):
                                 self._ha_update_pending = True
 
-                    # Push to HA at most once per write interval, sending
-                    # per-barcode averages over the buffered readings rather
-                    # than the most-recent raw snapshot.
-                    now = time.monotonic()
-                    if self._ha_update_pending and (
-                        now - self._last_ha_update >= self._write_interval
-                    ):
-                        self.data["counters"] = parser.counters
-                        snapshot = self._build_averaged_snapshot()
-                        per_node_counts = {
-                            barcode: len(readings)
-                            for barcode, readings in self._reading_buffers.items()
-                            if readings and barcode in snapshot["nodes"]
-                        }
-                        _LOGGER.debug(
-                            "HA update: %d node(s) — %s",
-                            len(per_node_counts),
-                            ", ".join(
-                                f"{snapshot['nodes'][b].get('name', b)}: "
-                                f"{n} reading(s)"
-                                for b, n in per_node_counts.items()
-                            ),
-                        )
-                        self._reading_buffers.clear()
-                        self.hass.loop.call_soon_threadsafe(
-                            self.async_set_updated_data,
-                            snapshot,
-                        )
-                        self._last_ha_update = now
-                        self._ha_update_pending = False
+                        # Push to HA at most once per write interval, sending
+                        # per-barcode averages over the buffered readings rather
+                        # than the most-recent raw snapshot.
+                        now = time.monotonic()
+                        if self._ha_update_pending and (
+                            now - self._last_ha_update >= self._write_interval
+                        ):
+                            self.data["counters"] = parser.counters
+                            snapshot = self._build_averaged_snapshot()
+                            per_node_counts = {
+                                barcode: len(readings)
+                                for barcode, readings in self._reading_buffers.items()
+                                if readings and barcode in snapshot["nodes"]
+                            }
+                            _LOGGER.debug(
+                                "HA update: %d node(s) — %s",
+                                len(per_node_counts),
+                                ", ".join(
+                                    f"{snapshot['nodes'][b].get('name', b)}: "
+                                    f"{n} reading(s)"
+                                    for b, n in per_node_counts.items()
+                                ),
+                            )
+                            self._reading_buffers.clear()
+                            self.hass.loop.call_soon_threadsafe(
+                                self.async_set_updated_data,
+                                snapshot,
+                            )
+                            self._last_ha_update = now
+                            self._ha_update_pending = False
                     elif (
                         RECONNECT_TIMEOUT > 0
                         and (time.monotonic() - last_data_time) > RECONNECT_TIMEOUT

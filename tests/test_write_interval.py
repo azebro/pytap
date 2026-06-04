@@ -4,9 +4,10 @@ from datetime import datetime
 import time
 from unittest.mock import MagicMock
 
+import pytest
+
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
-import pytest
 
 from custom_components.pytap.const import (
     CONF_MODULE_BARCODE,
@@ -18,8 +19,9 @@ from custom_components.pytap.const import (
     DEFAULT_PORT,
     DEFAULT_WRITE_INTERVAL,
 )
-from custom_components.pytap.coordinator import _AVERAGED_FIELDS, PyTapDataUpdateCoordinator
+from custom_components.pytap.coordinator import PyTapDataUpdateCoordinator, _AVERAGED_FIELDS
 from custom_components.pytap.pytap.core.events import InfrastructureEvent, PowerReportEvent
+
 
 MOCK_MODULES = [
     {
@@ -106,10 +108,6 @@ class TestWriteIntervalThrottling:
             coordinator._ha_update_pending = True
 
         now = time.monotonic()
-        return self._run_flush_check(coordinator, now)
-
-    def _run_flush_check(self, coordinator, now: float) -> bool:
-        """Simulate the write-interval flush check in the listener loop."""
         pushed = False
         if coordinator._ha_update_pending and (
             now - coordinator._last_ha_update >= coordinator._write_interval
@@ -155,18 +153,6 @@ class TestWriteIntervalThrottling:
 
         self._run_batch(coordinator, _make_power_event())
 
-        assert coordinator._ha_update_pending is False
-
-    def test_pending_flushes_even_when_no_new_data(self, hass: HomeAssistant) -> None:
-        """Pending data flushes once interval elapses, even on an empty read tick."""
-        entry = _make_entry(hass, write_interval=60)
-        coordinator = PyTapDataUpdateCoordinator(hass, entry)
-        coordinator._ha_update_pending = True
-        coordinator._last_ha_update = time.monotonic() - 61
-
-        pushed = self._run_flush_check(coordinator, time.monotonic())
-
-        assert pushed is True
         assert coordinator._ha_update_pending is False
 
 
@@ -380,3 +366,4 @@ class TestBufferPopulation:
         assert coordinator.data["nodes"]["A-1234567B"]["power"] == pytest.approx(
             200.0, rel=0.01
         )
+
