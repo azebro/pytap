@@ -4,7 +4,6 @@ Validates that legacy ``voltage`` and ``current`` entity unique IDs from
 pre-v0.2.0 are removed from the entity registry when the integration loads.
 """
 
-
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
@@ -22,11 +21,13 @@ from custom_components.pytap.const import (
     CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
     CONF_MODULES,
+    CONF_WRITE_INTERVAL,
     DEFAULT_LIVE_REPORTING,
     DEFAULT_PEAK_POWER,
     DEFAULT_PORT,
     DEFAULT_STRING_NAME,
     DOMAIN,
+    MIN_WRITE_INTERVAL,
 )
 
 MOCK_MODULES = [
@@ -340,3 +341,33 @@ class TestConfigEntryMigration:
         assert result is True
         assert entry.version == CONFIG_ENTRY_VERSION
         assert entry.data[CONF_LIVE_REPORTING] is False
+
+    async def test_migrate_v4_to_v5_clamps_small_write_interval(
+        self, hass: HomeAssistant
+    ) -> None:
+        """v4 → v5: a stale sub-minimum write_interval is clamped into range."""
+        entry = _make_entry(hass, version=4, modules=[])
+        hass.config_entries.async_update_entry(
+            entry, data={**entry.data, CONF_WRITE_INTERVAL: 1}
+        )
+
+        result = await async_migrate_entry(hass, entry)
+
+        assert result is True
+        assert entry.version == CONFIG_ENTRY_VERSION
+        assert entry.data[CONF_WRITE_INTERVAL] == MIN_WRITE_INTERVAL
+
+    async def test_migrate_v4_to_v5_preserves_valid_write_interval(
+        self, hass: HomeAssistant
+    ) -> None:
+        """v4 → v5: an in-range write_interval is left unchanged."""
+        entry = _make_entry(hass, version=4, modules=[])
+        hass.config_entries.async_update_entry(
+            entry, data={**entry.data, CONF_WRITE_INTERVAL: 60}
+        )
+
+        result = await async_migrate_entry(hass, entry)
+
+        assert result is True
+        assert entry.version == CONFIG_ENTRY_VERSION
+        assert entry.data[CONF_WRITE_INTERVAL] == 60

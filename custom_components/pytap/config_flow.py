@@ -40,6 +40,8 @@ from .const import (
     DEFAULT_PORT,
     DEFAULT_WRITE_INTERVAL,
     DOMAIN,
+    MAX_WRITE_INTERVAL,
+    MIN_WRITE_INTERVAL,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -322,48 +324,73 @@ class PyTapOptionsFlow(OptionsFlow):
     async def async_step_change_reporting(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Allow the user to change reporting settings.
+        """Toggle live reporting.
 
-        Presents a 'Live reporting' checkbox (default ON) that delivers
-        readings as they arrive.  When unchecked, a write_interval field
-        appears and readings are cached, then pushed as a time-weighted
-        average every ``write_interval`` seconds.
+        Live reporting is presented on its own step with just the checkbox.
+        Home Assistant's static forms cannot grey out a field reactively, so
+        the reporting interval is collected on a separate ``set_interval``
+        step that is only reached when live reporting is turned off. When it
+        is left on, the interval is irrelevant and never shown.
         """
         if user_input is not None:
-            new_data = {**self._config_entry.data}
             live = user_input.get(CONF_LIVE_REPORTING, DEFAULT_LIVE_REPORTING)
-            new_data[CONF_LIVE_REPORTING] = live
             if live:
-                # Live mode — clear any stored interval
+                # Live mode — clear any stored interval and finish.
+                new_data = {**self._config_entry.data}
+                new_data[CONF_LIVE_REPORTING] = True
                 new_data.pop(CONF_WRITE_INTERVAL, None)
-            else:
-                new_data[CONF_WRITE_INTERVAL] = user_input.get(
-                    CONF_WRITE_INTERVAL, DEFAULT_WRITE_INTERVAL
+                self.hass.config_entries.async_update_entry(
+                    self._config_entry, data=new_data
                 )
+                return await self.async_step_init()
+            # Interval mode — collect the interval on the next step.
+            return await self.async_step_set_interval()
+
+        current_live = self._config_entry.data.get(
+            CONF_LIVE_REPORTING, DEFAULT_LIVE_REPORTING
+        )
+        schema = vol.Schema(
+            {
+                vol.Optional(CONF_LIVE_REPORTING, default=current_live): bool,
+            }
+        )
+
+        return self.async_show_form(
+            step_id="change_reporting",
+            data_schema=schema,
+        )
+
+    async def async_step_set_interval(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Collect the reporting interval (only reached when live reporting is off)."""
+        if user_input is not None:
+            new_data = {**self._config_entry.data}
+            new_data[CONF_LIVE_REPORTING] = False
+            new_data[CONF_WRITE_INTERVAL] = user_input.get(
+                CONF_WRITE_INTERVAL, DEFAULT_WRITE_INTERVAL
+            )
             self.hass.config_entries.async_update_entry(
                 self._config_entry, data=new_data
             )
             return await self.async_step_init()
 
-        current_live = self._config_entry.data.get(
-            CONF_LIVE_REPORTING, DEFAULT_LIVE_REPORTING
-        )
         current_write_interval = self._config_entry.data.get(
             CONF_WRITE_INTERVAL, DEFAULT_WRITE_INTERVAL
         )
         schema = vol.Schema(
             {
                 vol.Optional(
-                    CONF_LIVE_REPORTING, default=current_live
-                ): bool,
-                vol.Optional(
                     CONF_WRITE_INTERVAL, default=current_write_interval
-                ): vol.All(vol.Coerce(int), vol.Range(min=5, max=300)),
+                ): vol.All(
+                    vol.Coerce(int),
+                    vol.Range(min=MIN_WRITE_INTERVAL, max=MAX_WRITE_INTERVAL),
+                ),
             }
         )
 
         return self.async_show_form(
-            step_id="change_reporting",
+            step_id="set_interval",
             data_schema=schema,
         )
 

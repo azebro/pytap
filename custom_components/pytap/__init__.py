@@ -20,10 +20,14 @@ from .const import (
     CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
     CONF_MODULES,
+    CONF_WRITE_INTERVAL,
     DEFAULT_LIVE_REPORTING,
     DEFAULT_PEAK_POWER,
     DEFAULT_STRING_NAME,
+    DEFAULT_WRITE_INTERVAL,
     DOMAIN,
+    MAX_WRITE_INTERVAL,
+    MIN_WRITE_INTERVAL,
 )
 from .coordinator import PyTapDataUpdateCoordinator
 
@@ -162,6 +166,18 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         new_data = {**entry.data}
         if CONF_LIVE_REPORTING not in new_data:
             new_data[CONF_LIVE_REPORTING] = DEFAULT_LIVE_REPORTING
+        # The v5 reporting form constrains write_interval to
+        # [MIN_WRITE_INTERVAL, MAX_WRITE_INTERVAL].  Earlier versions allowed
+        # smaller values, so clamp any stale value to keep the options form
+        # submittable after upgrade.
+        if CONF_WRITE_INTERVAL in new_data:
+            try:
+                interval = int(new_data[CONF_WRITE_INTERVAL])
+            except (TypeError, ValueError):
+                interval = DEFAULT_WRITE_INTERVAL
+            new_data[CONF_WRITE_INTERVAL] = max(
+                MIN_WRITE_INTERVAL, min(MAX_WRITE_INTERVAL, interval)
+            )
         hass.config_entries.async_update_entry(entry, data=new_data, version=5)
 
     return True

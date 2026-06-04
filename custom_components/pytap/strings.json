@@ -169,14 +169,22 @@
       },
       "change_reporting": {
         "title": "Reporting Settings",
-        "description": "Configure how this integration delivers data to Home Assistant.\n\nWhen **Live reporting** is enabled (default), readings are pushed as they arrive from the gateway with sub-second latency.\n\nWhen disabled, readings are cached for the configured interval and delivered as a time-weighted average. This reduces CPU and I/O load for installations with many panels.",
+        "description": "Configure how this integration delivers data to Home Assistant.\n\nWhen **Live reporting** is enabled (default), readings are pushed as they arrive from the gateway with sub-second latency.\n\nTurn it off to cache readings and deliver a time-weighted average instead \u2014 you'll set the interval on the next screen. This reduces CPU and I/O load for installations with many panels.",
         "data": {
-          "live_reporting": "Live reporting",
+          "live_reporting": "Live reporting"
+        },
+        "data_description": {
+          "live_reporting": "Deliver each reading as it arrives from the gateway (recommended for most setups). Turn this off to set an averaging interval."
+        }
+      },
+      "set_interval": {
+        "title": "Reporting Interval",
+        "description": "Readings are cached and delivered to Home Assistant as a time-weighted average once per interval.",
+        "data": {
           "write_interval": "Reporting interval (seconds)"
         },
         "data_description": {
-          "live_reporting": "Deliver each reading as it arrives from the gateway (recommended for most setups).",
-          "write_interval": "When live reporting is off, how often (in seconds) to push time-weighted averaged updates to Home Assistant. Range: 5\u2013300. Default: 30 seconds."
+          "write_interval": "How often (in seconds) to push time-weighted averaged updates to Home Assistant. Range: 5\u2013300. Default: 30 seconds."
         }
       }
     }

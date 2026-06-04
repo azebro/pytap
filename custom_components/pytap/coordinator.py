@@ -293,7 +293,9 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Reset all daily accumulators and push updated data to sensors."""
         self._midnight_reset_unsub = None
         today = dt_util.now().date().isoformat()
-        _LOGGER.info("Midnight daily reset — resetting daily accumulators for %s", today)
+        _LOGGER.info(
+            "Midnight daily reset — resetting daily accumulators for %s", today
+        )
 
         data_changed = False
         for barcode, acc in self._energy_state.items():
@@ -359,57 +361,27 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
                         if self._live_reporting:
                             # Live mode — push every change immediately
-                            if self._ha_update_pending:
-                                self.data["counters"] = parser.counters
-                                self.hass.loop.call_soon_threadsafe(
-                                    self.async_set_updated_data,
-                                    dict(self.data),
-                                )
-                                self._ha_update_pending = False
+                            self._push_live_update(parser)
                         else:
                             # Interval mode — buffer readings and push
                             # time-weighted averages once per write_interval.
-                            now = time.monotonic()
-                            if self._ha_update_pending and (
-                                now - self._last_ha_update
-                                >= self._write_interval
-                            ):
-                                self.data["counters"] = parser.counters
-                                snapshot = self._build_averaged_snapshot(
-                                    now
-                                )
-                                per_node_counts = {
-                                    barcode: len(readings)
-                                    for barcode, readings
-                                    in self._reading_buffers.items()
-                                    if readings
-                                    and barcode in snapshot["nodes"]
-                                }
-                                _LOGGER.debug(
-                                    "HA update: %d node(s) — %s",
-                                    len(per_node_counts),
-                                    ", ".join(
-                                        f"{snapshot['nodes'][b].get('name', b)}: "
-                                        f"{n} reading(s)"
-                                        for b, n in per_node_counts.items()
-                                    ),
-                                )
-                                self._reading_buffers.clear()
-                                self.hass.loop.call_soon_threadsafe(
-                                    self.async_set_updated_data,
-                                    snapshot,
-                                )
-                                self._last_ha_update = now
-                                self._ha_update_pending = False
-                    elif (
-                        RECONNECT_TIMEOUT > 0
-                        and (time.monotonic() - last_data_time) > RECONNECT_TIMEOUT
-                    ):
-                        _LOGGER.warning(
-                            "No data from gateway for %ds, reconnecting",
-                            RECONNECT_TIMEOUT,
-                        )
-                        break
+                            self._maybe_flush_interval(parser, time.monotonic())
+                    else:
+                        # No data this read cycle (socket read timeout).
+                        now = time.monotonic()
+                        if not self._live_reporting:
+                            # Flush buffered readings on schedule so sensors
+                            # keep updating during production lulls.
+                            self._maybe_flush_interval(parser, now)
+                        if (
+                            RECONNECT_TIMEOUT > 0
+                            and (now - last_data_time) > RECONNECT_TIMEOUT
+                        ):
+                            _LOGGER.warning(
+                                "No data from gateway for %ds, reconnecting",
+                                RECONNECT_TIMEOUT,
+                            )
+                            break
 
             except Exception as err:
                 if self._stop_event.is_set():
@@ -429,7 +401,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     else:
                         self.hass.loop.call_soon_threadsafe(
                             self.async_set_updated_data,
-                            dict(self.data),
+                            {**self.data, "nodes": dict(self.data["nodes"])},
                         )
                     self._ha_update_pending = False
                 with self._source_lock:
@@ -459,6 +431,58 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if self._stop_event.is_set():
                     return
                 time.sleep(0.1)
+
+    def _push_live_update(self, parser: Any) -> None:
+        """Push an immediate snapshot to HA (live reporting mode).
+
+        Publishes an *immutable* copy of the ``nodes`` mapping so the listener
+        thread can keep mutating ``self.data["nodes"]`` without HA-side
+        consumers (sensors, diagnostics) ever iterating a dict that changes
+        size mid-read.  Runs in the executor thread.
+        """
+        if not self._ha_update_pending:
+            return
+        self.data["counters"] = parser.counters
+        self.hass.loop.call_soon_threadsafe(
+            self.async_set_updated_data,
+            {**self.data, "nodes": dict(self.data["nodes"])},
+        )
+        self._ha_update_pending = False
+
+    def _maybe_flush_interval(self, parser: Any, now: float) -> None:
+        """Flush buffered readings as a time-weighted average (interval mode).
+
+        Pushes a snapshot once the write interval has elapsed since the last
+        update.  Called both when data arrives and during idle read cycles so
+        buffered readings are not stranded when the stream goes quiet.  Runs
+        in the executor thread.
+        """
+        if not self._ha_update_pending or (
+            now - self._last_ha_update < self._write_interval
+        ):
+            return
+        self.data["counters"] = parser.counters
+        snapshot = self._build_averaged_snapshot(now)
+        per_node_counts = {
+            barcode: len(readings)
+            for barcode, readings in self._reading_buffers.items()
+            if readings and barcode in snapshot["nodes"]
+        }
+        _LOGGER.debug(
+            "HA update: %d node(s) — %s",
+            len(per_node_counts),
+            ", ".join(
+                f"{snapshot['nodes'][b].get('name', b)}: {n} reading(s)"
+                for b, n in per_node_counts.items()
+            ),
+        )
+        self._reading_buffers.clear()
+        self.hass.loop.call_soon_threadsafe(
+            self.async_set_updated_data,
+            snapshot,
+        )
+        self._last_ha_update = now
+        self._ha_update_pending = False
 
     def _init_mappings_from_parser(self, parser: Any) -> None:
         """Pre-populate barcode/node mappings from the parser's persistent state.
@@ -643,12 +667,19 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "daily_reset_date": acc.daily_reset_date,
             "last_update": now.isoformat(),
         }
-        self._reading_buffers.setdefault(barcode, []).append(
-            (
-                time.monotonic(),
-                {field: self.data["nodes"][barcode][field] for field in _AVERAGED_FIELDS},
+        # Only buffer readings in interval/averaged mode.  In live mode the
+        # raw values are pushed immediately, so buffering would grow without
+        # bound and never be consumed.
+        if not self._live_reporting:
+            self._reading_buffers.setdefault(barcode, []).append(
+                (
+                    time.monotonic(),
+                    {
+                        field: self.data["nodes"][barcode][field]
+                        for field in _AVERAGED_FIELDS
+                    },
+                )
             )
-        )
         self._schedule_save()
         return True
 
