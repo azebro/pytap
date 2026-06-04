@@ -115,9 +115,12 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._live_reporting: bool = entry.data.get(
             CONF_LIVE_REPORTING, DEFAULT_LIVE_REPORTING
         )
-        self._write_interval: float = float(
-            entry.data.get(CONF_WRITE_INTERVAL, DEFAULT_WRITE_INTERVAL)
-        )
+        raw_write_interval = entry.data.get(CONF_WRITE_INTERVAL, DEFAULT_WRITE_INTERVAL)
+        try:
+            self._write_interval: float = float(raw_write_interval)
+        except (TypeError, ValueError):
+            self._write_interval = float(DEFAULT_WRITE_INTERVAL)
+        self._write_interval = max(0.0, self._write_interval)
 
         # Build barcode allowlist from configured modules
         self._configured_barcodes: set[str] = {
