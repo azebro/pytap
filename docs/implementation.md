@@ -1,6 +1,6 @@
 # PyTap — Implementation Document
 
-> Version 0.3.1 · Last updated: March 2026
+> Version 1.2.0 · Last updated: June 2026
 
 This document captures the current implementation state of the PyTap Home Assistant custom component. It describes what has been built, how each module works, the design decisions made during development, and the test coverage in place.
 
@@ -41,7 +41,7 @@ PyTap is a Home Assistant custom component that passively monitors Tigo TAP sola
 | Aspect | Implementation |
 | --- | --- |
 | Integration type | Hub (`integration_type: "hub"`) |
-| Data delivery | Push-based streaming (`iot_class: "local_push"`) |
+| Data delivery | Push-based streaming (`iot_class: "local_push"`); selectable live or time-weighted averaged interval reporting |
 | Entity creation | Deterministic from user-configured barcode list (no auto-discovery) |
 | Config flow | Menu-driven: add modules one at a time via individual form fields |
 | Threading model | Blocking parser in executor thread, bridged to async event loop |
@@ -56,14 +56,14 @@ PyTap is a Home Assistant custom component that passively monitors Tigo TAP sola
 
 ```
 custom_components/pytap/
-├── __init__.py          # ~187 lines — Integration lifecycle (setup, teardown, migration, options listener)
-├── config_flow.py       # 369 lines  — Menu-driven config & options flows
-├── const.py             # ~28 lines  — Domain, config keys, defaults, energy tuning constants
-├── coordinator.py       # ~1016 lines — Push-based DataUpdateCoordinator
+├── __init__.py          # ~201 lines — Integration lifecycle (setup, teardown, migration, options listener)
+├── config_flow.py       # 467 lines  — Menu-driven config & options flows
+├── const.py             # ~32 lines  — Domain, config keys, defaults, reporting & energy tuning constants
+├── coordinator.py       # ~1187 lines — Push-based DataUpdateCoordinator (live + averaged interval reporting)
 ├── diagnostics.py       # ~46 lines  — Diagnostics download (config entry diagnostics)
 ├── energy.py            # ~80 lines  — Pure trapezoidal energy accumulation helpers
 ├── manifest.json        # 13 lines   — HA integration metadata
-├── sensor.py            # ~572 lines — 12 sensor entity types, CoordinatorEntity pattern
+├── sensor.py            # ~642 lines — 12 sensor entity types, CoordinatorEntity pattern
 ├── strings.json         # ~100 lines — UI strings (source of truth)
 ├── translations/
 │   └── en.json          # ~100 lines — English translations (mirrors strings.json)
@@ -79,13 +79,14 @@ custom_components/pytap/
         └── barcode.py   # Tigo barcode encode/decode
 
 tests/
-├── conftest.py                    # 14 lines  — Auto-enable custom integrations fixture
-├── test_config_flow.py            # 548 lines — 16 config flow tests
-├── test_coordinator_persistence.py # ~1100 lines — 36 coordinator & persistence tests
+├── conftest.py                    # 10 lines  — Auto-enable custom integrations fixture
+├── test_config_flow.py            # ~719 lines — config flow & options flow tests
+├── test_coordinator_persistence.py # ~1096 lines — coordinator & persistence tests
 ├── test_diagnostics.py            # ~172 lines — 4 diagnostics platform tests
 ├── test_energy.py                 # ~170 lines — 13 pure energy accumulation tests
-├── test_migration.py              # ~300 lines — 11 entity migration tests
-└── test_sensor.py                 # ~875 lines — 32 sensor platform tests
+├── test_migration.py              # ~342 lines — config entry & legacy entity migration tests
+├── test_sensor.py                 # ~1074 lines — sensor platform tests
+└── test_write_interval.py         # ~556 lines — live/interval reporting & time-weighted averaging tests
 
 docs/
 ├── architecture.md      # 656 lines — Architecture & design document
@@ -114,6 +115,12 @@ CONF_MODULE_PEAK_POWER = "peak_power"  # Peak panel power in Wp
 # Defaults
 DEFAULT_PEAK_POWER = 455          # Wp (watts peak) — STC rating
 
+# Reporting mode
+CONF_LIVE_REPORTING = "live_reporting"   # Push every reading vs. averaged interval
+DEFAULT_LIVE_REPORTING = True
+CONF_WRITE_INTERVAL = "write_interval"   # Seconds between averaged pushes
+DEFAULT_WRITE_INTERVAL = 30
+
 # Reconnection tuning
 RECONNECT_TIMEOUT = 60            # Seconds of silence → reconnect
 RECONNECT_DELAY = 5               # Pause between reconnection attempts
@@ -137,7 +144,7 @@ These constants are imported by every other module in the integration.
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/azebro/pytap/issues",
   "requirements": [],
-  "version": "0.3.0"
+  "version": "1.2.0"
 }
 ```
 
@@ -150,7 +157,7 @@ Key choices:
 
 ### `config_flow.py` — Configuration Flow
 
-**369 lines** implementing a menu-driven config flow and a full options flow.
+**467 lines** implementing a menu-driven config flow and a full options flow.
 
 #### Config Flow Steps
 
@@ -199,7 +206,10 @@ Key choices:
   UPDATE_ENTRY
 ```
 
-- **`async_step_init`** — Menu with "Add a module", "Remove a module", "Save and close".
+- **`async_step_init`** — Menu with "Change connection", "Change reporting settings", "Add a module", "Remove a module", "Save and close".
+- **`async_step_change_connection`** — Host/port form to update the gateway connection (advisory connection test, same as setup).
+- **`async_step_change_reporting`** — "Reporting Settings" form with a single **Live reporting** checkbox (default on). When left on, the integration clears any stored `write_interval` and returns to the menu. When turned **off**, the flow advances to `async_step_set_interval`. The interval field is deliberately *not* shown here because Home Assistant's static forms cannot grey out a field reactively.
+- **`async_step_set_interval`** — Reached only when live reporting is off. Shows the **Reporting interval** field (`vol.Range(min=MIN_WRITE_INTERVAL, max=MAX_WRITE_INTERVAL)` = 5–300, default 30 s), stores `live_reporting=False` + `write_interval`, and returns to the menu.
 - **`async_step_add_module`** — Same form and validation as the config flow version.
 - **`async_step_remove_module`** — Dropdown (`vol.In`) built dynamically from the current module list showing `"Name (Barcode)"` labels. Selecting one removes it and returns to the menu.
 - **"Save and close"** — Updates `ConfigEntry.data` with the modified module list, triggering an integration reload.
@@ -218,7 +228,7 @@ Four custom `HomeAssistantError` subclasses: `CannotConnect`, `InvalidAuth`, `In
 
 ### `coordinator.py` — Data Coordinator
 
-**~1016 lines** implementing `PyTapDataUpdateCoordinator`, the core runtime engine.
+**~1187 lines** implementing `PyTapDataUpdateCoordinator`, the core runtime engine.
 
 #### Class: `PyTapDataUpdateCoordinator`
 
@@ -286,7 +296,7 @@ async_stop_listener()
   2. Checks `_stop_event` immediately after connect — if set during connect, exits cleanly.
   3. Reads 4096-byte chunks in a loop.
   4. Feeds bytes to the parser, getting back a list of `Event` objects.
-  5. For **each event individually**, calls `_process_event()` — if it returns `True` (data changed), pushes an update to HA via `hass.loop.call_soon_threadsafe(self.async_set_updated_data, ...)`. This per-event push avoids micro-batching.
+  5. For **each event individually**, calls `_process_event()`. When data changes, the update is delivered to HA according to the configured reporting mode (see [Reporting Modes](#reporting-modes) below): in **live** mode each change is pushed immediately via `hass.loop.call_soon_threadsafe(self.async_set_updated_data, ...)`; in **averaged interval** mode changes are buffered and flushed once per `write_interval`.
   6. Monitors for silence timeouts (`RECONNECT_TIMEOUT`).
   7. On error/timeout, closes the source (under `_source_lock`), waits `RECONNECT_DELAY` seconds, and retries.
   8. Sleep during reconnect delay uses 0.1s increments checking `_stop_event` for fast shutdown.
@@ -354,6 +364,15 @@ The data dict stored per node:
 **`_handle_topology(event) → bool`:**
 - Attaches topology data to the matching node (by resolving `node_id` → barcode).
 - Returns `True` if data was attached to a configured node.
+
+#### Reporting Modes
+
+The coordinator reads `live_reporting` (default `True`) and `write_interval` (default 30 s) from `ConfigEntry.data` at init and chooses how processed events reach Home Assistant:
+
+- **Live mode (`live_reporting = True`)** — Each event that changes node data triggers an immediate `async_set_updated_data` push. Sub-second latency; best for most installations.
+- **Averaged interval mode (`live_reporting = False`)** — `_handle_power_report` records each reading into `_reading_buffers[barcode]` as a `(monotonic_ts, fields)` tuple. Once per `write_interval` seconds the listener calls `_build_averaged_snapshot(flush_ts)`, which computes a **time-weighted average** of each field in `_AVERAGED_FIELDS` (weighting each reading by the time until the next reading, or until the flush for the last one), recomputes `performance` from the averaged power, pushes the snapshot, and clears the buffer.
+
+`_build_averaged_snapshot()` copies node dicts instead of mutating `self.data["nodes"]`, so the raw latest values are preserved for persistence while HA receives the averaged values. Energy accumulation (`accumulate_energy`) always runs on the raw reading, independent of reporting mode.
 
 #### Discovery Logging
 
@@ -533,11 +552,12 @@ Handles integration lifecycle, config entry migration, and legacy entity cleanup
 
 #### Config Entry Version
 
-`CONFIG_ENTRY_VERSION = 4`:
+`CONFIG_ENTRY_VERSION = 5`:
 
 - `v1 → v2`: voltage/current split to `_in`/`_out`
 - `v2 → v3`: module string labels became mandatory (defaulted to `"Default"` during migration)
 - `v3 → v4`: peak power added to module config (defaulted to 455 Wp during migration)
+- `v4 → v5`: `live_reporting` toggle added (defaulted to `True` during migration)
 
 #### `async_migrate_entry(hass, entry) → bool`
 
@@ -545,6 +565,7 @@ Handles config entry version migration:
 - **v1 → v2:** Updates `entry.version` to 2.
 - **v2 → v3:** Ensures each module has a non-empty string label, defaulting missing/empty values to `"Default"`.
 - **v3 → v4:** Adds `peak_power` to each module, defaulting to `DEFAULT_PEAK_POWER` (455 Wp) for modules that don't have it.
+- **v4 → v5:** Adds `live_reporting` to the entry data (defaulting to `True`) when not already present.
 
 #### `async_setup_entry(hass, entry) → bool`
 
@@ -587,7 +608,10 @@ Defines all user-facing text for the config flow and options flow in structured 
 - `finish` — "Finish Setup" (terminal step).
 
 **Options flow steps:**
-- `init` — "PyTap Options" menu with add/remove/done options.
+- `init` — "PyTap Options" menu with change-connection, change-reporting, add-module, remove-module, and save options.
+- `change_connection` — Host/port form to update the gateway connection.
+- `change_reporting` — "Reporting Settings" form: `live_reporting` checkbox only.
+- `set_interval` — "Reporting Interval" form: `write_interval` field (shown only when live reporting is off).
 - `add_module` — Same fields as config flow.
 - `remove_module` — Dropdown with `remove_barcode` selector.
 
@@ -874,7 +898,7 @@ The architecture document (`architecture.md`) was written during initial design 
 | `via_device` on nodes | Linked to gateway device | Not implemented (no gateway device yet) |
 | Unavailable timeout | Described as configurable via options | Removed — sensors hold last value indefinitely |
 | Sensor count | Historical counts | 12 per optimizer, plus string/installation aggregate sensors |
-| Config entry version | Not mentioned | v4 with v1→v2, v2→v3, and v3→v4 migration steps |
+| Config entry version | Not mentioned | v5 with v1→v2 through v4→v5 migration steps |
 | Threading primitives | Not specified | threading.Event + threading.Lock (not asyncio.Event) |
 | Diagnostics platform | Mentioned for discovered barcodes | Implemented via `diagnostics.py` config-entry download |
 
@@ -1013,6 +1037,23 @@ Created this implementation document capturing all development work to date.
 - `async_start_listener()` now schedules the midnight reset timer at startup.
 - `async_stop_listener()` cancels the midnight reset timer on shutdown.
 - Added 4 tests in `TestMidnightReset`: zeroing daily values, skip-if-already-reset, timer rescheduling, and cancellation on stop.
+
+### Phase 17 — Live Reporting Toggle & Time-Weighted Averaging
+
+- Added a `live_reporting` boolean config option (default `True`) and reworked the options flow's *Change reporting settings* step to present a live-reporting checkbox plus a reporting-interval field.
+- In live mode the coordinator pushes every changed reading immediately; in interval mode it buffers per-barcode `(timestamp, fields)` readings and pushes a **time-weighted average** via `_build_averaged_snapshot(flush_ts)` once per `write_interval`.
+- Replaced the previous arithmetic-mean averaging with time-weighted averaging (each reading weighted by the duration it remained the latest value), giving representative values when readings arrive at uneven intervals.
+- Changed `DEFAULT_WRITE_INTERVAL` from 5 to 30 seconds and the interval range from 1–300 to 5–300.
+- Bumped `CONFIG_ENTRY_VERSION` and `PyTapConfigFlow.VERSION` to 5 with a v4→v5 migration adding `live_reporting=True`.
+- Added `tests/test_write_interval.py` covering reporting-mode init, throttle behaviour, and time-weighted averaging; updated migration, config-flow, and sensor tests.
+
+### Phase 18 — Reporting Mode Hardening
+
+- **Buffer leak fix** — `_handle_power_report` now only appends to `_reading_buffers` in interval mode (`if not self._live_reporting`). Previously the buffer was populated in live mode too but never consumed, growing without bound.
+- **Thread-safe live push** — extracted `_push_live_update()`, which publishes `{**self.data, "nodes": dict(self.data["nodes"])}` (an immutable copy of `nodes`) so HA-side consumers never iterate the dict while the listener thread mutates it. The reconnect/error `finally` flush uses the same detached-copy pattern.
+- **Idle interval flush** — extracted `_maybe_flush_interval()` and call it from both the data and no-data branches of `_listen`, so buffered readings are flushed on schedule during production lulls instead of waiting for the next frame or a reconnect.
+- **Migration clamp** — the v4→v5 migration now clamps any stale `write_interval` into `[MIN_WRITE_INTERVAL, MAX_WRITE_INTERVAL]` (5–300) so the reporting form stays submittable after upgrade. Added `MIN_WRITE_INTERVAL`/`MAX_WRITE_INTERVAL` constants shared by the migration and the config-flow schema.
+- Added regression tests (`TestLivePushAndIdleFlush`, migration clamp tests) and corrected the previously misnamed live-mode buffer test. Full suite: 162 tests passing, ruff clean.
 
 ---
 

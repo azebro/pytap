@@ -15,6 +15,7 @@ Please note that this integration requires RS485 to TCP converter that needs to 
 ## Features
 
 - **Real-time streaming** — Push-based data delivery with sub-second latency (no polling).
+- **Configurable reporting** — Choose **live reporting** (default; every reading delivered as it arrives) or a **time-weighted averaged interval** that caches readings and pushes a single representative value every few seconds to reduce CPU and recorder load on large installations.
 - **Per-optimizer sensors** — 12 sensor entities per Tigo TS4 module: performance,
   power, voltage in/out, current in/out, temperature, DC-DC duty cycle, RSSI,
   daily energy, total energy, and readings today.
@@ -120,9 +121,21 @@ Check your Home Assistant logs after the gateway has been running for a while (u
 Go to **Settings → Devices & Services → PyTap → Configure** to:
 
 - **Change connection** — Update the gateway IP address and port.
+- **Change reporting settings** — Toggle live reporting or set the averaged reporting interval (see [Reporting modes](#reporting-modes)).
 - **Add** new optimizer modules (if the barcode was previously seen on the bus, it resolves instantly).
 - **Remove** modules you no longer want to track.
 - **Save and close** to apply changes.
+
+### Reporting modes
+
+PyTap can deliver readings to Home Assistant in two ways, selectable under **Configure → Change reporting settings**:
+
+- **Live reporting (default)** — Each reading is pushed to Home Assistant as soon as it arrives from the gateway, giving sub-second latency. Best for most installations.
+- **Averaged interval** — When live reporting is turned off, readings are cached and a **time-weighted average** is pushed once per *reporting interval* (5–300 seconds, default 30). Weighting each reading by how long it remained the latest value yields a representative average even when readings arrive at uneven intervals. This reduces event-loop, CPU, and recorder/database load on installations with many panels.
+
+> **Setting the interval:** The reporting interval only applies in averaged mode, so it is hidden while **Live reporting** is enabled. To change it, open **Change reporting settings**, untick **Live reporting**, and click **Submit** — a follow-up **Reporting Interval** screen then lets you enter the value. Leaving **Live reporting** ticked skips that screen entirely.
+
+Energy totals (daily and lifetime) are always integrated from the raw readings, so the reporting mode only affects the instantaneous values (power, voltage, current, temperature) shown on dashboards — never the accumulated energy figures.
 
 ### Diagnostics Download
 
@@ -157,7 +170,7 @@ PyTap Coordinator
         └── Sensor entities update in real time
 ```
 
-PyTap uses a background listener thread that streams data from the gateway, parses protocol frames, and dispatches events to the Home Assistant event loop. Only events matching your configured barcodes create or update sensor entities.
+PyTap uses a background listener thread that streams data from the gateway, parses protocol frames, and dispatches events to the Home Assistant event loop. Only events matching your configured barcodes create or update sensor entities. In the default **live reporting** mode each update is forwarded immediately; in **averaged interval** mode updates are buffered and flushed as a time-weighted average every few seconds (see [Reporting modes](#reporting-modes)).
 
 On startup, PyTap restores persisted coordinator state (barcode mappings, energy accumulators, and last node snapshots). Sensor entities also use Home Assistant restore fallback if needed, so a restart during low/no production does not force entities into unavailable when prior data exists.
 

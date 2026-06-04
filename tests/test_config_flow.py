@@ -577,7 +577,8 @@ async def test_options_change_reporting_shows_live_checkbox(
     assert result["step_id"] == "change_reporting"
     schema_keys = {str(k) for k in result["data_schema"].schema}
     assert "live_reporting" in schema_keys
-    assert "write_interval" in schema_keys
+    # The interval lives on a separate step so it is hidden when live is on.
+    assert "write_interval" not in schema_keys
 
 
 async def test_options_change_reporting_defaults_to_live(
@@ -600,7 +601,7 @@ async def test_options_change_reporting_defaults_to_live(
 async def test_options_change_reporting_enable_interval_mode(
     hass: HomeAssistant,
 ) -> None:
-    """Unchecking live and setting an interval stores both values."""
+    """Unchecking live advances to the interval step; setting it stores both values."""
     entry = _make_config_entry(hass)
 
     result = await hass.config_entries.options.async_init(entry.entry_id)
@@ -610,9 +611,17 @@ async def test_options_change_reporting_enable_interval_mode(
     )
     assert result["step_id"] == "change_reporting"
 
+    # Turning live reporting off moves to the dedicated interval step.
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
-        {CONF_LIVE_REPORTING: False, CONF_WRITE_INTERVAL: 30},
+        {CONF_LIVE_REPORTING: False},
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "set_interval"
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {CONF_WRITE_INTERVAL: 30},
     )
 
     assert result["type"] is FlowResultType.MENU
@@ -647,9 +656,13 @@ async def test_options_change_reporting_enable_live_clears_interval(
     )
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
-        {CONF_LIVE_REPORTING: True, CONF_WRITE_INTERVAL: 30},
+        {CONF_LIVE_REPORTING: True},
     )
 
+    # Enabling live reporting finishes immediately — the interval step is
+    # never shown (it would be irrelevant / "greyed out").
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "init"
     assert entry.data[CONF_LIVE_REPORTING] is True
     assert CONF_WRITE_INTERVAL not in entry.data
 
@@ -666,9 +679,13 @@ async def test_options_change_reporting_preserves_modules(
         result["flow_id"],
         {"next_step_id": "change_reporting"},
     )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {CONF_LIVE_REPORTING: False},
+    )
     await hass.config_entries.options.async_configure(
         result["flow_id"],
-        {CONF_LIVE_REPORTING: False, CONF_WRITE_INTERVAL: 60},
+        {CONF_WRITE_INTERVAL: 60},
     )
 
     assert entry.data[CONF_MODULES] == original_modules
@@ -714,6 +731,14 @@ async def test_options_prefill_interval_from_entry(
 
     schema_dict = {str(k): k for k in result["data_schema"].schema}
     lr_key = schema_dict["live_reporting"]
-    wi_key = schema_dict["write_interval"]
     assert lr_key.default() is False
+
+    # The interval is pre-filled on the dedicated set_interval step.
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {CONF_LIVE_REPORTING: False},
+    )
+    assert result["step_id"] == "set_interval"
+    schema_dict = {str(k): k for k in result["data_schema"].schema}
+    wi_key = schema_dict["write_interval"]
     assert wi_key.default() == 60

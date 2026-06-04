@@ -10,7 +10,7 @@ Covers:
 
 from datetime import datetime
 import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
@@ -378,7 +378,7 @@ class TestTimeWeightedAveraging:
             coordinator,
             self.BARCODE_A,
             [
-                (100.0, self._reading(0.0)),    # 5s
+                (100.0, self._reading(0.0)),  # 5s
                 (105.0, self._reading(self.PEAK_POWER)),  # 5s until flush
             ],
         )
@@ -435,9 +435,7 @@ class TestTimeWeightedAveraging:
 
     def test_per_node_isolation(self, hass: HomeAssistant) -> None:
         """Readings from different nodes MUST NOT affect each other."""
-        coordinator = PyTapDataUpdateCoordinator(
-            hass, _make_entry_two_modules(hass)
-        )
+        coordinator = PyTapDataUpdateCoordinator(hass, _make_entry_two_modules(hass))
         coordinator._schedule_save = MagicMock()
         # Node A: 100 for 5s, 300 for 5s → TWA = 200
         self._seed(
@@ -542,15 +540,114 @@ class TestBufferPopulation:
         )
 
     def test_live_mode_does_not_buffer(self, hass: HomeAssistant) -> None:
-        """In live mode, reading buffers should still be populated for
-        consistency, but the live path does not use them."""
+        """In live mode, reading buffers stay empty.
+
+        The live path pushes raw values immediately, so buffering would only
+        accumulate unbounded memory with no consumer.
+        """
         entry = _make_entry(hass, live_reporting=True)
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
         coordinator._schedule_save = MagicMock()
         coordinator._handle_infrastructure(_make_infra_event())
 
         coordinator._process_event(_make_power_event(power=100.0))
+        coordinator._process_event(_make_power_event(power=200.0))
 
-        # Buffer is populated by _handle_power_report regardless of mode;
-        # the live path just ignores it and pushes raw data directly.
-        assert "A-1234567B" in coordinator._reading_buffers
+        # Buffer must remain empty in live mode (guards unbounded growth).
+        assert coordinator._reading_buffers == {}
+
+
+# ----------------------------------------------------------
+# Live push + idle flush helpers
+# ----------------------------------------------------------
+
+
+class TestLivePushAndIdleFlush:
+    """Tests for the live-push and idle-flush helpers.
+
+    These close the live-mode buffer leak (data published immutably, buffer
+    not populated) and the interval idle-flush gap (buffered readings flushed
+    on schedule even when no new data arrives).
+    """
+
+    BARCODE = "A-1234567B"
+
+    def _seed_node(self, coordinator, power: float = 100.0) -> None:
+        coordinator._handle_infrastructure(_make_infra_event())
+        coordinator._process_event(_make_power_event(power=power))
+
+    def test_live_push_detaches_nodes_copy(self, hass: HomeAssistant) -> None:
+        """Live push publishes a nodes dict distinct from the mutating one."""
+        coordinator = PyTapDataUpdateCoordinator(
+            hass, _make_entry(hass, live_reporting=True)
+        )
+        coordinator._schedule_save = MagicMock()
+        self._seed_node(coordinator)
+        coordinator._ha_update_pending = True
+
+        parser = MagicMock()
+        parser.counters = {"frames_received": 1}
+        with patch.object(coordinator.hass.loop, "call_soon_threadsafe") as mock_cstf:
+            coordinator._push_live_update(parser)
+
+        assert mock_cstf.called
+        _, payload = mock_cstf.call_args.args
+        assert payload["nodes"] == coordinator.data["nodes"]
+        # Must be a distinct object so listener-thread mutation cannot alias it.
+        assert payload["nodes"] is not coordinator.data["nodes"]
+        assert coordinator._ha_update_pending is False
+
+    def test_live_push_noop_when_not_pending(self, hass: HomeAssistant) -> None:
+        """Live push does nothing when no update is pending."""
+        coordinator = PyTapDataUpdateCoordinator(
+            hass, _make_entry(hass, live_reporting=True)
+        )
+        coordinator._schedule_save = MagicMock()
+        coordinator._ha_update_pending = False
+
+        parser = MagicMock()
+        with patch.object(coordinator.hass.loop, "call_soon_threadsafe") as mock_cstf:
+            coordinator._push_live_update(parser)
+
+        assert not mock_cstf.called
+
+    def test_idle_flush_emits_when_interval_elapsed(self, hass: HomeAssistant) -> None:
+        """Interval flush fires once the write interval has elapsed, even with
+        no new data (the idle path)."""
+        coordinator = PyTapDataUpdateCoordinator(
+            hass, _make_entry(hass, live_reporting=False, write_interval=30)
+        )
+        coordinator._schedule_save = MagicMock()
+        self._seed_node(coordinator)
+        coordinator._ha_update_pending = True
+        coordinator._last_ha_update = 0.0
+
+        parser = MagicMock()
+        parser.counters = {"frames_received": 1}
+        with patch.object(coordinator.hass.loop, "call_soon_threadsafe") as mock_cstf:
+            coordinator._maybe_flush_interval(parser, now=100.0)
+
+        assert mock_cstf.called
+        assert coordinator._reading_buffers == {}
+        assert coordinator._ha_update_pending is False
+        assert coordinator._last_ha_update == 100.0
+
+    def test_idle_flush_skips_before_interval(self, hass: HomeAssistant) -> None:
+        """Interval flush is suppressed before the interval elapses."""
+        coordinator = PyTapDataUpdateCoordinator(
+            hass, _make_entry(hass, live_reporting=False, write_interval=30)
+        )
+        coordinator._schedule_save = MagicMock()
+        self._seed_node(coordinator)
+        coordinator._ha_update_pending = True
+        coordinator._last_ha_update = 90.0
+
+        parser = MagicMock()
+        parser.counters = {"frames_received": 1}
+        with patch.object(coordinator.hass.loop, "call_soon_threadsafe") as mock_cstf:
+            coordinator._maybe_flush_interval(parser, now=100.0)
+
+        assert not mock_cstf.called
+        # Still pending and buffered until the interval elapses.
+        assert coordinator._ha_update_pending is True
+        assert self.BARCODE in coordinator._reading_buffers

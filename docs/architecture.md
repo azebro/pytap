@@ -195,6 +195,10 @@ DEFAULT_PORT = 502           # Tigo TAP default Modbus/TCP port
 DEFAULT_SCAN_INTERVAL = 30   # Coordinator poll fallback (seconds)
 CONF_MODULE_PEAK_POWER = "peak_power"
 DEFAULT_PEAK_POWER = 455     # Wp (watts peak) — STC rating
+CONF_LIVE_REPORTING = "live_reporting"
+DEFAULT_LIVE_REPORTING = True  # Push every reading as it arrives (default)
+CONF_WRITE_INTERVAL = "write_interval"
+DEFAULT_WRITE_INTERVAL = 30   # Seconds between averaged pushes (interval mode)
 ```
 
 ### 4. `coordinator.py` — Data Update Coordinator
@@ -297,6 +301,19 @@ The coordinator handles connection failures and source timeouts with automatic r
 - **Initial connection failure** — Raises `UpdateFailed`, HA marks the integration as unavailable and retries using its standard backoff.
 - **Mid-stream disconnection** — The listener task catches the exception, logs a warning, waits `RECONNECT_DELAY` seconds, and re-establishes the connection.
 - **Silence timeout** — If no data arrives for `RECONNECT_TIMEOUT` seconds, the coordinator assumes the connection is stale and reconnects.
+
+#### Reporting Modes — Live vs. Averaged Interval
+
+The coordinator delivers readings to Home Assistant in one of two user-selectable modes (set via the options flow's *Change reporting settings* step and stored as `live_reporting` / `write_interval` in `ConfigEntry.data`):
+
+| Mode | `live_reporting` | Behavior |
+| --- | --- | --- |
+| **Live (default)** | `True` | Every event that changes node data triggers an immediate `async_set_updated_data` push — sub-second latency. |
+| **Averaged interval** | `False` | Readings are buffered per barcode with monotonic timestamps. Once per `write_interval` seconds (5–300, default 30) the coordinator pushes a **time-weighted average** of the buffered readings via `_build_averaged_snapshot()`. |
+
+Time-weighted averaging weights each buffered reading by the duration it remained the latest value (the time until the next reading, or until the flush for the final reading). This yields a physically representative average when readings arrive at uneven intervals, unlike a plain arithmetic mean.
+
+Averaging applies only to the instantaneous fields pushed to entities (power, voltage in/out, current in/out, temperature, DC-DC duty cycle, RSSI); `performance` is recomputed from the averaged power. Energy accumulation and persisted node snapshots always use the raw readings, so daily/total energy stays accurate regardless of reporting mode.
 
 #### Data Merging Strategy
 
@@ -598,6 +615,8 @@ The coordinator stores node data as a flat dictionary keyed by `barcode` (not `n
 | `host` | string | (required) | IP address or hostname of the Tigo gateway |
 | `port` | int | 502 | TCP port for the gateway's RS-485 bridge |
 | `modules` | list | (required) | List of optimizer modules as `STRING:NAME:BARCODE:PEAK_POWER` dicts |
+| `live_reporting` | bool | `True` | Push every reading immediately (default) vs. averaged interval mode |
+| `write_interval` | int | 30 | Seconds between time-weighted averaged pushes when `live_reporting` is off (5–300) |
 
 **Module format:** Each module is a dict with fields:
 - `STRING` — Required group name (e.g., `A`, `East`).
@@ -621,6 +640,7 @@ Configurable at runtime without removing the integration:
 
 - **Module list** — Add or remove optimizer barcodes as the installation evolves.
 - **Connection settings** — Change the gateway host and port without reconfiguring.
+- **Reporting settings** — Toggle live reporting, or set the averaged reporting interval (5–300 s) used when live reporting is off. The interval is collected on a follow-up step shown only when live reporting is turned off, so it stays hidden while live reporting is enabled.
 
 Changes trigger a full integration reload. Previously-discovered barcode mappings are persisted and survive the reload.
 
