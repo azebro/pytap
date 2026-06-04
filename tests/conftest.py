@@ -1,10 +1,7 @@
 """Fixtures for PyTap tests."""
 
-from unittest.mock import patch
 
 import pytest
-
-from homeassistant.core import HomeAssistant
 
 
 @pytest.fixture(autouse=True)

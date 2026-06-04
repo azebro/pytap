@@ -15,10 +15,12 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 
 from .const import (
+    CONF_LIVE_REPORTING,
     CONF_MODULE_BARCODE,
     CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
     CONF_MODULES,
+    DEFAULT_LIVE_REPORTING,
     DEFAULT_PEAK_POWER,
     DEFAULT_STRING_NAME,
     DOMAIN,
@@ -32,7 +34,8 @@ PLATFORMS: list[Platform] = [Platform.SENSOR]
 # Bumped from 1 → 2 when voltage/current were split into in/out variants.
 # Bumped from 2 → 3 when module string labels became mandatory.
 # Bumped from 3 → 4 when module peak_power became mandatory in config.
-CONFIG_ENTRY_VERSION = 4
+# Bumped from 4 → 5 when live_reporting toggle was added.
+CONFIG_ENTRY_VERSION = 5
 
 # Old unique IDs that were replaced by the _in/_out split.
 _LEGACY_UNIQUE_ID_RENAMES: dict[str, str] = {
@@ -103,6 +106,7 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     v1 → v2: voltage/current sensors split into _in/_out variants.
     v2 → v3: module string labels are mandatory.
     v3 → v4: module peak power is added with default value.
+    v4 → v5: live_reporting toggle added (default True).
     """
     if entry.version == 1:
         _LOGGER.info(
@@ -149,6 +153,16 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         new_data = {**entry.data, CONF_MODULES: updated_modules}
         hass.config_entries.async_update_entry(entry, data=new_data, version=4)
+
+    if entry.version == 4:
+        _LOGGER.info(
+            "Migrating PyTap config entry %s from version 4 to 5",
+            entry.entry_id,
+        )
+        new_data = {**entry.data}
+        if CONF_LIVE_REPORTING not in new_data:
+            new_data[CONF_LIVE_REPORTING] = DEFAULT_LIVE_REPORTING
+        hass.config_entries.async_update_entry(entry, data=new_data, version=5)
 
     return True
 

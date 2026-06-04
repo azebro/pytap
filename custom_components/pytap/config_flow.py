@@ -28,12 +28,14 @@ from homeassistant.exceptions import HomeAssistantError
 import voluptuous as vol
 
 from .const import (
+    CONF_LIVE_REPORTING,
     CONF_MODULE_BARCODE,
     CONF_MODULE_NAME,
     CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
     CONF_MODULES,
     CONF_WRITE_INTERVAL,
+    DEFAULT_LIVE_REPORTING,
     DEFAULT_PEAK_POWER,
     DEFAULT_PORT,
     DEFAULT_WRITE_INTERVAL,
@@ -112,7 +114,7 @@ def _modules_description(modules: list[dict[str, Any]]) -> str:
 class PyTapConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for PyTap."""
 
-    VERSION = 4
+    VERSION = 5
 
     def __init__(self) -> None:
         """Initialize the config flow."""
@@ -320,25 +322,43 @@ class PyTapOptionsFlow(OptionsFlow):
     async def async_step_change_reporting(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Allow the user to change reporting settings (write interval)."""
+        """Allow the user to change reporting settings.
+
+        Presents a 'Live reporting' checkbox (default ON) that delivers
+        readings as they arrive.  When unchecked, a write_interval field
+        appears and readings are cached, then pushed as a time-weighted
+        average every ``write_interval`` seconds.
+        """
         if user_input is not None:
             new_data = {**self._config_entry.data}
-            new_data[CONF_WRITE_INTERVAL] = user_input.get(
-                CONF_WRITE_INTERVAL, DEFAULT_WRITE_INTERVAL
-            )
+            live = user_input.get(CONF_LIVE_REPORTING, DEFAULT_LIVE_REPORTING)
+            new_data[CONF_LIVE_REPORTING] = live
+            if live:
+                # Live mode — clear any stored interval
+                new_data.pop(CONF_WRITE_INTERVAL, None)
+            else:
+                new_data[CONF_WRITE_INTERVAL] = user_input.get(
+                    CONF_WRITE_INTERVAL, DEFAULT_WRITE_INTERVAL
+                )
             self.hass.config_entries.async_update_entry(
                 self._config_entry, data=new_data
             )
             return await self.async_step_init()
 
+        current_live = self._config_entry.data.get(
+            CONF_LIVE_REPORTING, DEFAULT_LIVE_REPORTING
+        )
         current_write_interval = self._config_entry.data.get(
             CONF_WRITE_INTERVAL, DEFAULT_WRITE_INTERVAL
         )
         schema = vol.Schema(
             {
                 vol.Optional(
+                    CONF_LIVE_REPORTING, default=current_live
+                ): bool,
+                vol.Optional(
                     CONF_WRITE_INTERVAL, default=current_write_interval
-                ): vol.All(vol.Coerce(int), vol.Range(min=1, max=300)),
+                ): vol.All(vol.Coerce(int), vol.Range(min=5, max=300)),
             }
         )
 

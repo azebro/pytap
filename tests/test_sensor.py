@@ -2,20 +2,17 @@
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
-
 from homeassistant.components.sensor import SensorStateClass
 from homeassistant.const import (
     CONF_HOST,
     CONF_PORT,
-    EntityCategory,
     STATE_UNAVAILABLE,
+    EntityCategory,
     UnitOfEnergy,
 )
 from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
-
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.pytap.const import (
@@ -24,7 +21,6 @@ from custom_components.pytap.const import (
     CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
     CONF_MODULES,
-    DEFAULT_PEAK_POWER,
     DEFAULT_PORT,
     DOMAIN,
 )
@@ -34,7 +30,6 @@ from custom_components.pytap.sensor import (
     _coerce_restored_state_value,
     async_setup_entry,
 )
-
 
 MOCK_MODULES = [
     {
