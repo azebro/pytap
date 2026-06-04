@@ -129,7 +129,8 @@
           "change_connection": "Change connection settings",
           "add_module": "Add a module",
           "remove_module": "Remove a module",
-          "done": "Save and close"
+          "done": "Save and close",
+          "change_reporting": "Change reporting settings"
         }
       },
       "change_connection": {
@@ -164,6 +165,18 @@
         "title": "Remove Module",
         "data": {
           "remove_barcode": "Select module to remove"
+        }
+      },
+      "change_reporting": {
+        "title": "Reporting Settings",
+        "description": "Configure how this integration delivers data to Home Assistant.\n\nWhen **Live reporting** is enabled (default), readings are pushed as they arrive from the gateway with sub-second latency.\n\nWhen disabled, readings are cached for the configured interval and delivered as a time-weighted average. This reduces CPU and I/O load for installations with many panels.",
+        "data": {
+          "live_reporting": "Live reporting",
+          "write_interval": "Reporting interval (seconds)"
+        },
+        "data_description": {
+          "live_reporting": "Deliver each reading as it arrives from the gateway (recommended for most setups).",
+          "write_interval": "When live reporting is off, how often (in seconds) to push time-weighted averaged updates to Home Assistant. Range: 5\u2013300. Default: 30 seconds."
         }
       }
     }

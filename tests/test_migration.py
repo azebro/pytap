@@ -4,31 +4,30 @@ Validates that legacy ``voltage`` and ``current`` entity unique IDs from
 pre-v0.2.0 are removed from the entity registry when the integration loads.
 """
 
-import pytest
 
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
-
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.pytap import (
+    CONFIG_ENTRY_VERSION,
     _async_cleanup_legacy_entities,
     async_migrate_entry,
-    CONFIG_ENTRY_VERSION,
 )
 from custom_components.pytap.const import (
+    CONF_LIVE_REPORTING,
     CONF_MODULE_BARCODE,
     CONF_MODULE_NAME,
     CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
     CONF_MODULES,
+    DEFAULT_LIVE_REPORTING,
     DEFAULT_PEAK_POWER,
-    DEFAULT_STRING_NAME,
     DEFAULT_PORT,
+    DEFAULT_STRING_NAME,
     DOMAIN,
 )
-
 
 MOCK_MODULES = [
     {
@@ -298,3 +297,46 @@ class TestConfigEntryMigration:
         assert entry.version == CONFIG_ENTRY_VERSION
         assert entry.data[CONF_MODULES][0][CONF_MODULE_PEAK_POWER] == 400
         assert entry.data[CONF_MODULES][1][CONF_MODULE_PEAK_POWER] == DEFAULT_PEAK_POWER
+
+    async def test_migrate_v4_to_v5_adds_live_reporting(
+        self, hass: HomeAssistant
+    ) -> None:
+        """v4 → v5: adds live_reporting with default True."""
+        entry = _make_entry(
+            hass,
+            version=4,
+            modules=[
+                {
+                    CONF_MODULE_STRING: "A",
+                    CONF_MODULE_NAME: "Panel_01",
+                    CONF_MODULE_BARCODE: "A-1234567B",
+                    CONF_MODULE_PEAK_POWER: 455,
+                },
+            ],
+        )
+
+        result = await async_migrate_entry(hass, entry)
+
+        assert result is True
+        assert entry.version == CONFIG_ENTRY_VERSION
+        assert entry.data[CONF_LIVE_REPORTING] is DEFAULT_LIVE_REPORTING
+
+    async def test_migrate_v4_to_v5_preserves_existing_live_reporting(
+        self, hass: HomeAssistant
+    ) -> None:
+        """v4 → v5: if live_reporting is already in data, preserve it."""
+        entry = _make_entry(
+            hass,
+            version=4,
+            modules=[],
+        )
+        # Simulate a user who manually set it somehow
+        hass.config_entries.async_update_entry(
+            entry, data={**entry.data, CONF_LIVE_REPORTING: False}
+        )
+
+        result = await async_migrate_entry(hass, entry)
+
+        assert result is True
+        assert entry.version == CONFIG_ENTRY_VERSION
+        assert entry.data[CONF_LIVE_REPORTING] is False

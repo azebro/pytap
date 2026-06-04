@@ -5,9 +5,7 @@ infrastructure state survive restarts via the consolidated HA Store.
 """
 
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
+from unittest.mock import AsyncMock, MagicMock
 
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
@@ -21,7 +19,6 @@ from custom_components.pytap.const import (
     CONF_MODULES,
     DEFAULT_PEAK_POWER,
     DEFAULT_PORT,
-    DOMAIN,
 )
 from custom_components.pytap.coordinator import (
     PyTapDataUpdateCoordinator,
@@ -33,7 +30,6 @@ from custom_components.pytap.pytap.core.events import (
     PowerReportEvent,
 )
 from custom_components.pytap.pytap.core.state import PersistentState
-
 
 MOCK_MODULES = [
     {

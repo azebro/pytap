@@ -1112,7 +1112,8 @@ def _build_power_report_packet(node_id: int) -> bytes:
         0x90,  # dsn
         0x0D,  # data_length = 13 bytes
     ])
-    # 13-byte power report: voltage_in_out(3) + duty_cycle(1) + current_temp(3) + unknown(3) + slot_counter(2) + rssi(1)
+    # 13-byte power report: voltage_in_out(3) + duty_cycle(1) +
+    # current_temp(3) + unknown(3) + slot_counter(2) + rssi(1)
     data = bytes([
         0x0F, 0x27, 0x50,  # voltage_in=486(24.3V), voltage_out=592(59.2V)
         0xFF,  # duty_cycle = 1.0
