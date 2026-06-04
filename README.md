@@ -30,6 +30,11 @@ Please note that this integration requires RS485 to TCP converter that needs to 
 - **Restart-safe availability** — Last known node readings are persisted and
     restored on startup, so sensors stay available with the most recent value
     even before the first live frame arrives (for example after a night restart).
+- **Sleep-aware readings** — When optimizers stop reporting (for example at
+    night), instantaneous production values (power, voltage, current,
+    performance, DC-DC duty cycle) are zeroed after a short timeout instead of
+    staying frozen at the last daytime value. Cumulative energy meters are left
+    untouched.
 - **Energy accumulation** — Trapezoidal Wh integration with proactive midnight reset and monotonic lifetime totals. Daily sensors zero at exactly midnight local time.
 - **No external dependencies** — The protocol parser library is fully embedded; nothing to install from PyPI.
 - **Options flow** — Add or remove optimizer modules at any time without reconfiguring.

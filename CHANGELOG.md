@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Zero instantaneous production values (power, voltage, current, performance,
+  DC-DC duty cycle) when an optimizer stops reporting (for example at night)
+  instead of leaving the last daytime values frozen. Cumulative energy meters
+  are preserved.
+
 ## [1.2.0] - 2026-03-07
 
 ### Changed

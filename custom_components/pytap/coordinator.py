@@ -36,6 +36,9 @@ from .const import (
     RECONNECT_DELAY,
     RECONNECT_RETRIES,
     RECONNECT_TIMEOUT,
+    STALE_CHECK_INTERVAL_SECONDS,
+    STALE_DATA_TIMEOUT_SECONDS,
+    STALE_ZERO_KEYS,
 )
 from .energy import EnergyAccumulator, accumulate_energy
 from .pytap.core.events import (
@@ -132,6 +135,9 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Midnight reset timer handle
         self._midnight_reset_unsub: asyncio.TimerHandle | None = None
 
+        # Stale-data check timer handle
+        self._stale_check_unsub: asyncio.TimerHandle | None = None
+
         # Source handle for cancellation — accessed from both threads
         self._source: Any = None
         self._source_lock = threading.Lock()
@@ -204,6 +210,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             name="pytap_listener",
         )
         self._schedule_midnight_reset()
+        self._schedule_stale_check()
 
     async def _async_listen(self) -> None:
         """Async wrapper to run the blocking listener in an executor."""
@@ -216,6 +223,10 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._midnight_reset_unsub is not None:
             self._midnight_reset_unsub.cancel()
             self._midnight_reset_unsub = None
+        # Cancel stale-data check timer
+        if self._stale_check_unsub is not None:
+            self._stale_check_unsub.cancel()
+            self._stale_check_unsub = None
         # Flush any pending state save
         if self._save_task is not None:
             self._save_task.cancel()
@@ -280,6 +291,48 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Re-schedule for the next midnight
         self._schedule_midnight_reset()
+
+    def _schedule_stale_check(self) -> None:
+        """Schedule the next periodic stale-data check."""
+        self._stale_check_unsub = self.hass.loop.call_later(
+            STALE_CHECK_INTERVAL_SECONDS, self._perform_stale_check
+        )
+
+    @callback
+    def _perform_stale_check(self) -> None:
+        """Zero instantaneous production values for nodes that stopped reporting.
+
+        When optimizers go to sleep (for example at night) they stop sending
+        power reports, leaving the last live values frozen.  This zeroes the
+        instantaneous electrical readings once a node has been silent longer
+        than ``STALE_DATA_TIMEOUT_SECONDS`` so sensors correctly reflect that
+        no power is being produced.  Cumulative energy meters and diagnostic
+        readings (temperature, RSSI) are left untouched.
+        """
+        self._stale_check_unsub = None
+        now = dt_util.now()
+        data_changed = False
+
+        for node_data in self.data.get("nodes", {}).values():
+            last_update_raw = node_data.get("last_update")
+            if not last_update_raw:
+                continue
+            last_update = dt_util.parse_datetime(last_update_raw)
+            if last_update is None:
+                continue
+            age = (now - last_update).total_seconds()
+            if age < STALE_DATA_TIMEOUT_SECONDS:
+                continue
+            for key in STALE_ZERO_KEYS:
+                if node_data.get(key) not in (None, 0, 0.0):
+                    node_data[key] = 0.0
+                    data_changed = True
+
+        if data_changed:
+            self.async_set_updated_data(dict(self.data))
+
+        # Re-schedule the next check
+        self._schedule_stale_check()
 
     def _listen(self) -> None:
         """Blocking listener loop (runs in executor thread).
