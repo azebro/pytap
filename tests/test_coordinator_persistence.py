@@ -1098,3 +1098,133 @@ class TestMidnightReset:
 
         mock_timer.cancel.assert_called_once()
         assert coordinator._midnight_reset_unsub is None
+
+class TestStaleDataCheck:
+    """Test that stale nodes have their instantaneous values zeroed."""
+
+    def _stale_node(self, age_seconds: float) -> dict:
+        """Build a node payload whose last_update is ``age_seconds`` in the past."""
+        last_update = (
+            dt_util.now() - timedelta(seconds=age_seconds)
+        ).isoformat()
+        return {
+            "power": 250.0,
+            "performance": 55.0,
+            "voltage_in": 30.0,
+            "voltage_out": 29.0,
+            "current_in": 8.0,
+            "current_out": 8.5,
+            "dc_dc_duty_cycle": 0.9,
+            "temperature": 40.0,
+            "rssi": -60,
+            "daily_energy_wh": 150.0,
+            "total_energy_wh": 5000.0,
+            "readings_today": 42,
+            "last_update": last_update,
+        }
+
+    def test_stale_node_zeros_instantaneous_values(
+        self, hass: HomeAssistant
+    ) -> None:
+        """A node silent past the timeout should have production values zeroed."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+        coordinator.async_set_updated_data = MagicMock()
+
+        coordinator.data["nodes"]["A-1234567B"] = self._stale_node(3600)
+
+        coordinator._perform_stale_check()
+
+        node = coordinator.data["nodes"]["A-1234567B"]
+        assert node["power"] == 0.0
+        assert node["performance"] == 0.0
+        assert node["voltage_in"] == 0.0
+        assert node["voltage_out"] == 0.0
+        assert node["current_in"] == 0.0
+        assert node["current_out"] == 0.0
+        assert node["dc_dc_duty_cycle"] == 0.0
+
+        # Cumulative meters and diagnostics are preserved
+        assert node["daily_energy_wh"] == 150.0
+        assert node["total_energy_wh"] == 5000.0
+        assert node["readings_today"] == 42
+        assert node["temperature"] == 40.0
+        assert node["rssi"] == -60
+
+        coordinator.async_set_updated_data.assert_called_once()
+
+    def test_fresh_node_left_unchanged(self, hass: HomeAssistant) -> None:
+        """A node that reported recently should not be altered."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+        coordinator.async_set_updated_data = MagicMock()
+
+        coordinator.data["nodes"]["A-1234567B"] = self._stale_node(5)
+
+        coordinator._perform_stale_check()
+
+        node = coordinator.data["nodes"]["A-1234567B"]
+        assert node["power"] == 250.0
+        assert node["voltage_in"] == 30.0
+        coordinator.async_set_updated_data.assert_not_called()
+
+    def test_already_zero_node_no_update(self, hass: HomeAssistant) -> None:
+        """A stale node already at zero should not trigger another update."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+        coordinator.async_set_updated_data = MagicMock()
+
+        node = self._stale_node(3600)
+        for key in (
+            "power",
+            "performance",
+            "voltage_in",
+            "voltage_out",
+            "current_in",
+            "current_out",
+            "dc_dc_duty_cycle",
+        ):
+            node[key] = 0.0
+        coordinator.data["nodes"]["A-1234567B"] = node
+
+        coordinator._perform_stale_check()
+
+        coordinator.async_set_updated_data.assert_not_called()
+
+    def test_node_without_last_update_skipped(self, hass: HomeAssistant) -> None:
+        """A node with no last_update timestamp should be skipped."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+        coordinator.async_set_updated_data = MagicMock()
+
+        node = self._stale_node(3600)
+        node["last_update"] = None
+        coordinator.data["nodes"]["A-1234567B"] = node
+
+        coordinator._perform_stale_check()
+
+        assert coordinator.data["nodes"]["A-1234567B"]["power"] == 250.0
+        coordinator.async_set_updated_data.assert_not_called()
+
+    def test_stale_check_reschedules(self, hass: HomeAssistant) -> None:
+        """The stale check should reschedule itself."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+        coordinator.async_set_updated_data = MagicMock()
+
+        coordinator._perform_stale_check()
+
+        assert coordinator._stale_check_unsub is not None
+
+    async def test_stop_cancels_stale_timer(self, hass: HomeAssistant) -> None:
+        """Stopping the listener should cancel the stale-data timer."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+
+        mock_timer = MagicMock()
+        coordinator._stale_check_unsub = mock_timer
+
+        await coordinator.async_stop_listener()
+
+        mock_timer.cancel.assert_called_once()
+        assert coordinator._stale_check_unsub is None
