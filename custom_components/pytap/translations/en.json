@@ -130,7 +130,9 @@
           "add_module": "Add a module",
           "remove_module": "Remove a module",
           "done": "Save and close",
-          "change_reporting": "Change reporting settings"
+          "change_reporting": "Change reporting settings",
+          "change_precision": "Change state precision",
+          "change_last_update": "Change last-update attribute"
         }
       },
       "change_connection": {
@@ -169,7 +171,7 @@
       },
       "change_reporting": {
         "title": "Reporting Settings",
-        "description": "Configure how this integration delivers data to Home Assistant.\n\nWhen **Live reporting** is enabled (default), readings are pushed as they arrive from the gateway with sub-second latency.\n\nTurn it off to cache readings and deliver a time-weighted average instead \u2014 you'll set the interval on the next screen. This reduces CPU and I/O load for installations with many panels.",
+        "description": "Configure how this integration delivers data to Home Assistant.\n\nWhen **Live reporting** is enabled (default), readings are pushed as they arrive from the gateway with sub-second latency.\n\nTurn it off to cache readings and deliver a time-weighted average instead — you'll set the interval on the next screen. This reduces CPU and I/O load for installations with many panels.",
         "data": {
           "live_reporting": "Live reporting"
         },
@@ -184,7 +186,39 @@
           "write_interval": "Reporting interval (seconds)"
         },
         "data_description": {
-          "write_interval": "How often (in seconds) to push time-weighted averaged updates to Home Assistant. Range: 5\u2013300. Default: 30 seconds."
+          "write_interval": "How often (in seconds) to push time-weighted averaged updates to Home Assistant. Range: 5–300. Default: 30 seconds."
+        }
+      },
+      "change_precision": {
+        "title": "State Precision (Rounding)",
+        "description": "Optionally round float sensor states to a fixed number of decimals before they are handed to Home Assistant. Dropdowns show example value after rounding; select \"off\" to keep raw values (default). Purpose: Rounding keeps stored values compact and reduces different values across consecutive readings. Raw values sit on fine device rasters (e.g. voltage steps of 0.05 V), and interval averaging produces long float tails (e.g. 34.4999961853) — rounded to 0.1, a flicker between 34.49 and 34.51 stays 34.5. Important: an unchanged state only skips recorder/InfluxDB writes if the sensor’s attributes are unchanged too. With the \"Last update attribute\" option (see the options menu) left at raw (the default), every reading still triggers a write regardless of rounding — enable quantization or turn the attribute off to realize the savings. Applies in both reporting modes (live and interval-averaged) and to per-module and aggregate (string/installation) sensors alike. Aggregates always sum raw readings internally, so rounding never compounds. Integer sensors (RSSI, readings) are never rounded; display precision in the UI remains a separate per-entity setting. Recommended for typical PV setups: voltage 0.1, current 0.01, power 1, temperature 0.1, percent 0.1, energy 0.1.",
+        "data": {
+          "voltage": "Voltage (V)",
+          "current": "Current (A)",
+          "power": "Power (W)",
+          "temperature": "Temperature (°C)",
+          "percent": "Percentages (performance, duty cycle)",
+          "energy": "Energy (Wh)"
+        },
+        "data_description": {
+          "voltage": "Applies to voltage_in and voltage_out of every module.",
+          "current": "Applies to current_in and current_out of every module.",
+          "power": "Applies to module, string and installation power.",
+          "temperature": "Applies to module temperature.",
+          "percent": "Applies to performance and DC/DC duty cycle.",
+          "energy": "Applies to daily and total energy (module, string, installation)."
+        }
+      },
+      "change_last_update": {
+        "title": "Last Update Attribute",
+        "description": "Each module sensor exposes a last_update attribute holding the timestamp of that module’s most recent reading. Home Assistant records a sensor whenever anything about it changes — including attributes. A full-resolution timestamp therefore forces a write for every single reading, even when the (rounded) state is identical — on larger installations this attribute, not the measurement, is what drives recorder and InfluxDB volume. Modes: raw — full-resolution timestamp, updated on every reading (default, previous behaviour). quantized — the floored timestamp is written once per interval and the attribute is omitted in between, so it costs almost nothing to store while still advancing once per interval; per-module “silent for X minutes” automations that read the live attribute no longer fire between intervals — read the most recent logged last_update (e.g. from InfluxDB) instead, which stops advancing when a module goes dark. off — attribute not exposed; note that Home Assistant’s built-in last_updated advances with every coordinator update — even for a module that has stopped reporting — so per-module outage detection needs raw or quantized. Current reporting configuration: {reporting_hint}.",
+        "data": {
+          "last_update_mode": "Mode",
+          "last_update_quantization": "Quantization interval (seconds)"
+        },
+        "data_description": {
+          "last_update_mode": "How the last_update attribute is maintained.",
+          "last_update_quantization": "Used in quantized mode only. In averaged reporting the value is normalized to a multiple of the reporting interval and forced to at least twice it — at 1× every flush would re-emit the timestamp and save nothing."
         }
       }
     }

@@ -23,6 +23,8 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_LAST_UPDATE_MODE,
+    CONF_LAST_UPDATE_QUANTIZATION,
     CONF_LIVE_REPORTING,
     CONF_MODULE_BARCODE,
     CONF_MODULE_NAME,
@@ -30,6 +32,8 @@ from .const import (
     CONF_MODULE_STRING,
     CONF_MODULES,
     CONF_WRITE_INTERVAL,
+    DEFAULT_LAST_UPDATE_MODE,
+    DEFAULT_LAST_UPDATE_QUANTIZATION,
     DEFAULT_LIVE_REPORTING,
     DEFAULT_PEAK_POWER,
     DEFAULT_PORT,
@@ -37,11 +41,14 @@ from .const import (
     DOMAIN,
     ENERGY_GAP_THRESHOLD_SECONDS,
     ENERGY_LOW_POWER_THRESHOLD_W,
+    LAST_UPDATE_MODE_OFF,
+    LAST_UPDATE_MODE_QUANTIZED,
     RECONNECT_DELAY,
     RECONNECT_RETRIES,
     RECONNECT_TIMEOUT,
 )
 from .energy import EnergyAccumulator, accumulate_energy
+from .last_update import compute_last_update
 from .pytap.core.events import (
     Event,
     InfrastructureEvent,
@@ -122,6 +129,37 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._write_interval = float(DEFAULT_WRITE_INTERVAL)
         self._write_interval = max(0.0, self._write_interval)
 
+        # Last-update attribute handling (v2.2, write-trigger control).
+        # ``raw`` keeps the previous per-reading timestamp, ``quantized``
+        # floors it to an n-second raster so the attribute (and therefore
+        # the recorder/InfluxDB write it triggers) changes at most once per
+        # raster step, ``off`` suppresses the attribute entirely.
+        self._last_update_mode: str = entry.data.get(
+            CONF_LAST_UPDATE_MODE, DEFAULT_LAST_UPDATE_MODE
+        )
+        try:
+            self._last_update_quantization: int = int(
+                entry.data.get(
+                    CONF_LAST_UPDATE_QUANTIZATION,
+                    DEFAULT_LAST_UPDATE_QUANTIZATION,
+                )
+            )
+        except (TypeError, ValueError):
+            self._last_update_quantization = DEFAULT_LAST_UPDATE_QUANTIZATION
+        if self._last_update_quantization <= 0:
+            self._last_update_quantization = DEFAULT_LAST_UPDATE_QUANTIZATION
+
+        # Per-module raster cell last emitted in quantized (sparse)
+        # mode, so the floored timestamp is written once per raster
+        # period and suppressed in between.  Keyed by barcode.
+        self._last_emitted_grid: dict[str, int | None] = {}
+
+        # Barcodes updated since the last live push, so the sparse quantized
+        # decision at the push boundary only advances raster cells for modules
+        # that actually reported this cycle (silent modules must not keep
+        # emitting, or outage detection breaks).
+        self._live_dirty: set[str] = set()
+
         # Build barcode allowlist from configured modules
         self._configured_barcodes: set[str] = {
             m[CONF_MODULE_BARCODE] for m in self._modules if m.get(CONF_MODULE_BARCODE)
@@ -196,6 +234,29 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_update_data(self) -> dict[str, Any]:
         """Return current data (push-based, no polling needed)."""
         return self.data
+
+    def _format_last_update(self, now: datetime, barcode: str) -> str | None:
+        """Return the ``last_update`` attribute value for one push boundary.
+
+        Delegates to :func:`compute_last_update` and advances this module's
+        raster-cell tracker.  ``raw`` returns the full-resolution timestamp
+        (previous behaviour), ``off`` returns ``None``, and ``quantized`` is
+        sparse: the floored timestamp is returned once per raster period and
+        ``None`` in between, so the attribute is written once per period and
+        omitted otherwise.
+
+        Must be called exactly once per push per module — in live reporting
+        that is per reading, in averaged reporting per flush — so the tracker
+        stays in step with what is actually pushed to Home Assistant.
+        """
+        value, cell = compute_last_update(
+            self._last_update_mode,
+            self._last_update_quantization,
+            now,
+            self._last_emitted_grid.get(barcode),
+        )
+        self._last_emitted_grid[barcode] = cell
+        return value
 
     def get_diagnostics_data(self) -> dict[str, Any]:
         """Return coordinator diagnostics snapshot."""
@@ -443,9 +504,35 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not self._ha_update_pending:
             return
         self.data["counters"] = parser.counters
+        if self._last_update_mode == LAST_UPDATE_MODE_QUANTIZED:
+            # Sparse write-once at the real push boundary (once per
+            # chunk): decide last_update per module that reported this
+            # cycle, so the floored timestamp survives to HA instead of
+            # being overwritten by a later reading of the same module in
+            # the same chunk.
+            push_now = dt_util.now()
+            for barcode in self._live_dirty:
+                node = self.data["nodes"].get(barcode)
+                if isinstance(node, dict):
+                    node["last_update"] = self._format_last_update(
+                        push_now, barcode
+                    )
+        self._live_dirty.clear()
         self.hass.loop.call_soon_threadsafe(
             self.async_set_updated_data,
-            {**self.data, "nodes": dict(self.data["nodes"])},
+            # Copy each node dict, not just the outer mapping.  The outer
+            # dict() guards against size-change-during-iteration, but the
+            # inner node dicts stayed shared: a following reading resetting
+            # last_update to None could overwrite the sparse timestamp before
+            # this scheduled HA update was processed, dropping the once-per-
+            # raster emission.  Independent copies make the snapshot stable.
+            {
+                **self.data,
+                "nodes": {
+                    b: (dict(n) if isinstance(n, dict) else n)
+                    for b, n in self.data["nodes"].items()
+                },
+            },
         )
         self._ha_update_pending = False
 
@@ -665,8 +752,21 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "total_energy_wh": round(acc.total_energy_wh, 2),
             "readings_today": acc.readings_today,
             "daily_reset_date": acc.daily_reset_date,
-            "last_update": now.isoformat(),
+            # last_update: store the raw per-reading timestamp here (None
+            # when off).  The sparse quantized decision is made at the push
+            # boundary — live in _push_live_update, averaged in
+            # _build_averaged_snapshot — because a single read chunk / flush
+            # collapses multiple readings per module to the last one, which
+            # would otherwise drop the once-per-raster emission.  raw keeps
+            # this per-reading value unchanged.
+            "last_update": (
+                None
+                if self._last_update_mode == LAST_UPDATE_MODE_OFF
+                else now.isoformat()
+            ),
         }
+        if self._live_reporting:
+            self._live_dirty.add(barcode)
         # Only buffer readings in interval/averaged mode.  In live mode the
         # raw values are pushed immediately, so buffering would grow without
         # bound and never be consumed.
@@ -896,6 +996,13 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
             else:
                 avg_node["performance"] = None
+            if self._last_update_mode == LAST_UPDATE_MODE_QUANTIZED:
+                # Sparse write-once: emit the floored timestamp on the
+                # first flush of each raster cell, suppress it (None) in
+                # between.  raw/off keep the value from the reading payload.
+                avg_node["last_update"] = self._format_last_update(
+                    dt_util.now(), barcode
+                )
             snapshot_nodes[barcode] = avg_node
         return {**self.data, "nodes": snapshot_nodes}
 
