@@ -43,12 +43,99 @@ from .const import (
     CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
     CONF_MODULES,
+    CONF_STATE_PRECISION,
     DEFAULT_PEAK_POWER,
     DOMAIN,
+    MAX_STATE_PRECISION,
+    MIN_STATE_PRECISION,
+    PRECISION_GROUP_CURRENT,
+    PRECISION_GROUP_ENERGY,
+    PRECISION_GROUP_PERCENT,
+    PRECISION_GROUP_POWER,
+    PRECISION_GROUP_TEMPERATURE,
+    PRECISION_GROUP_VOLTAGE,
+    PRECISION_GROUPS,
 )
 from .coordinator import PyTapDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
+
+
+# Maps each float-valued sensor description key to its physical quantity
+# group. One precision setting per group applies to per-module AND aggregate
+# sensors alike (aggregates sum raw coordinator data, so per-module rounding
+# never propagates into aggregate values). Integer sensors (rssi,
+# readings_today) are deliberately absent and are never rounded.
+_PRECISION_GROUP_BY_KEY: dict[str, str] = {
+    "voltage_in": PRECISION_GROUP_VOLTAGE,
+    "voltage_out": PRECISION_GROUP_VOLTAGE,
+    "current_in": PRECISION_GROUP_CURRENT,
+    "current_out": PRECISION_GROUP_CURRENT,
+    "power": PRECISION_GROUP_POWER,
+    "temperature": PRECISION_GROUP_TEMPERATURE,
+    "performance": PRECISION_GROUP_PERCENT,
+    "dc_dc_duty_cycle": PRECISION_GROUP_PERCENT,
+    "daily_energy": PRECISION_GROUP_ENERGY,
+    "total_energy": PRECISION_GROUP_ENERGY,
+}
+
+
+def _state_precision_from_entry(entry: ConfigEntry) -> dict[str, int]:
+    """Read the configured per-group state precision from a config entry.
+
+    Returns a validated ``{group: decimals}`` dict. Missing/invalid entries
+    are dropped, so behaviour without the option (empty dict) is identical
+    to versions before this feature existed. Values are clamped to the
+    supported round() range.
+    """
+    raw = entry.data.get(CONF_STATE_PRECISION)
+    if not isinstance(raw, dict):
+        if raw is not None:
+            _LOGGER.warning(
+                "Ignoring invalid state_precision %r — using raw values", raw
+            )
+        return {}
+    validated: dict[str, int] = {}
+    for group, value in raw.items():
+        if group not in PRECISION_GROUPS:
+            _LOGGER.warning("Ignoring unknown precision group %r", group)
+            continue
+        try:
+            precision = int(value)
+        except (TypeError, ValueError):
+            _LOGGER.warning(
+                "Ignoring invalid precision %r for group %s", value, group
+            )
+            continue
+        validated[group] = max(
+            MIN_STATE_PRECISION, min(MAX_STATE_PRECISION, precision)
+        )
+    return validated
+
+
+def _precision_for_key(
+    precision_map: dict[str, int], description_key: str
+) -> int | None:
+    """Resolve the precision for one sensor description key (None = off)."""
+    group = _PRECISION_GROUP_BY_KEY.get(description_key)
+    if group is None:
+        return None
+    return precision_map.get(group)
+
+
+def _apply_state_precision(
+    value: int | float | None, precision: int | None
+) -> int | float | None:
+    """Round a float sensor state to the configured precision.
+
+    ``None`` precision (off) and non-float values pass through unchanged, so
+    integer counters (e.g. readings_today) and unset states are never touched.
+    Rounding happens only at the state boundary — never inside the
+    coordinator's energy accumulation, where errors would compound.
+    """
+    if precision is None or not isinstance(value, float):
+        return value
+    return round(value, precision)
 
 
 def _coerce_restored_state_value(raw_state: str, sensor_key: str) -> int | float | None:
@@ -270,6 +357,8 @@ async def async_setup_entry(
     """
     coordinator: PyTapDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
     modules: list[dict[str, str]] = entry.data.get(CONF_MODULES, [])
+    # Read once at setup: options updates trigger a full reload (see __init__).
+    precision_map = _state_precision_from_entry(entry)
 
     entities: list[SensorEntity] = []
     string_to_barcodes: dict[str, list[str]] = {}
@@ -291,6 +380,9 @@ async def async_setup_entry(
                     description=description,
                     module_config=module_config,
                     entry=entry,
+                    state_precision=_precision_for_key(
+                        precision_map, description.key
+                    ),
                 )
             )
 
@@ -308,6 +400,9 @@ async def async_setup_entry(
                     description=description,
                     barcodes=barcodes,
                     device_info=device_info,
+                    state_precision=_precision_for_key(
+                        precision_map, description.key
+                    ),
                     unique_id=(
                         f"{DOMAIN}_{entry.entry_id}_string_{string_name}_{description.key}"
                     ),
@@ -328,6 +423,9 @@ async def async_setup_entry(
                     description=description,
                     barcodes=all_barcodes,
                     device_info=device_info,
+                    state_precision=_precision_for_key(
+                        precision_map, description.key
+                    ),
                     unique_id=(
                         f"{DOMAIN}_{entry.entry_id}_installation_{description.key}"
                     ),
@@ -353,10 +451,12 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
         description: PyTapSensorEntityDescription,
         module_config: dict[str, str],
         entry: ConfigEntry,
+        state_precision: int | None = None,
     ) -> None:
         """Initialize the sensor."""
         super().__init__(coordinator)
         self.entity_description = description
+        self._state_precision = state_precision
 
         self._barcode = module_config[CONF_MODULE_BARCODE]
         self._module_name = module_config[CONF_MODULE_NAME]
@@ -422,7 +522,9 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
             # Convert duty cycle from 0.0-1.0 to percentage
             if self.entity_description.key == "dc_dc_duty_cycle" and value is not None:
                 value = round(value * 100, 2)
-            self._attr_native_value = value
+            self._attr_native_value = _apply_state_precision(
+                value, self._state_precision
+            )
             self._restored_native_value = False
         else:
             if not self._restored_native_value:
@@ -487,10 +589,12 @@ class PyTapAggregateSensor(
         barcodes: list[str],
         device_info: DeviceInfo,
         unique_id: str,
+        state_precision: int | None = None,
     ) -> None:
         """Initialize aggregate sensor."""
         super().__init__(coordinator)
         self.entity_description = description
+        self._state_precision = state_precision
         self._barcodes = barcodes
         self._attr_unique_id = unique_id
         self._attr_device_info = device_info
@@ -593,8 +697,9 @@ class PyTapAggregateSensor(
                 total_peak_power += peak_power_value
 
             if total_peak_power > 0:
-                self._attr_native_value = round(
-                    (total_power / total_peak_power) * 100.0, 2
+                self._attr_native_value = _apply_state_precision(
+                    round((total_power / total_peak_power) * 100.0, 2),
+                    self._state_precision,
                 )
             else:
                 self._attr_native_value = None
@@ -613,7 +718,7 @@ class PyTapAggregateSensor(
             if value is not None:
                 total = (total or 0.0) + value
 
-        self._attr_native_value = total
+        self._attr_native_value = _apply_state_precision(total, self._state_precision)
         self._restored_native_value = False
         self.async_write_ha_state()
 

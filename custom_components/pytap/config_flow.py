@@ -6,7 +6,7 @@ rather than a comma-separated text blob.
 
 Flow: user (host/port) → modules_menu → add_module (repeat) → finish
 Options: init (menu) → add_module / remove_module / change_connection /
-         change_reporting → done
+         change_reporting / change_precision / change_last_update → done
 """
 
 from __future__ import annotations
@@ -28,20 +28,47 @@ from homeassistant.exceptions import HomeAssistantError
 import voluptuous as vol
 
 from .const import (
+    CONF_LAST_UPDATE_MODE,
+    CONF_LAST_UPDATE_QUANTIZATION,
     CONF_LIVE_REPORTING,
     CONF_MODULE_BARCODE,
     CONF_MODULE_NAME,
     CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
     CONF_MODULES,
+    CONF_STATE_PRECISION,
     CONF_WRITE_INTERVAL,
+    DEFAULT_LAST_UPDATE_MODE,
+    DEFAULT_LAST_UPDATE_QUANTIZATION,
     DEFAULT_LIVE_REPORTING,
     DEFAULT_PEAK_POWER,
     DEFAULT_PORT,
     DEFAULT_WRITE_INTERVAL,
     DOMAIN,
+    LAST_UPDATE_MODE_OFF,
+    LAST_UPDATE_MODE_QUANTIZED,
+    LAST_UPDATE_MODE_RAW,
+    MAX_LAST_UPDATE_QUANTIZATION,
     MAX_WRITE_INTERVAL,
+    MIN_LAST_UPDATE_QUANTIZATION,
     MIN_WRITE_INTERVAL,
+    PRECISION_GROUP_CURRENT,
+    PRECISION_GROUP_ENERGY,
+    PRECISION_GROUP_PERCENT,
+    PRECISION_GROUP_POWER,
+    PRECISION_GROUP_TEMPERATURE,
+    PRECISION_GROUP_VOLTAGE,
+    STATE_PRECISION_OFF,
+)
+from .last_update import normalize_quantization
+from homeassistant.helpers.selector import (
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
+    SelectOptionDict,
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -233,6 +260,47 @@ class PyTapConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_create_entry(title=title, data=data)
 
 
+def _precision_options(
+    example: float, unit: str, decimals: list[int]
+) -> list[SelectOptionDict]:
+    """Build dropdown options showing the example value after rounding.
+
+    E.g. for voltage 48.7654 V: "0.01 → 48.77 V". The -1 step follows
+    Python round() semantics (round to tens).
+    """
+    options: list[SelectOptionDict] = [
+        SelectOptionDict(
+            value=STATE_PRECISION_OFF,
+            label=f"off — raw value ({example} {unit})",
+        )
+    ]
+    for dec in decimals:
+        rounded = round(example, dec)
+        if dec <= 0:
+            shown = f"{int(rounded)}"
+            step = {0: "1", -1: "10"}[dec]
+        else:
+            shown = f"{rounded:.{dec}f}"
+            step = "0." + "0" * (dec - 1) + "1"
+        options.append(
+            SelectOptionDict(value=str(dec), label=f"{step} → {shown} {unit}")
+        )
+    return options
+
+
+# Per-group dropdown options. Example values are chosen so every offered
+# rounding step produces a visibly different result.
+_PRECISION_STEPS = [-1, 0, 1, 2, 3]
+_PRECISION_SELECTORS: dict[str, list[SelectOptionDict]] = {
+    PRECISION_GROUP_VOLTAGE: _precision_options(48.7654, "V", _PRECISION_STEPS),
+    PRECISION_GROUP_CURRENT: _precision_options(8.5472, "A", _PRECISION_STEPS),
+    PRECISION_GROUP_POWER: _precision_options(1234.5678, "W", _PRECISION_STEPS),
+    PRECISION_GROUP_TEMPERATURE: _precision_options(41.8712, "°C", _PRECISION_STEPS),
+    PRECISION_GROUP_PERCENT: _precision_options(64.5345, "%", _PRECISION_STEPS),
+    PRECISION_GROUP_ENERGY: _precision_options(4567.8912, "Wh", _PRECISION_STEPS),
+}
+
+
 class PyTapOptionsFlow(OptionsFlow):
     """Handle PyTap options — add/remove modules after setup."""
 
@@ -252,6 +320,8 @@ class PyTapOptionsFlow(OptionsFlow):
             menu_options=[
                 "change_connection",
                 "change_reporting",
+                "change_precision",
+                "change_last_update",
                 "add_module",
                 "remove_module",
                 "done",
@@ -392,6 +462,173 @@ class PyTapOptionsFlow(OptionsFlow):
         return self.async_show_form(
             step_id="set_interval",
             data_schema=schema,
+        )
+
+    async def async_step_change_precision(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Configure optional per-quantity rounding of float sensor states.
+
+        One dropdown per physical quantity (voltage, current, power,
+        temperature, percent, energy). ``off`` (default) keeps raw values —
+        identical to versions before this option existed. The setting applies
+        to per-module and aggregate sensors alike; aggregates always sum raw
+        coordinator data, so per-module rounding never propagates into
+        aggregate values. Display precision in the UI is a separate
+        per-entity setting and is not changed here.
+        """
+        if user_input is not None:
+            precision: dict[str, int] = {}
+            for group in _PRECISION_SELECTORS:
+                selection = user_input.get(group, STATE_PRECISION_OFF)
+                if selection != STATE_PRECISION_OFF:
+                    precision[group] = int(selection)
+            new_data = {**self._config_entry.data}
+            if precision:
+                new_data[CONF_STATE_PRECISION] = precision
+            else:
+                new_data.pop(CONF_STATE_PRECISION, None)
+            self.hass.config_entries.async_update_entry(
+                self._config_entry, data=new_data
+            )
+            return await self.async_step_init()
+
+        current = self._config_entry.data.get(CONF_STATE_PRECISION)
+        if not isinstance(current, dict):
+            current = {}
+
+        schema_dict: dict[Any, Any] = {}
+        for group, options in _PRECISION_SELECTORS.items():
+            default = (
+                str(int(current[group])) if group in current else STATE_PRECISION_OFF
+            )
+            schema_dict[vol.Optional(group, default=default)] = SelectSelector(
+                SelectSelectorConfig(
+                    options=options,
+                    mode=SelectSelectorMode.DROPDOWN,
+                )
+            )
+
+        return self.async_show_form(
+            step_id="change_precision",
+            data_schema=vol.Schema(schema_dict),
+        )
+
+    async def async_step_change_last_update(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Configure the per-module ``last_update`` attribute (v2.2).
+
+        HA records a sensor whenever anything about it changes, including
+        attributes. The full-resolution per-reading timestamp therefore
+        forces a recorder/InfluxDB write for every reading even when the
+        (rounded) state is unchanged — on larger installations this
+        attribute, not the measurement, drives write volume. Modes:
+
+        * ``raw`` (default) — full-resolution timestamp, previous behaviour.
+        * ``quantized`` — floored timestamp written once per interval and
+          omitted in between (near-``off`` storage; the timestamp still
+          advances once per interval). Live per-module outage automations
+          that read the attribute stop firing between intervals — detection
+          reads the last logged ``last_update`` (e.g. from InfluxDB) instead.
+        * ``off`` — attribute not exposed. HA's built-in ``last_updated``
+          advances with every coordinator update even for silent modules,
+          so per-module outage detection needs ``raw`` or ``quantized``.
+
+        In averaged reporting mode the quantization interval is clamped to
+        at least the reporting interval and normalized to a multiple of it —
+        the attribute cannot change more often than readings are delivered.
+        """
+        data = self._config_entry.data
+        write_interval = int(data.get(CONF_WRITE_INTERVAL, DEFAULT_WRITE_INTERVAL))
+        live_reporting = bool(
+            data.get(CONF_LIVE_REPORTING, DEFAULT_LIVE_REPORTING)
+        )
+
+        if user_input is not None:
+            mode = user_input.get(CONF_LAST_UPDATE_MODE, DEFAULT_LAST_UPDATE_MODE)
+            new_data = {**data}
+            if mode == LAST_UPDATE_MODE_RAW:
+                new_data.pop(CONF_LAST_UPDATE_MODE, None)
+                new_data.pop(CONF_LAST_UPDATE_QUANTIZATION, None)
+            elif mode == LAST_UPDATE_MODE_OFF:
+                new_data[CONF_LAST_UPDATE_MODE] = mode
+                new_data.pop(CONF_LAST_UPDATE_QUANTIZATION, None)
+            else:
+                seconds = int(
+                    user_input.get(
+                        CONF_LAST_UPDATE_QUANTIZATION,
+                        DEFAULT_LAST_UPDATE_QUANTIZATION,
+                    )
+                )
+                seconds = normalize_quantization(
+                    seconds, write_interval, live_reporting
+                )
+                new_data[CONF_LAST_UPDATE_MODE] = mode
+                new_data[CONF_LAST_UPDATE_QUANTIZATION] = seconds
+            self.hass.config_entries.async_update_entry(
+                self._config_entry, data=new_data
+            )
+            return await self.async_step_init()
+
+        current_mode = data.get(CONF_LAST_UPDATE_MODE, DEFAULT_LAST_UPDATE_MODE)
+        current_quant = int(
+            data.get(
+                CONF_LAST_UPDATE_QUANTIZATION, DEFAULT_LAST_UPDATE_QUANTIZATION
+            )
+        )
+        mode_options = [
+            SelectOptionDict(
+                value=LAST_UPDATE_MODE_RAW,
+                label="raw — full timestamp, changes on every reading (default)",
+            ),
+            SelectOptionDict(
+                value=LAST_UPDATE_MODE_QUANTIZED,
+                label="quantized — written once per interval, absent in between",
+            ),
+            SelectOptionDict(
+                value=LAST_UPDATE_MODE_OFF,
+                label="off — attribute not exposed",
+            ),
+        ]
+        schema = vol.Schema(
+            {
+                vol.Optional(
+                    CONF_LAST_UPDATE_MODE, default=current_mode
+                ): SelectSelector(
+                    SelectSelectorConfig(
+                        options=mode_options,
+                        mode=SelectSelectorMode.DROPDOWN,
+                    )
+                ),
+                vol.Optional(
+                    CONF_LAST_UPDATE_QUANTIZATION, default=current_quant
+                ): NumberSelector(
+                    NumberSelectorConfig(
+                        min=MIN_LAST_UPDATE_QUANTIZATION,
+                        max=MAX_LAST_UPDATE_QUANTIZATION,
+                        step=1,
+                        mode=NumberSelectorMode.BOX,
+                        unit_of_measurement="s",
+                    )
+                ),
+            }
+        )
+        return self.async_show_form(
+            step_id="change_last_update",
+            data_schema=schema,
+            description_placeholders={
+                "reporting_hint": (
+                    "live reporting is enabled — any value from "
+                    f"{MIN_LAST_UPDATE_QUANTIZATION} s applies as-is"
+                    if live_reporting
+                    else (
+                        "averaged mode with a "
+                        f"{write_interval} s reporting interval — the value "
+                        "is normalized to a multiple of it (at least 2×)"
+                    )
+                ),
+            },
         )
 
     async def async_step_add_module(
