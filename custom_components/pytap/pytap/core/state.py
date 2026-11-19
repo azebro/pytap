@@ -137,13 +137,11 @@ class PersistentState:
     def to_dict(self) -> dict:
         """Serialise to a JSON-compatible dict for HA Store."""
         return {
-            "gateway_identities": {
-                str(k): str(v) for k, v in self.gateway_identities.items()
-            },
-            "gateway_versions": {str(k): v for k, v in self.gateway_versions.items()},
+            "gateway_identities": {str(k): str(v) for k, v in dict(self.gateway_identities).items()},
+            "gateway_versions": {str(k): v for k, v in dict(self.gateway_versions).items()},
             "gateway_node_tables": {
-                str(gw): {str(nid): str(addr) for nid, addr in nodes.items()}
-                for gw, nodes in self.gateway_node_tables.items()
+                str(gw): {str(nid): str(addr) for nid, addr in dict(nodes).items()}
+                for gw, nodes in dict(self.gateway_node_tables).items()
             },
         }
 

@@ -2,6 +2,14 @@
   "config": {
     "step": {
       "user": {
+        "title": "Choose Connection",
+        "description": "Choose how PyTap receives the passive Tigo byte stream.",
+        "menu_options": {
+          "tcp": "TCP gateway",
+          "serial": "Serial / Home Assistant proxy"
+        }
+      },
+      "tcp": {
         "title": "Connect to Tigo Gateway",
         "description": "Provide the connection details for your Tigo gateway.",
         "data": {
@@ -13,12 +21,32 @@
           "port": "The port number (default: 502)."
         }
       },
+      "serial": {
+        "title": "Serial / Home Assistant Proxy",
+        "description": "Select a local serial adapter or a proxy port. For a proxy, add an ESPHome device with serial_proxy to Home Assistant first. Offline ports can be entered manually. PyTap only listens; it never writes to the bus.",
+        "data": {
+          "serial_port": "Serial port or proxy",
+          "baud_rate": "Baud rate"
+        },
+        "data_description": {
+          "serial_port": "Choose the actual port, including when a device exposes multiple proxies.",
+          "baud_rate": "UART speed (default: 38400). Framing is fixed to 8N1 with no flow control."
+        }
+      },
       "modules_menu": {
         "title": "Configure Modules",
-        "description": "{modules_list}\n\n{error}",
+        "description": "{modules_list}\n\nDiscovery mode: **{discovery_mode}**. With automatic discovery enabled, you can finish without adding modules. PyTap will listen for optimizer barcodes and create sensors as they arrive; this can take time.\n\n{error}",
         "menu_options": {
           "add_module": "Add a module",
+          "discovery": "Module discovery settings",
           "finish": "Finish setup"
+        }
+      },
+      "discovery": {
+        "title": "Module Discovery",
+        "description": "Automatically discover optimizers from passive bus traffic. No bus commands are sent. Names are based on barcodes, string grouping starts as Discovered, and rated panel power is unknown until edited. Turn this off to track only modules you add manually.",
+        "data": {
+          "auto_discovery": "Automatically discover modules"
         }
       },
       "add_module": {
@@ -42,22 +70,32 @@
       }
     },
     "error": {
-      "cannot_connect": "Failed to connect to the Tigo gateway. Check host and port.",
-      "invalid_auth": "Invalid authentication",
+      "cannot_connect": "Could not connect to this endpoint. Check the settings, or submit again to save them anyway and keep retrying in the background.",
       "invalid_barcode": "Invalid barcode format. Expected format like A-1234567B.",
       "missing_string": "String group is required.",
       "missing_name": "Module name is required.",
       "missing_barcode": "Barcode is required.",
       "duplicate_barcode": "This barcode has already been added.",
-      "no_modules": "At least one module must be added.",
-      "unknown": "Unexpected error"
-    },
-    "abort": {
-      "already_configured": "This gateway is already configured."
+      "no_modules": "Manual mode requires at least one module. Add a module, or go back and enable automatic discovery.",
+      "invalid_host": "Enter a hostname or IP address.",
+      "invalid_port": "Enter a port between 1 and 65535.",
+      "invalid_serial_port": "Choose a serial device under /dev (for example /dev/serial/by-id/…) or a valid Home Assistant serial-proxy URL.",
+      "invalid_baud_rate": "Enter a baud rate between 1 and 4000000.",
+      "invalid_connection_type": "Choose TCP or serial.",
+      "serial_port_in_use": "Another PyTap entry already uses this serial port, or is still releasing it.",
+      "connection_in_use": "A PyTap entry that is still shutting down holds this connection. Wait a moment and try again.",
+      "unsupported_serial_settings": "The serial backend does not support these settings. Check the selected port and baud rate."
     }
   },
   "entity": {
     "sensor": {
+      "module_discovery": {
+        "name": "Module discovery",
+        "state": {
+          "waiting_for_modules": "Waiting for modules",
+          "modules_discovered": "Modules discovered"
+        }
+      },
       "performance": {
         "name": "Performance"
       },
@@ -124,16 +162,52 @@
     "step": {
       "init": {
         "title": "PyTap Options",
-        "description": "{modules_list}",
+        "description": "{modules_list}\n\nDiscovery mode: **{discovery_mode}**. Module and discovery changes are applied with Save and close.",
         "menu_options": {
           "change_connection": "Change connection settings",
           "add_module": "Add a module",
+          "edit_module": "Edit a module",
+          "change_discovery": "Change module discovery",
           "remove_module": "Remove a module",
           "done": "Save and close",
-          "change_reporting": "Change reporting settings"
+          "change_reporting": "Change reporting settings",
+          "change_stale": "Change stale reading behaviour"
+        }
+      },
+      "change_discovery": {
+        "title": "Module Discovery",
+        "description": "Enable passive discovery of new optimizers. Disabling this stops adding new modules but keeps modules already discovered. Removed modules are ignored until explicitly added again. Save and close applies this setting.",
+        "data": {
+          "auto_discovery": "Automatically discover modules"
+        }
+      },
+      "edit_module": {
+        "title": "Edit Module",
+        "data": {
+          "barcode": "Select module"
+        }
+      },
+      "module_details": {
+        "title": "Module Details",
+        "description": "Edit the optimizer name, string group, and rated panel power. Barcode-based entity IDs and energy history are preserved. Save and close applies the changes.",
+        "data": {
+          "name": "Name",
+          "string": "String group",
+          "peak_power": "Peak power (Wp)"
+        },
+        "data_description": {
+          "peak_power": "Enter the panel's rated watts, or 0 if unknown. Performance percentages are unavailable until the rating is known."
         }
       },
       "change_connection": {
+        "title": "Change Connection Settings",
+        "description": "Choose the connection type. Your modules, entity IDs, reporting settings, and energy history are preserved.",
+        "menu_options": {
+          "change_tcp": "TCP gateway",
+          "change_serial": "Serial / Home Assistant proxy"
+        }
+      },
+      "change_tcp": {
         "title": "Change Connection Settings",
         "description": "Update the IP address and port of your Tigo gateway.",
         "data": {
@@ -143,6 +217,18 @@
         "data_description": {
           "host": "The hostname or IP address of your Tigo gateway.",
           "port": "The port number (default: 502)."
+        }
+      },
+      "change_serial": {
+        "title": "Serial / Home Assistant Proxy",
+        "description": "Select a local adapter or an ESPHome serial-proxy port already added to Home Assistant. You can retain or manually enter an offline endpoint. Connection changes are saved immediately and reload PyTap.",
+        "data": {
+          "serial_port": "Serial port or proxy",
+          "baud_rate": "Baud rate"
+        },
+        "data_description": {
+          "serial_port": "Select the actual port; the current port is not probed while PyTap is using it.",
+          "baud_rate": "UART speed (default: 38400). Framing is fixed to 8N1 with no flow control."
         }
       },
       "add_module": {
@@ -186,7 +272,101 @@
         "data_description": {
           "write_interval": "How often (in seconds) to push time-weighted averaged updates to Home Assistant. Range: 5\u2013300. Default: 30 seconds."
         }
+      },
+      "change_stale": {
+        "title": "Stale Readings",
+        "description": "Choose what live panel readings (power, voltage, current, temperature, duty cycle, RSSI and performance) do when a panel stops sending valid reports, for example at night or during radio dropouts. Energy totals are not affected.",
+        "data": {
+          "stale_action": "When a panel stops reporting",
+          "stale_timeout": "Timeout (seconds)"
+        },
+        "data_description": {
+          "stale_action": "Unavailable: show readings as unavailable. Zero: report 0 for power, voltage, current and performance (other readings become unavailable). Hold: keep the last values, including after a restart.",
+          "stale_timeout": "How long without a valid report before a panel counts as stale (60–600 s). In averaged reporting mode the reporting interval is added."
+        }
       }
+    },
+    "error": {
+      "invalid_host": "Enter a hostname or IP address.",
+      "no_modules": "Manual mode requires at least one module. Add a module, or enable automatic discovery before saving.",
+      "missing_name": "Module name is required.",
+      "missing_string": "String group is required.",
+      "invalid_port": "Enter a port between 1 and 65535.",
+      "invalid_serial_port": "Choose a serial device under /dev (for example /dev/serial/by-id/…) or a valid Home Assistant serial-proxy URL.",
+      "invalid_baud_rate": "Enter a baud rate between 1 and 4000000.",
+      "invalid_connection_type": "Choose TCP or serial.",
+      "serial_port_in_use": "Another PyTap entry already uses this serial port, or is still releasing it.",
+      "connection_in_use": "A PyTap entry that is still shutting down holds this connection. Wait a moment and try again.",
+      "unsupported_serial_settings": "The serial backend does not support these settings. Check the selected port and baud rate.",
+      "cannot_connect": "Could not connect to this endpoint. Check the settings, or submit again to save them anyway and keep retrying in the background.",
+      "invalid_barcode": "Invalid barcode format. Expected format like A-1234567B.",
+      "duplicate_barcode": "This barcode has already been added.",
+      "missing_barcode": "Barcode is required."
+    }
+  },
+  "selector": {
+    "stale_action": {
+      "options": {
+        "unavailable": "Unavailable",
+        "zero": "Zero",
+        "hold": "Hold last value"
+      }
+    }
+  },
+  "exceptions": {
+    "previous_listener_stopping": {
+      "message": "The previous PyTap listener is still releasing its connection; setup will retry."
+    },
+    "invalid_connection_settings": {
+      "message": "The saved {field} setting is invalid. Update it with Configure → Change connection settings; the entry then retries setup."
+    },
+    "capture_entry_not_loaded": {
+      "message": "Select a loaded PyTap config entry."
+    },
+    "capture_busy": {
+      "message": "A packet capture, export or deletion is already running or stopping."
+    },
+    "stop_before_export": {
+      "message": "Stop the packet capture before exporting it."
+    },
+    "capture_id_required": {
+      "message": "Select a stopped capture ID."
+    },
+    "invalid_capture_id": {
+      "message": "The capture ID is invalid."
+    },
+    "capture_not_found": {
+      "message": "Capture {capture_id} was not found."
+    },
+    "capture_active": {
+      "message": "Stop the active packet capture before deleting it."
+    },
+    "capture_unsafe": {
+      "message": "The capture contains unexpected files or links and was not changed."
+    },
+    "listener_not_running": {
+      "message": "The PyTap listener is not running."
+    },
+    "invalid_duration": {
+      "message": "Duration must be between {min} and {max} minutes."
+    },
+    "invalid_storage": {
+      "message": "Storage budget must be between {min} and {max} MiB."
+    },
+    "storage_budget_exhausted": {
+      "message": "No packet capture storage budget remains ({available_mib} MiB available). Delete old captures or raise the budget."
+    },
+    "export_budget_exceeded": {
+      "message": "Exporting needs about {required_mib} MiB but only {available_mib} MiB of the storage budget remains. Delete old captures or raise the budget."
+    },
+    "capture_failed": {
+      "message": "Packet capture action failed ({error}); check capture status and available storage."
+    },
+    "capture_invalid": {
+      "message": "The selected packet capture is incomplete, corrupt or in an unsupported format; inspect it with the offline replay script or delete it."
+    },
+    "export_insufficient_space": {
+      "message": "Exporting needs about {required_mib} MiB but only {available_mib} MiB of disk space is free. Free disk space or delete old captures."
     }
   }
 }

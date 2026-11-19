@@ -131,6 +131,20 @@ def _make_mock_coordinator(hass, entry, node_data=None):
     coordinator.hass = hass
     coordinator.config_entry = entry
     coordinator.last_update_success = True
+    coordinator.modules = entry.data.get(CONF_MODULES, [])
+    coordinator.module_count = len(
+        {m.get(CONF_MODULE_BARCODE) for m in coordinator.modules if m.get(CONF_MODULE_BARCODE)}
+    )
+    coordinator.auto_discovery = False
+    coordinator.module_peak_power.side_effect = lambda barcode: next(
+        (
+            m.get(CONF_MODULE_PEAK_POWER, 455)
+            for m in coordinator.modules
+            if m.get(CONF_MODULE_BARCODE) == barcode
+        ),
+        455,
+    )
+    coordinator.is_reporting.return_value = True
     coordinator.async_request_refresh = AsyncMock()
     return coordinator
 
@@ -140,8 +154,7 @@ async def test_sensor_entities_created(hass: HomeAssistant) -> None:
     entry = _make_mock_config_entry(hass)
     coordinator = _make_mock_coordinator(hass, entry)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
 
@@ -159,8 +172,7 @@ async def test_sensor_unique_ids(hass: HomeAssistant) -> None:
     entry = _make_mock_config_entry(hass)
     coordinator = _make_mock_coordinator(hass, entry)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -180,8 +192,7 @@ async def test_sensor_available_with_data(hass: HomeAssistant) -> None:
     entry = _make_mock_config_entry(hass)
     coordinator = _make_mock_coordinator(hass, entry, node_data=MOCK_NODE_DATA)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -204,8 +215,7 @@ async def test_sensor_unavailable_without_data(hass: HomeAssistant) -> None:
     entry = _make_mock_config_entry(hass)
     coordinator = _make_mock_coordinator(hass, entry, node_data={})
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -231,8 +241,7 @@ async def test_sensor_skips_modules_without_barcode(hass: HomeAssistant) -> None
     }
     coordinator = _make_mock_coordinator(hass, entry)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -246,8 +255,7 @@ async def test_sensor_device_info(hass: HomeAssistant) -> None:
     entry = _make_mock_config_entry(hass)
     coordinator = _make_mock_coordinator(hass, entry)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -287,8 +295,7 @@ async def test_daily_energy_last_reset(hass: HomeAssistant) -> None:
     entry = _make_mock_config_entry(hass)
     coordinator = _make_mock_coordinator(hass, entry, node_data=MOCK_NODE_DATA)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -319,8 +326,7 @@ async def test_aggregate_entity_count_single_string(hass: HomeAssistant) -> None
     entry = _make_mock_config_entry(hass, modules=modules)
     coordinator = _make_mock_coordinator(hass, entry)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -333,8 +339,7 @@ async def test_readings_today_sensor_metadata(hass: HomeAssistant) -> None:
     entry = _make_mock_config_entry(hass)
     coordinator = _make_mock_coordinator(hass, entry, node_data=MOCK_NODE_DATA)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -352,8 +357,7 @@ async def test_readings_today_value_and_last_reset(hass: HomeAssistant) -> None:
     entry = _make_mock_config_entry(hass)
     coordinator = _make_mock_coordinator(hass, entry, node_data=MOCK_NODE_DATA)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -388,8 +392,7 @@ async def test_string_power_sums_constituents(hass: HomeAssistant) -> None:
     entry = _make_mock_config_entry(hass, modules=modules)
     coordinator = _make_mock_coordinator(hass, entry, node_data=MOCK_NODE_DATA_TWO)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -409,8 +412,7 @@ async def test_installation_power_sums_all(hass: HomeAssistant) -> None:
     entry = _make_mock_config_entry(hass)
     coordinator = _make_mock_coordinator(hass, entry, node_data=MOCK_NODE_DATA_TWO)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -444,8 +446,7 @@ async def test_string_daily_energy_sums(hass: HomeAssistant) -> None:
     entry = _make_mock_config_entry(hass, modules=modules)
     coordinator = _make_mock_coordinator(hass, entry, node_data=MOCK_NODE_DATA_TWO)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -479,8 +480,7 @@ async def test_string_total_energy_sums(hass: HomeAssistant) -> None:
     entry = _make_mock_config_entry(hass, modules=modules)
     coordinator = _make_mock_coordinator(hass, entry, node_data=MOCK_NODE_DATA_TWO)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -500,8 +500,7 @@ async def test_installation_daily_energy_sums_all(hass: HomeAssistant) -> None:
     entry = _make_mock_config_entry(hass)
     coordinator = _make_mock_coordinator(hass, entry, node_data=MOCK_NODE_DATA_TWO)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -521,8 +520,7 @@ async def test_installation_total_energy_sums_all(hass: HomeAssistant) -> None:
     entry = _make_mock_config_entry(hass)
     coordinator = _make_mock_coordinator(hass, entry, node_data=MOCK_NODE_DATA_TWO)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -542,8 +540,7 @@ async def test_aggregate_available_partial_data(hass: HomeAssistant) -> None:
     entry = _make_mock_config_entry(hass)
     coordinator = _make_mock_coordinator(hass, entry, node_data=MOCK_NODE_DATA)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -565,8 +562,7 @@ async def test_aggregate_excludes_none_values(hass: HomeAssistant) -> None:
     }
     coordinator = _make_mock_coordinator(hass, entry, node_data=node_data)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -586,8 +582,7 @@ async def test_performance_sensor_value(hass: HomeAssistant) -> None:
     entry = _make_mock_config_entry(hass)
     coordinator = _make_mock_coordinator(hass, entry, node_data=MOCK_NODE_DATA)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -631,8 +626,7 @@ async def test_string_performance_weighted(hass: HomeAssistant) -> None:
     }
     coordinator = _make_mock_coordinator(hass, entry, node_data=node_data)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -664,8 +658,7 @@ async def test_installation_performance_partial_data(hass: HomeAssistant) -> Non
     }
     coordinator = _make_mock_coordinator(hass, entry, node_data=node_data)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -691,8 +684,7 @@ async def test_installation_performance_unavailable_without_data(
     }
     coordinator = _make_mock_coordinator(hass, entry, node_data=node_data)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -719,8 +711,7 @@ async def test_performance_sensor_zero_power(hass: HomeAssistant) -> None:
     }
     coordinator = _make_mock_coordinator(hass, entry, node_data=node_data)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -746,8 +737,7 @@ async def test_performance_sensor_above_100(hass: HomeAssistant) -> None:
     }
     coordinator = _make_mock_coordinator(hass, entry, node_data=node_data)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -766,8 +756,7 @@ async def test_aggregate_extra_attributes(hass: HomeAssistant) -> None:
     entry = _make_mock_config_entry(hass)
     coordinator = _make_mock_coordinator(hass, entry, node_data=MOCK_NODE_DATA)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -788,8 +777,7 @@ async def test_string_aggregate_device_info(hass: HomeAssistant) -> None:
     entry = _make_mock_config_entry(hass)
     coordinator = _make_mock_coordinator(hass, entry, node_data=MOCK_NODE_DATA_TWO)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -811,8 +799,7 @@ async def test_installation_aggregate_device_info(hass: HomeAssistant) -> None:
     entry = _make_mock_config_entry(hass)
     coordinator = _make_mock_coordinator(hass, entry, node_data=MOCK_NODE_DATA_TWO)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -834,8 +821,7 @@ async def test_aggregate_daily_energy_last_reset(hass: HomeAssistant) -> None:
     entry = _make_mock_config_entry(hass)
     coordinator = _make_mock_coordinator(hass, entry, node_data=MOCK_NODE_DATA_TWO)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -856,8 +842,7 @@ async def test_aggregate_total_energy_no_last_reset(hass: HomeAssistant) -> None
     entry = _make_mock_config_entry(hass)
     coordinator = _make_mock_coordinator(hass, entry, node_data=MOCK_NODE_DATA_TWO)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -875,8 +860,7 @@ async def test_no_string_aggregates_when_no_modules(hass: HomeAssistant) -> None
     entry = _make_mock_config_entry(hass, modules=[])
     coordinator = _make_mock_coordinator(hass, entry)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
@@ -903,13 +887,14 @@ def test_coerce_restored_state_value_ignores_unavailable() -> None:
 async def test_restart_restores_snapshot_before_live_stream(
     hass: HomeAssistant,
 ) -> None:
-    """After restart, sensors should be available from restored snapshot data."""
+    """After restart, energy restores from snapshot but live readings wait for a report."""
     entry = MockConfigEntry(
         domain=DOMAIN,
         data={
             CONF_HOST: "192.168.1.100",
             CONF_PORT: DEFAULT_PORT,
             CONF_MODULES: [MOCK_MODULES[0]],
+            "stale_action": "unavailable",  # Opt-in; the default holds values.
         },
         entry_id="restart_restore_entry",
         title="PyTap (192.168.1.100)",
@@ -970,8 +955,8 @@ async def test_restart_restores_snapshot_before_live_stream(
     assert power_entity_id is not None
     power_state = hass.states.get(power_entity_id)
     assert power_state is not None
-    assert power_state.state != STATE_UNAVAILABLE
-    assert float(power_state.state) == 299.2
+    # A restored reading is not current: it must not masquerade as live data.
+    assert power_state.state == STATE_UNAVAILABLE
 
     # Verify energy sensors restore from coordinator snapshot (not zeroed)
     daily_energy_entity_id = ent_reg.async_get_entity_id(
@@ -998,8 +983,12 @@ async def test_restart_restores_snapshot_before_live_stream(
     assert installation_power_entity_id is not None
     installation_power_state = hass.states.get(installation_power_entity_id)
     assert installation_power_state is not None
-    assert installation_power_state.state != STATE_UNAVAILABLE
-    assert float(installation_power_state.state) == 299.2
+    assert installation_power_state.state == STATE_UNAVAILABLE
+
+    installation_energy_id = ent_reg.async_get_entity_id(
+        "sensor", DOMAIN, f"{DOMAIN}_{entry.entry_id}_installation_total_energy"
+    )
+    assert float(hass.states.get(installation_energy_id).state) == 2000.0
 
 
 async def test_restart_uses_restore_entity_fallback_without_snapshot(
@@ -1012,6 +1001,7 @@ async def test_restart_uses_restore_entity_fallback_without_snapshot(
             CONF_HOST: "192.168.1.100",
             CONF_PORT: DEFAULT_PORT,
             CONF_MODULES: [MOCK_MODULES[0]],
+            "stale_action": "unavailable",  # Opt-in; the default holds values.
         },
         entry_id="restart_restore_fallback_entry",
         title="PyTap (192.168.1.100)",
@@ -1061,8 +1051,12 @@ async def test_restart_uses_restore_entity_fallback_without_snapshot(
     assert power_entity_id is not None
     power_state = hass.states.get(power_entity_id)
     assert power_state is not None
-    assert power_state.state != STATE_UNAVAILABLE
-    assert float(power_state.state) == 123.4
+    assert power_state.state == STATE_UNAVAILABLE
+
+    energy_entity_id = ent_reg.async_get_entity_id("sensor", DOMAIN, f"{DOMAIN}_A-1234567B_total_energy")
+    energy_state = hass.states.get(energy_entity_id)
+    assert energy_state is not None
+    assert float(energy_state.state) == 123.4
 
     installation_power_entity_id = ent_reg.async_get_entity_id(
         "sensor", DOMAIN, f"{DOMAIN}_{entry.entry_id}_installation_power"
@@ -1070,5 +1064,9 @@ async def test_restart_uses_restore_entity_fallback_without_snapshot(
     assert installation_power_entity_id is not None
     installation_power_state = hass.states.get(installation_power_entity_id)
     assert installation_power_state is not None
-    assert installation_power_state.state != STATE_UNAVAILABLE
-    assert float(installation_power_state.state) == 456.7
+    assert installation_power_state.state == STATE_UNAVAILABLE
+
+    installation_energy_id = ent_reg.async_get_entity_id(
+        "sensor", DOMAIN, f"{DOMAIN}_{entry.entry_id}_installation_total_energy"
+    )
+    assert float(hass.states.get(installation_energy_id).state) == 456.7

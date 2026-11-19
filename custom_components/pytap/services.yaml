@@ -1,0 +1,110 @@
+start_capture:
+  name: Start packet capture
+  description: >-
+    Passively record raw bus bytes to private files. Disabled after restart/reload.
+    Captures contain hardware identifiers and diagnostic text; share deliberately.
+    Stop on storage/duration limits instead of deleting older evidence.
+  fields:
+    config_entry_id:
+      name: PyTap instance
+      required: true
+      selector:
+        config_entry:
+          integration: pytap
+    duration_minutes:
+      name: Maximum duration (minutes)
+      default: 1440
+      selector:
+        number:
+          min: 1
+          max: 10080
+          mode: box
+    max_storage_mib:
+      name: Storage budget (MiB)
+      description: Includes existing captures/exports for this instance. No files are automatically deleted.
+      default: 1024
+      selector:
+        number:
+          min: 16
+          max: 4096
+          mode: box
+stop_capture:
+  name: Stop packet capture
+  description: Stop admitting reads and drain/flush the private capture files.
+  fields:
+    config_entry_id:
+      name: PyTap instance
+      required: true
+      selector:
+        config_entry:
+          integration: pytap
+capture_status:
+  name: Packet capture status
+  description: Report state, losses, limits, and local paths without exposing recorded bytes.
+  fields:
+    config_entry_id:
+      name: PyTap instance
+      required: true
+      selector:
+        config_entry:
+          integration: pytap
+    capture_id:
+      name: Capture ID
+      description: Optional stopped session ID; omit for the current session.
+      selector:
+        text:
+list_captures:
+  name: List packet captures
+  description: List the latest 20 private capture sessions, including completeness/loss flags.
+  fields:
+    config_entry_id:
+      name: PyTap instance
+      required: true
+      selector:
+        config_entry:
+          integration: pytap
+export_capture:
+  name: Export packet capture
+  description: Validate and ZIP a stopped capture locally. The archive is not exposed over HTTP.
+  fields:
+    config_entry_id:
+      name: PyTap instance
+      required: true
+      selector:
+        config_entry:
+          integration: pytap
+    capture_id:
+      name: Capture ID
+      description: Optional stopped session ID; omit for the current session.
+      selector:
+        text:
+    max_storage_mib:
+      name: Storage budget (MiB)
+      description: >-
+        The archive counts toward this budget, together with other captures/exports for this instance
+        (the capture being exported is not counted against itself). Defaults to the capture's own budget.
+      selector:
+        number:
+          min: 16
+          max: 4096
+          mode: box
+delete_capture:
+  name: Delete packet capture
+  description: >-
+    Permanently delete one stopped capture session and its exported archives (including archives left
+    behind after the capture folder was removed). The active session
+    cannot be deleted. Captures are stored in the Home Assistant configuration directory and are
+    therefore included in Home Assistant backups; delete them (and older backups) to remove them fully.
+  fields:
+    config_entry_id:
+      name: PyTap instance
+      required: true
+      selector:
+        config_entry:
+          integration: pytap
+    capture_id:
+      name: Capture ID
+      description: Stopped session ID from the list captures action.
+      required: true
+      selector:
+        text:

@@ -5,6 +5,7 @@ PV application, and observer) into a single Parser class with a
 feed(bytes) -> list[Event] interface.
 """
 
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from enum import Enum, auto
@@ -22,6 +23,7 @@ from .events import (
 )
 from .state import NodeTableBuilder, PersistentState, SlotClock
 from .types import (
+    MAX_SLOT_NUMBER,
     Address,
     Frame,
     FrameType,
@@ -88,6 +90,14 @@ class _Counters:
     runts: int = 0
     giants: int = 0
     noise_bytes: int = 0
+    # Slot counters outside 0..MAX_SLOT_NUMBER (corrupt or unknown encoding).
+    invalid_slots: int = 0
+    # RECEIVE_RESPONSE frames with an invalid header slot whose packets passed
+    # strict framing checks (kept) or failed them (dropped).
+    invalid_slot_frames_kept: int = 0
+    invalid_slot_frames_dropped: int = 0
+    # Power reports discarded because the gateway had no slot clock yet.
+    no_slot_clock_drops: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +125,45 @@ def _interpret_packet_number_lo(new_lo: int, old: int) -> int:
     return (new_hi << 8) | new_lo
 
 
+_KNOWN_PACKET_TYPES: frozenset[int] = frozenset(int(t) for t in PacketType)
+# Data lengths that are valid for packet types with a fixed layout.
+_PACKET_DATA_LENGTHS: dict[int, frozenset[int]] = {
+    PacketType.POWER_REPORT: frozenset({13, 15}),
+}
+_MAX_NODE_ADDRESS = 0x7FFF
+
+
+def _strict_received_packets(
+    data: bytes,
+) -> list[tuple[ReceivedPacketHeader, bytes]] | None:
+    """Walk received packets, returning None unless every byte is accounted for.
+
+    Requires exact consumption (no truncated header/data, no trailing bytes)
+    and well-formed headers: known packet type, node address in
+    1..0x7FFF and a data length consistent with the packet type.
+    """
+    packets: list[tuple[ReceivedPacketHeader, bytes]] = []
+    offset = 0
+    while offset < len(data):
+        end_of_header = offset + ReceivedPacketHeader.HEADER_SIZE
+        if end_of_header > len(data):
+            return None
+        header = ReceivedPacketHeader.from_bytes(data[offset:end_of_header])
+        end = end_of_header + header.data_length
+        if end > len(data):
+            return None
+        if header.packet_type not in _KNOWN_PACKET_TYPES:
+            return None
+        if not 1 <= header.node_address <= _MAX_NODE_ADDRESS:
+            return None
+        lengths = _PACKET_DATA_LENGTHS.get(header.packet_type)
+        if lengths is not None and header.data_length not in lengths:
+            return None
+        packets.append((header, data[end_of_header:end]))
+        offset = end
+    return packets
+
+
 # ---------------------------------------------------------------------------
 #  Parser
 # ---------------------------------------------------------------------------
@@ -131,7 +180,11 @@ class Parser:
     def __init__(
         self,
         persistent_state: PersistentState | None = None,
+        *,
+        clock: Callable[[], datetime] | None = None,
     ):
+        # Offline replay supplies observation time; live behavior is unchanged.
+        self._clock = clock or (lambda: datetime.now())
         # Frame accumulator state
         self._state: _FrameState = _FrameState.IDLE
         self._buffer: bytearray = bytearray()
@@ -144,6 +197,7 @@ class Parser:
         # Slot clocks (one per gateway)
         self._slot_clocks: dict[int, SlotClock] = {}
         self._captured_slot_times: dict[int, datetime] = {}
+        self._no_slot_clock_warned: set[int] = set()
 
         # Enumeration state
         self._enum_state: _EnumerationState | None = None
@@ -379,7 +433,7 @@ class Parser:
         gw_id = frame.address.gateway_id.value
         packet_number = int.from_bytes(payload[2:4], "big")
         self._rx_packet_numbers[gw_id] = packet_number
-        self._captured_slot_times[gw_id] = datetime.now()
+        self._captured_slot_times[gw_id] = self._clock()
         return []
 
     def _handle_receive_response(self, frame: Frame) -> list[Event]:
@@ -436,9 +490,17 @@ class Parser:
         # Update stored packet number
         self._rx_packet_numbers[gw_id] = packet_number
 
-        # Update slot clock
+        # Update slot clock. An invalid header counter must never index the
+        # clock. It also suggests the variable-length header (status_type) was
+        # mis-decoded, so the packet data may start at the wrong offset. Such
+        # frames are kept only if the packet walk is exact and well-formed;
+        # otherwise the whole frame is dropped rather than risk bogus reports.
         capture_time = self._captured_slot_times.pop(gw_id, None)
-        if capture_time is not None:
+        header_slot_invalid = slot_counter.slot_number > MAX_SLOT_NUMBER
+        if header_slot_invalid:
+            self._counters.invalid_slots += 1
+            logger.debug("Receive response gw=%d: invalid slot counter 0x%04X", gw_id, slot_counter.raw)
+        elif capture_time is not None:
             if gw_id in self._slot_clocks:
                 self._slot_clocks[gw_id].set(slot_counter, capture_time)
             else:
@@ -446,10 +508,26 @@ class Parser:
 
         # Parse received packets
         received_data = payload[offset:]
+        if header_slot_invalid:
+            strict_packets = _strict_received_packets(received_data)
+            if strict_packets is None:
+                self._counters.invalid_slot_frames_dropped += 1
+                logger.debug(
+                    "Receive response gw=%d: invalid header slot and malformed packet data, frame dropped",
+                    gw_id,
+                )
+                return []
+            if strict_packets:
+                self._counters.invalid_slot_frames_kept += 1
+            packets = strict_packets
+        else:
+            packets = [
+                (ReceivedPacketHeader.from_bytes(header_bytes), pkt_data)
+                for header_bytes, pkt_data in iter_received_packets(received_data)
+            ]
         events: list[Event] = []
-        for header_bytes, pkt_data in iter_received_packets(received_data):
+        for header, pkt_data in packets:
             try:
-                header = ReceivedPacketHeader.from_bytes(header_bytes)
                 events.extend(self._parse_pv_packet(gw_id, header, pkt_data))
             except (ValueError, IndexError):
                 pass
@@ -693,10 +771,21 @@ class Parser:
         except (ValueError, IndexError):
             return []
 
+        if report.slot_counter.slot_number > MAX_SLOT_NUMBER:
+            # No valid timestamp can be derived for this measurement.
+            self._counters.invalid_slots += 1
+            logger.debug("Power report gw=%d node=%d: invalid slot counter, dropped", gw_id, node_id)
+            return []
         slot_clock = self._slot_clocks.get(gw_id)
         if slot_clock is None:
-            logger.warning(
-                "No slot clock for gateway %d, discarding power report", gw_id
+            self._counters.no_slot_clock_drops += 1
+            if gw_id in self._no_slot_clock_warned:
+                logger.debug("No slot clock for gateway %d, discarding power report", gw_id)
+            else:
+                self._no_slot_clock_warned.add(gw_id)
+                logger.warning(
+                    "No slot clock for gateway %d yet, discarding power reports until one is established",
+                    gw_id,
             )
             return []
 
@@ -738,7 +827,7 @@ class Parser:
                 node_id=node_id,
                 direction="response",
                 content=content,
-                timestamp=datetime.now(),
+                timestamp=self._clock(),
             )
         ]
 
@@ -754,7 +843,7 @@ class Parser:
                 gateway_id=gw_id,
                 node_id=node_id,
                 data=data,
-                timestamp=datetime.now(),
+                timestamp=self._clock(),
             )
         ]
 
@@ -883,7 +972,7 @@ class Parser:
                 node_id=node_addr.value,
                 direction="request",
                 content=request_str,
-                timestamp=datetime.now(),
+                timestamp=self._clock(),
             )
         ]
 
@@ -917,6 +1006,6 @@ class Parser:
             InfrastructureEvent(
                 gateways=gateways,
                 nodes=nodes,
-                timestamp=datetime.now(),
+                timestamp=self._clock(),
             )
         ]
