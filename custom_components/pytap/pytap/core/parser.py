@@ -5,6 +5,7 @@ PV application, and observer) into a single Parser class with a
 feed(bytes) -> list[Event] interface.
 """
 
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from enum import Enum, auto
@@ -179,7 +180,11 @@ class Parser:
     def __init__(
         self,
         persistent_state: PersistentState | None = None,
+        *,
+        clock: Callable[[], datetime] | None = None,
     ):
+        # Offline replay supplies observation time; live behavior is unchanged.
+        self._clock = clock or (lambda: datetime.now())
         # Frame accumulator state
         self._state: _FrameState = _FrameState.IDLE
         self._buffer: bytearray = bytearray()
@@ -428,7 +433,7 @@ class Parser:
         gw_id = frame.address.gateway_id.value
         packet_number = int.from_bytes(payload[2:4], "big")
         self._rx_packet_numbers[gw_id] = packet_number
-        self._captured_slot_times[gw_id] = datetime.now()
+        self._captured_slot_times[gw_id] = self._clock()
         return []
 
     def _handle_receive_response(self, frame: Frame) -> list[Event]:
@@ -822,7 +827,7 @@ class Parser:
                 node_id=node_id,
                 direction="response",
                 content=content,
-                timestamp=datetime.now(),
+                timestamp=self._clock(),
             )
         ]
 
@@ -838,7 +843,7 @@ class Parser:
                 gateway_id=gw_id,
                 node_id=node_id,
                 data=data,
-                timestamp=datetime.now(),
+                timestamp=self._clock(),
             )
         ]
 
@@ -967,7 +972,7 @@ class Parser:
                 node_id=node_addr.value,
                 direction="request",
                 content=request_str,
-                timestamp=datetime.now(),
+                timestamp=self._clock(),
             )
         ]
 
@@ -1001,6 +1006,6 @@ class Parser:
             InfrastructureEvent(
                 gateways=gateways,
                 nodes=nodes,
-                timestamp=datetime.now(),
+                timestamp=self._clock(),
             )
         ]

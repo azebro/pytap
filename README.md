@@ -229,15 +229,7 @@ PyTap diagnostics are available from the integration page:
 3. Use the menu (⋮) and select **Download diagnostics**.
 
 The diagnostics JSON includes parser counters, infrastructure and node mappings,
-discovered barcodes, connection state, and per-node summaries (including whether each panel is currently reporting). Host/IP and complete serial endpoints are not included; transport type, baud rate, and retry state remain visible.
-
-Power reports with an invalid slot counter are dropped. A receive-response
-frame with an invalid header slot counter never updates the slot clock; its
-reports are kept only if its packets parse exactly and are all well-formed
-(otherwise the whole frame is dropped), and like any report they are dropped
-while the gateway has no slot clock yet. The parser counts these in
-`invalid_slots`, `invalid_slot_frames_kept`, `invalid_slot_frames_dropped` and
-`no_slot_clock_drops`.
+discovered barcodes, connection state, packet-capture status, and per-node summaries (including whether each panel is currently reporting). Host/IP, complete serial endpoints and capture file paths are not included; transport type, baud rate, and retry state remain visible.
 
 ---
 
@@ -269,6 +261,136 @@ On startup, PyTap restores persisted coordinator state (barcode mappings, discov
 
 ## Development
 
+### Raw packet capture (opt-in)
+
+Version 1.5 adds admin-only actions under **Tools → Actions**. Capture is **off
+by default**, and never resumes automatically after a restart or integration
+reload. It copies reads from the existing listener before decoding, without
+opening another connection or transmitting any bus commands. A running capture
+is stopped and finalised when Home Assistant shuts down.
+
+1. Call **`pytap.start_capture`**, select the PyTap instance, and choose:
+   - `duration_minutes`: maximum duration, default **1440** (24 hours).
+   - `max_storage_mib`: storage budget, default **1024** (1 GiB).
+2. Use **`pytap.capture_status`** to check progress, stop reason, queue/disk
+   errors, and dropped bytes/records. Capture status is also in diagnostics.
+3. Call **`pytap.stop_capture`** when finished, or let the limit stop it.
+4. **`pytap.list_captures`** lists the latest 20 sessions, including those from
+   previous runs. Pass a returned `capture_id` to status/export for an older
+   session, or omit it to use the current session.
+5. **`pytap.export_capture`** validates and creates a private ZIP, returning its
+   local archive path. Retrieve it through Samba/your existing file-management
+   app. It is deliberately **not published at a web endpoint**. Stop recording
+   before exporting. The ZIP counts toward the storage budget together with the
+   instance's other captures and exports, but not the capture being exported
+   (optional `max_storage_mib`, default that capture's own budget). It must also
+   fit in free disk space (keeping 64 MiB spare); otherwise the export is
+   refused.
+6. **`pytap.delete_capture`** permanently deletes one stopped session and its
+   exported ZIPs, including ZIPs left behind after the session folder was
+   removed. The active session can't be deleted.
+
+The writer uses a bounded, non-blocking queue. On backpressure it stops recording
+and reports loss rather than slowing the parser. On storage exhaustion it stops
+instead of deleting earlier evidence. Raw segments rotate at **16 MiB**; the
+budget includes existing recordings/exports for that config entry and reserves
+space for metadata. Captures are never deleted automatically while the PyTap
+entry exists; free budget with `delete_capture` after copying what you need.
+Deleting the PyTap entry deletes all of its captures; if an export is still
+running, they are deleted once it finishes. Exports and deletions keep running
+across an integration reload, and new captures, exports and deletions are
+refused until they finish.
+
+Files live in the Home Assistant configuration directory, below
+`/config/pytap_captures/<config_entry_id>/<capture_id>/` (ZIPs are written next
+to the session directory). They are therefore **included in Home Assistant
+backups**; delete captures, and older backups, to remove them fully. Each
+session directory contains:
+
+| File                   | Contents                                                                                                                                                          |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bus-000000.bin`, …    | Unchanged bytes: unknown types, bad CRCs, escaped bytes, extra report fields, and noise                                                                           |
+| `chunks-000000.bin`, … | UTC/monotonic nanoseconds, logical byte offset, length, connection generation (`<QQQII`, little-endian, 32 bytes/record)                                          |
+| `events.jsonl`         | Connection open/close/error markers (error type only), without endpoints or exception text                                                                        |
+| `manifest.json`        | Source/framing/software versions, initial infrastructure, SHA-256 checksums/counts for every file (including `events.jsonl`), completeness/loss/error information |
+
+New captures use manifest format 2. Format 1 captures (from earlier versions of
+this feature) can still be listed, replayed and exported, but their
+`events.jsonl` has no checksum and is reported as unverified.
+
+The manifest is rewritten only when something changed (at most every 10 seconds
+while recording, plus at rotation and stop), and only after the data it
+describes has been flushed to disk.
+
+Timestamps describe **when a source read returned**, not exact UART-byte airtime.
+Rotation can split a read into index records with the same timestamp. `complete`
+only asserts that the local recorder finalized without known loss; it cannot
+prove that the ESPHome UART, network, or hardware did not drop bytes upstream.
+Failed disk chunks count bytes not confirmed written and indexed, even when an
+unindexed raw tail remains available for forensic inspection.
+
+Captures contain hardware identifiers and possibly diagnostic/configuration
+text. Directories/files are private; metadata excludes endpoints/credentials.
+Do not put recordings in `/config/www`, upload automatically, or publish without
+reviewing them. Record ordinary traffic plus a natural enumeration/startup
+cycle. Check status rather than assuming a full 24 hours fits the chosen budget.
+
+### Offline replay and inspection
+
+Download/extract a session and run from this repository with Python 3.11+:
+
+```bash
+python3 scripts/replay_capture.py /path/to/session --output /path/to/new-export
+```
+
+No HA installation is needed. Source files are never changed and an existing
+output directory is never overwritten. The tool streams evidence and produces:
+
+- `chunks.jsonl`: readable observation times, offsets, lengths and connections.
+- `frames.jsonl`: supported/unknown packets, wire bytes, complete headers and
+  payloads, CRC flags, unknown/extra measurement bytes, noise and incomplete
+  frames. Invalid-CRC measurements are inspection-only. Each frame also says
+  whether the live parser would have dropped it (`live_parser_would_drop`,
+  with a `live_parser_drop_reason` such as `crc_mismatch` or `giant`); frames
+  larger than the live parser accepts are flagged `giant`, also when they end
+  in an invalid escape. If the capture started while PyTap was already
+  connected, or bytes were lost within a connection, the live parser's framing
+  state is unknown: until it can be determined, frames get
+  `live_parser_would_drop: null` with reason `unknown_at_capture_start` or
+  `unknown_after_capture_gap`.
+- `events.jsonl`: current decoder events, using recorded UTC observations for
+  slot-clock reconstruction rather than replay time. Correlation resets at
+  reconnects/gaps; the recorded infrastructure snapshot bootstraps discovery.
+- `summary.json`: completeness/loss, format version, inspection counts and
+  counts of frames the live parser would drop or whose verdict is unknown.
+  `integrity_verified` is only true for complete format 2 captures.
+
+Incomplete captures require `--allow-incomplete`. Stale checksums/counts and
+partial rows produce warnings and an unverified/incomplete summary, never
+invented bytes. Unindexed tails remain in raw files/ZIP but are not replayed as
+timestamped chunks. A checksum mismatch in a supposedly complete capture is
+always an error, even with that override. Oversized corrupt frames are exported
+as bounded fragments; their full byte stream remains in the raw evidence.
+
+An interrupted capture can still be exported, even if its index ends in
+corrupt rows (for example after a power cut); replay stops at the first invalid
+row. If a crash created rotated segments before updating the manifest, ZIP
+export also preserves those unlisted files. ZIPs of incomplete captures, and of
+captures with validation warnings or unverified files (such as a format 1
+event log), include
+`recovery.json`, which lists any validation warnings and unlisted files and
+records whether the archive could be verified. Unlisted files are not automatically timestamp-replayed. The initial parser
+state is snapshotted in the listener immediately before the first admitted
+read, so infrastructure changes during file preparation cannot silently assign
+new measurements to stale barcodes. Power reports with an invalid slot counter
+remain inspectable as raw frames but are dropped by the measurement decoder. A
+receive-response frame with an invalid header slot counter never updates the
+slot clock; its reports are kept only if its packets parse exactly and are all
+well-formed (otherwise the whole frame is dropped), and like any report they
+are dropped while the gateway has no slot clock yet. The parser counts these in
+`invalid_slots`, `invalid_slot_frames_kept`, `invalid_slot_frames_dropped` and
+`no_slot_clock_drops`.
+
 This repository includes a dev container with Home Assistant pre-installed for local development and testing.
 
 ### Project Structure
@@ -277,6 +399,7 @@ This repository includes a dev container with Home Assistant pre-installed for l
 pytap/
 ├── custom_components/pytap/     # The HA custom component
 │   ├── __init__.py              # Integration lifecycle, migrations, device removal
+│   ├── capture_services.py      # Packet-capture actions (start/stop/status/list/export/delete)
 │   ├── config_flow.py           # Config & options flows
 │   ├── connection.py            # TCP/serial settings validation and serial source
 │   ├── const.py                 # Constants
@@ -284,10 +407,16 @@ pytap/
 │   ├── diagnostics.py           # Diagnostics download
 │   ├── energy.py                # Energy accumulation helpers
 │   ├── sensor.py                # Sensor platform (12 per-optimizer types + aggregates)
+│   ├── services.yaml            # Action descriptions
 │   ├── manifest.json            # Integration metadata
 │   ├── strings.json             # UI strings
 │   ├── translations/en.json     # English translations
 │   └── pytap/                   # Embedded protocol parser library
+│       └── core/
+│           ├── capture.py       # Raw packet capture writer, validation, export
+│           └── replay.py        # Offline frame inspection and replay
+├── scripts/
+│   └── replay_capture.py        # Offline capture inspection/replay tool
 ├── deploy/                      # Deployment tooling
 │   ├── deploy.sh                # Deploy script (SSH-based)
 │   └── .deploy.env.example      # Example credentials config
@@ -325,7 +454,7 @@ The current published harness pins HA 2026.10.4; its private fixtures are not co
 ### Linting
 
 ```bash
-python3 -m ruff check custom_components/pytap/ tests/
+python3 -m ruff check custom_components/pytap/ tests/ scripts/
 ```
 
 ### Deploying to a Home Assistant Instance

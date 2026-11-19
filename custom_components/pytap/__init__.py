@@ -13,9 +13,12 @@ from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.typing import ConfigType
 
+from .capture_services import async_remove_captures, register_capture_services
 from .connection import InvalidConnectionSettings
 from .const import (
     CONF_AUTO_DISCOVERY,
@@ -48,6 +51,7 @@ from .coordinator import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 
@@ -75,6 +79,12 @@ _LEGACY_UNIQUE_ID_RENAMES: dict[str, str] = {
 }
 # Old unique IDs that no longer have a corresponding entity at all.
 _LEGACY_UNIQUE_IDS_TO_REMOVE: set[str] = {"voltage", "current"}
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Register actions once, independent of an individual config entry."""
+    register_capture_services(hass)
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: PyTapConfigEntry) -> bool:
@@ -140,8 +150,8 @@ def _async_stop_on_shutdown(
 ) -> None:
     """Stop the listener when Home Assistant stops.
 
-    Home Assistant doesn't unload entries on shutdown: stop the listener
-    explicitly so its worker exits and the final state save runs.
+    Home Assistant doesn't unload entries on shutdown: stop the listener and
+    finalise any packet capture explicitly so its files stay verifiable.
     """
     remove_listener: CALLBACK_TYPE | None = None
 
@@ -221,7 +231,7 @@ def _async_park(hass: HomeAssistant, entry_id: str, coordinator: PyTapDataUpdate
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Delete this entry's saved state with the entry.
+    """Delete this entry's private packet captures and saved state with the entry.
 
     A listener that is still stopping is given a bounded wait first and can no
     longer save, so it can't recreate the deleted Store.
@@ -233,8 +243,9 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
                 del parked[entry.entry_id]
         else:
             # It stays parked, so its port counts as in use until the worker exits.
-            _LOGGER.warning("PyTap listener is still stopping; deleting its saved state anyway")
+            _LOGGER.warning("PyTap listener is still stopping; deleting its captures and saved state anyway")
         coordinator.release_barcode_claims()
+    await async_remove_captures(hass, entry.entry_id)
     await coordinator_store(hass, entry.entry_id).async_remove()
 
 

@@ -9,6 +9,7 @@ import time
 from unittest.mock import MagicMock, patch
 
 from homeassistant.config_entries import ConfigEntryState
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.helpers import device_registry as dr
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -121,6 +122,20 @@ async def test_slow_stop_does_not_strand_the_entry(hass):
         assert await hass.config_entries.async_unload(entry.entry_id)
 
 
+async def test_home_assistant_stop_finalises_capture(hass):
+    """Review #2: HA doesn't unload entries on shutdown; the capture must still close."""
+    entry = _entry(hass)
+    with patch("custom_components.pytap.coordinator.PyTapDataUpdateCoordinator._listen", _idle_listen):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        coordinator = entry.runtime_data
+        await coordinator.async_start_capture(1, 16)
+        hass.bus.async_fire(EVENT_HOMEASSISTANT_STOP)
+        await hass.async_block_till_done()
+        status = await coordinator.async_capture_info()
+    assert status["state"] == "stopped"
+    assert status["complete"] is True
+
+
 async def test_invalid_saved_port_is_a_clear_setup_error(hass):
     """Review #13: a value older versions accepted fails with a translated reason, no retries."""
     entry = _entry(hass, port=70000)
@@ -228,12 +243,14 @@ async def test_connection_loss_logged_once(hass, caplog):
     assert "errno 111" in warnings[0].message
 
 
-async def test_removing_entry_deletes_saved_state(hass):
+async def test_removing_entry_deletes_saved_state_and_captures(hass):
     entry = _entry(hass)
     with (
         patch("custom_components.pytap.coordinator.PyTapDataUpdateCoordinator._listen", return_value=None),
         patch("custom_components.pytap.coordinator._MigratingStore.async_remove") as remove_store,
+        patch("custom_components.pytap.async_remove_captures") as remove_captures,
     ):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.config_entries.async_remove(entry.entry_id)
     remove_store.assert_awaited_once()
+    remove_captures.assert_awaited_once_with(hass, entry.entry_id)

@@ -6,7 +6,7 @@ Passively monitors the RS-485 bus between a Tigo Cloud Connect Advanced (CCA) ga
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.10+ for the parser (3.11+ for `core.capture` / `core.replay`)
 - No dependencies for core library usage (`pyserial` only for `SerialSource`)
 
 ## Library Usage
@@ -64,6 +64,21 @@ restored_state = PersistentState.from_dict(saved)
 parser = pytap.create_parser(persistent_state=restored_state)
 ```
 
+### Replaying Recorded Data
+
+`create_parser()` accepts an optional keyword-only `clock` (a callable returning
+`datetime`) used instead of wall time, e.g. to replay recorded traffic with its
+original timestamps. `pytap.core.replay.replay_events()` does this for captures
+written by `pytap.core.capture.CaptureWriter`:
+
+```python
+from pytap.core.capture import iter_capture
+from pytap.core.replay import replay_events
+
+for item in replay_events(iter_capture(session_dir)):
+    print(item["observed_utc_ns"], item["event"])
+```
+
 ### Barcode Utilities
 
 ```python
@@ -101,9 +116,11 @@ pytap/
 ├── api.py             # Top-level functions: create_parser, parse_bytes, connect
 ├── core/
 │   ├── barcode.py     # Tigo barcode encode/decode
+│   ├── capture.py     # Raw byte recording, validation, export, deletion
 │   ├── crc.py         # CRC-16-CCITT calculation
 │   ├── events.py      # Event dataclasses (PowerReportEvent, etc.)
 │   ├── parser.py      # Core protocol parser (frame → event pipeline)
+│   ├── replay.py      # Offline frame inspection and timestamped replay
 │   ├── source.py      # TcpSource, SerialSource (byte providers)
 │   ├── state.py       # SlotClock, NodeTableBuilder, PersistentState
 │   └── types.py       # Protocol types (GatewayID, Frame, PowerReport, etc.)

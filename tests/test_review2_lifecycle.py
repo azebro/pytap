@@ -362,12 +362,16 @@ async def test_remove_waits_for_parked_listener_and_blocks_its_saves(hass):
     order = []
     save = AsyncMock(side_effect=lambda *_: order.append("save"))
 
+    async def remove_captures(*_):
+        order.append("captures")
+
     async def remove_store(*_):
         order.append("store")
 
     with (
         patch(LISTEN, _stuck_worker(release)),
         patch(SAVE, save),
+        patch("custom_components.pytap.async_remove_captures", remove_captures),
         patch("custom_components.pytap.coordinator._MigratingStore.async_remove", remove_store),
     ):
         assert await hass.config_entries.async_setup(entry.entry_id)
@@ -383,7 +387,7 @@ async def test_remove_waits_for_parked_listener_and_blocks_its_saves(hass):
             hass.loop.call_soon(release.set)
             await removal
         await hass.async_block_till_done()
-    assert order == ["store"]  # The stopped listener never saved.
+    assert order == ["captures", "store"]  # The stopped listener never saved.
     save.assert_not_called()
     assert entry.entry_id not in parked_coordinators(hass)
 
@@ -395,6 +399,7 @@ async def test_remove_with_still_stuck_listener_deletes_anyway_and_keeps_port_cl
     with (
         patch(LISTEN, _stuck_worker(release)),
         patch(SAVE, save),
+        patch("custom_components.pytap.async_remove_captures") as remove_captures,
         patch("custom_components.pytap.coordinator._MigratingStore.async_remove") as remove_store,
         patch(STOP_TIMEOUT, 0.1),
     ):
@@ -402,8 +407,9 @@ async def test_remove_with_still_stuck_listener_deletes_anyway_and_keeps_port_cl
         coordinator = entry.runtime_data
         coordinator._unsaved_changes = True
         await hass.config_entries.async_remove(entry.entry_id)
+        remove_captures.assert_awaited_once()
         remove_store.assert_awaited_once()
-        assert "deleting its saved state anyway" in caplog.text
+        assert "deleting its captures and saved state anyway" in caplog.text
         # The deleted entry's worker still holds the port.
         settings = {"connection_type": "serial", "serial_port": "/dev/ttyUSB0", "baud_rate": 38400}
         assert await serial_port_claimed(hass, settings)
@@ -527,14 +533,25 @@ async def test_flapping_link_warns_once_and_logs_recovery_once(hass, caplog):
     assert coordinator._retries == 0
 
 
-async def test_clean_tcp_stop_logs_no_connection_error(hass, socket_enabled, caplog):
+async def test_clean_tcp_stop_records_no_connection_error(hass, socket_enabled):
     server = socket.socket()
     server.bind(("127.0.0.1", 0))
     server.listen(1)
     entry = _entry(hass, host="127.0.0.1", port=server.getsockname()[1])
     coordinator = PyTapDataUpdateCoordinator(hass, entry)
     coordinator._async_load_coordinator_state = AsyncMock()
-    caplog.set_level(logging.DEBUG, logger="custom_components.pytap.coordinator")
+    calls = []
+    capture = MagicMock(busy=False)
+    capture.mark.side_effect = lambda kind, *args, **kwargs: calls.append(kind)
+    capture.request_stop.side_effect = lambda reason: calls.append("request_stop")
+    coordinator._capture = capture
+    interrupt = coordinator._interrupt_source
+
+    def tracked_interrupt():
+        calls.append("interrupt")
+        interrupt()
+
+    coordinator._interrupt_source = tracked_interrupt
     try:
         await coordinator.async_start_listener()
         peer, _ = await hass.async_add_executor_job(server.accept)
@@ -543,9 +560,9 @@ async def test_clean_tcp_stop_logs_no_connection_error(hass, socket_enabled, cap
         peer.close()
     finally:
         server.close()
-    assert "Connected to Tigo byte stream" in caplog.text
-    assert "unavailable" not in caplog.text
-    assert "Connection attempt failed" not in caplog.text
+    assert "connection_open" in calls
+    assert "connection_error" not in calls
+    assert calls.index("request_stop") < calls.index("interrupt")
 
 
 # --- Serial bridge (#5 test gap) ---

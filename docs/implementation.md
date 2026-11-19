@@ -20,6 +20,8 @@ For the high-level architecture and design rationale, see [architecture.md](arch
    - [coordinator.py — Data Coordinator](#coordinatorpy--data-coordinator)
    - [energy.py — Energy Accumulation](#energypy--energy-accumulation)
    - [sensor.py — Sensor Platform](#sensorpy--sensor-platform)
+   - [capture_services.py and pytap/core/capture.py — Packet Capture](#capture_servicespy-and-pytapcorecapturepy--packet-capture)
+   - [pytap/core/replay.py and scripts/replay_capture.py — Offline Replay](#pytapcorereplaypy-and-scriptsreplay_capturepy--offline-replay)
    - [diagnostics.py — Diagnostics Platform](#diagnosticspy--diagnostics-platform)
    - [\_\_init\_\_.py — Integration Lifecycle](#__init__py--integration-lifecycle)
    - [strings.json / translations — UI Strings](#stringsjson--translations--ui-strings)
@@ -50,6 +52,7 @@ PyTap is a Home Assistant custom component that passively monitors Tigo TAP sola
 | Restart behavior | Store restores mappings, discovered modules, energy and node snapshots; live readings are shown before the first new report only with `hold` |
 | External dependencies | `serialx` (serial/proxy); parser library embedded |
 | Entity types | Per optimizer: 12 sensors; 4 aggregate sensors per string and per installation; discovery-status sensor when discovery is on |
+| Packet capture | Opt-in admin actions; offline replay script |
 
 ---
 
@@ -57,7 +60,8 @@ PyTap is a Home Assistant custom component that passively monitors Tigo TAP sola
 
 ```
 custom_components/pytap/
-├── __init__.py          # Lifecycle (setup, teardown, migration v1→v7, device removal)
+├── __init__.py          # Lifecycle (setup, teardown, migration v1→v7, device removal, capture cleanup)
+├── capture_services.py  # Admin actions: start/stop/status/list/export/delete capture
 ├── config_flow.py       # Config & options flows
 ├── connection.py        # Connection validation, serial/proxy source, endpoint comparison
 ├── const.py             # Domain, config keys, defaults, reporting/stale/energy constants
@@ -66,6 +70,7 @@ custom_components/pytap/
 ├── energy.py            # Pure trapezoidal energy accumulation helpers
 ├── manifest.json        # HA integration metadata
 ├── sensor.py            # Per-optimizer, aggregate and discovery-status sensors
+├── services.yaml        # Action descriptions
 ├── strings.json         # UI strings (source of truth)
 ├── translations/
 │   └── en.json          # English translations (mirrors strings.json)
@@ -77,8 +82,13 @@ custom_components/pytap/
         ├── events.py    # Event dataclasses (PowerReportEvent, etc.)
         ├── state.py     # SlotClock, NodeTableBuilder, PersistentState (to_dict/from_dict)
         ├── source.py    # TcpSource (with interrupt()), SerialSource
+        ├── capture.py   # CaptureWriter, manifest validation, iter_capture, export, delete
+        ├── replay.py    # FrameScanner, decode_wire_frame, replay_events
         ├── crc.py       # CRC-16-CCITT
         └── barcode.py   # Tigo barcode encode/decode
+
+scripts/
+└── replay_capture.py    # Offline capture validation, frame inspection and replay
 
 tests/                   # See Testing
 docs/
@@ -96,6 +106,7 @@ Defines all integration-wide constants in a single location, including:
 
 ```python
 DOMAIN = "pytap"
+INTEGRATION_VERSION = "1.2.0"
 
 # Connection
 DEFAULT_PORT = 502
@@ -236,16 +247,17 @@ async_start_listener()
     └── freshness timer                     (async_track_time_interval, 5 s)
 
 async_stop_listener(*, discard_state=False) → bool   (bounded by LISTENER_STOP_TIMEOUT)
-    ├── set _stop_event, _interrupt_source()
+    ├── set _stop_event, capture.request_stop("unload"), _interrupt_source()
     ├── cancel midnight, freshness and save timers (even if the stop then times out)
     └── _async_stop_listener_locked()
           ├── await listener task and worker future (shielded)
+          ├── async_stop_capture("unload")
           └── flush unsaved Store changes (shielded; skipped once saves are blocked)
 ```
 
-- **`_listen()`** — For each connection: new parser via `create_parser(persistent_state=...)`, `open_source()`, then read 4096-byte chunks. Each chunk is fed to the parser, and the resulting events processed under `_state_lock`. Live mode publishes at once (`_push_live_update`); averaged mode calls `_maybe_flush_interval` on data and on idle reads. After `RECONNECT_TIMEOUT` of silence it reconnects. Errors and silence reconnects are logged once per outage (type + errno, at WARNING), later attempts at DEBUG; the outage ends only when data is received again. A read interrupted by stop isn't logged as a connection error. The `finally` block flushes pending data and closes the source. The reconnect delay uses `_stop_event.wait()`.
+- **`_listen()`** — For each connection: new parser via `create_parser(persistent_state=...)`, `open_source()`, then read 4096-byte chunks. Each chunk is recorded by an active capture, fed to the parser, and the resulting events processed under `_state_lock`. Live mode publishes at once (`_push_live_update`); averaged mode calls `_maybe_flush_interval` on data and on idle reads. After `RECONNECT_TIMEOUT` of silence it reconnects. Errors and silence reconnects are logged once per outage (type + errno, at WARNING), later attempts at DEBUG; the outage ends only when data is received again. A read interrupted by stop isn't recorded as a connection error. The `finally` block marks the capture, flushes pending data, and closes the source. The reconnect delay uses `_stop_event.wait()`.
 - **`_interrupt_source()`** — Calls the source's `interrupt()` if present (`TcpSource` shuts the socket down to wake `recv`).
-- A stop that times out returns `False`; `__init__.py` parks the coordinator so the next setup waits for it, and `async_on_listener_exit()` lets it finish its own stop once the worker exits. `discard_state=True` (entry removal) blocks every later Store write.
+- A stop that times out returns `False`; `__init__.py` parks the coordinator so the next setup waits for it, and `async_on_listener_exit()` lets it finish its own stop once the worker exits. `discard_state=True` (entry removal) blocks every later Store write. An export running in the executor does not block stopping.
 
 #### Event Processing
 
@@ -303,6 +315,10 @@ One HA Store (`pytap_<entry_id>_coordinator`, version 2; `_MigratingStore` accep
 
 `_init_mappings_from_parser()` pre-populates mappings from the parser's node tables on each (re)connect; saved coordinator mappings are kept when the parser has none.
 
+#### Packet Capture
+
+`async_start_capture`, `async_stop_capture`, `async_capture_info`, `async_list_captures`, `async_export_capture`, `async_delete_capture` operate on `<config>/pytap_captures/<entry_id>` under `_capture_lock`. Start validates 1–10080 minutes and 16–4096 MiB, and refuses while the listener is stopped or another capture/export/delete runs (including one left running by an unloaded coordinator: jobs are registered per capture root with `track_capture_job()`). Export refuses while recording, defaults its budget to the capture's own (`max_storage_bytes` from its manifest), and runs as a shielded executor job that does not block unload. Delete refuses the active session. `capture_status` (for diagnostics) never includes the directory; action responses do.
+
 ---
 
 ### `energy.py` — Energy Accumulation
@@ -349,6 +365,29 @@ The coordinator calls it for every tracked report. Daily values are also reset p
 
 ---
 
+### `capture_services.py` and `pytap/core/capture.py` — Packet Capture
+
+**Actions** (registered once in `async_setup`, admin-only, `SupportsResponse.OPTIONAL`): `start_capture` (`duration_minutes` 1–10080, default 1440; `max_storage_mib` 16–4096, default 1024), `stop_capture`, `capture_status` / `export_capture` (optional `capture_id`; export also optional `max_storage_mib`), `list_captures`, `delete_capture` (required `capture_id`). `CaptureError` becomes a translated `ServiceValidationError`, as do other `ValueError`s from invalid evidence (`capture_invalid`); `CaptureRuntimeError` (e.g. `export_insufficient_space`) and `OSError`/`KeyError` (`capture_failed`, with only the exception type) become `HomeAssistantError`. `async_remove_captures()` deletes the entry's capture root on entry removal; with an export/delete job still running it waits up to 30 s (`async_wait_for_capture_jobs()`) and otherwise defers deletion until the job ends.
+
+**`CaptureWriter`:**
+
+- `start()` (executor) creates private directories/files (0700/0600), computes the session budget from `max_storage_bytes` minus existing usage (captures and ZIPs) and free disk space, writes the first manifest, then starts the writer thread.
+- `record()` (worker thread) never blocks: it copies the read into a bounded queue, or stops with `queue_overflow` and counts the loss. The first record stores a `PersistentState` snapshot in the metadata.
+- `mark()` queues connection events (`events.jsonl`).
+- The writer thread writes `bus-NNNNNN.bin` / `chunks-NNNNNN.bin` (`<QQQII` index), rotates at 16 MiB, stops on `duration_limit`, `storage_limit`, `disk_space_low` or `disk_error`, and rewrites `manifest.json` only when it changed (at most every 10 s, plus rotation/stop) after fsyncing the data files and before fsyncing the directory. SHA-256 checksums cover every segment, index and `events.jsonl`.
+
+**Reading and export:** `read_manifest()` validates structure (format 1 or 2; format 2 requires the `events` block; a too deeply nested manifest raises `ValueError`) and refuses incomplete captures unless allowed. `iter_capture()` verifies sizes/checksums (strict for complete captures; a format 1 event log only gets a warning, as it has no checksum) and streams `CapturedChunk`s; for incomplete evidence it warns, stops at an invalid index row, and never replays unindexed tails. `export_archive()` refuses a symlinked root or session, validates, and checks the estimated ZIP size against the budget left by everything else under the root (the exported capture excluded; `export_budget_exceeded`) and against free disk space minus 64 MiB (`CaptureRuntimeError`, `export_insufficient_space`); both limits are re-checked while writing. Inputs are opened with `O_NOFOLLOW` (relative to the session directory where supported) and must be regular files. It writes `<capture_id>-<hex>.zip` next to the session; incomplete captures also get unlisted crash segments, and archives that are incomplete or have warnings/unverified files (e.g. a format 1 event log) get `recovery.json` (`verified`, `format_version`, `validation_warnings`, `unverified_files`). `delete_capture()` validates every entry before deleting the session and its ZIPs, and also deletes ZIPs whose session directory is gone. `list_captures()` returns the latest 20.
+
+---
+
+### `pytap/core/replay.py` and `scripts/replay_capture.py` — Offline Replay
+
+- **`FrameScanner`** splits chunks into `frame`, `noise`, `incomplete` and `oversized_fragment` records without crossing connections or gaps. Frames are decoded by `decode_wire_frame()` (escapes, CRC, receive/command headers, power-report measurements including raw unknown/extra bytes) and flagged `giant` above the live parser's size limit (also when an invalid escape follows). A mirror of the live framing state machine sets `live_parser_would_drop` and `live_parser_drop_reason` (`framing_state`, `unknown_escape`, `giant`, `runt`, `crc_mismatch`). With `started_mid_connection` (from the manifest metadata), or after lost bytes within one connection, it tracks every possible starting state until they converge; frames completed before then get `live_parser_would_drop: None` with reason `unknown_at_capture_start` / `unknown_after_capture_gap`.
+- **`replay_events(chunks, state)`** runs `Parser(persistent_state=state, clock=…)` with each chunk's recorded UTC time as the clock, starting a new parser on connection changes or gaps.
+- **`scripts/replay_capture.py <session> --output <new-dir> [--allow-incomplete]`** validates the capture first, then writes `chunks.jsonl`, `frames.jsonl`, `events.jsonl` (bootstrapped from the manifest's parser state) and `summary.json` (including `format_version`, `frames_live_parser_would_drop`, `frames_live_parser_verdict_unknown`, and `integrity_verified`, true only for complete format 2 captures). It never modifies the source or overwrites output.
+
+---
+
 ### `diagnostics.py` — Diagnostics Platform
 
 `async_get_config_entry_diagnostics()` returns:
@@ -356,7 +395,7 @@ The coordinator calls it for every tracked report. Daily values are also reset p
 - `config_entry` — with `host`, `serial_port` and `title` redacted.
 - `modules`, `counters` (parser counters, including `invalid_slots`, `invalid_slot_frames_kept`, `invalid_slot_frames_dropped` and `no_slot_clock_drops`), `gateways`, `discovered_barcodes`.
 - `nodes` — per barcode: `last_update`, `gateway_id`, `node_id`, `reporting`, `seconds_since_report`, daily/total energy, `readings_today`.
-- From `get_diagnostics_data()` (also redacted): `node_mappings`, `connection_state` (incl. transport type, baud rate, `connected`, `retries`), `module_discovery`, `energy_state`.
+- From `get_diagnostics_data()` (also redacted): `packet_capture` (status without directory), `node_mappings`, `connection_state` (incl. transport type, baud rate, `connected`, `retries`), `module_discovery`, `energy_state`.
 
 ---
 
@@ -381,8 +420,8 @@ Entries newer than v7 fail migration.
 2. `_async_cleanup_legacy_entities()`.
 3. Creates the coordinator; `InvalidConnectionSettings` → `ConfigEntryError` (`invalid_connection_settings`, naming the setting).
 4. `async_config_entry_first_refresh()`, `async_start_listener()`.
-5. Stores the coordinator in `entry.runtime_data` (`PyTapConfigEntry = ConfigEntry[PyTapDataUpdateCoordinator]`, defined in `coordinator.py`). Platforms, diagnostics, the options flow and device removal read it from there (the latter two only while the entry is loaded).
-6. Listens once for `EVENT_HOMEASSISTANT_STOP` to stop the listener (the listener is removed again on unload).
+5. Stores the coordinator in `entry.runtime_data` (`PyTapConfigEntry = ConfigEntry[PyTapDataUpdateCoordinator]`, defined in `coordinator.py`). Platforms, diagnostics, capture actions, the options flow and device removal read it from there (the latter two only while the entry is loaded).
+6. Listens once for `EVENT_HOMEASSISTANT_STOP` to stop the listener and finalise captures (the listener is removed again on unload).
 7. If the Store was read without error, `_async_remove_orphaned_devices()` removes (`async_remove_device`) devices whose barcodes are all in `excluded_barcodes` and no longer tracked, and string-only devices of strings without modules (unless discovery is on and no saved state was restored). Other unknown optimizer devices are kept.
 8. Forwards `Platform.SENSOR` and registers `_async_update_options` (reload).
 
@@ -394,7 +433,7 @@ If steps 4–8 raise, `_async_stop_or_park()` stops the listener (or parks it) b
 
 #### `async_remove_entry` / `async_remove_config_entry_device`
 
-Removing the entry first gives a parked coordinator a bounded stop with `discard_state=True` (a still-stuck one stays parked, so its port stays claimed), then deletes its Store. Deleting an optimizer device (any identifier not prefixed with the entry ID, so discovered optimizers too, even while not loaded) removes the module if configured and excludes its barcode; empty string devices may be deleted; the installation device and strings still in use may not.
+Removing the entry first gives a parked coordinator a bounded stop with `discard_state=True` (a still-stuck one stays parked, so its port stays claimed), then deletes its captures and Store. Deleting an optimizer device (any identifier not prefixed with the entry ID, so discovered optimizers too, even while not loaded) removes the module if configured and excludes its barcode; empty string devices may be deleted; the installation device and strings still in use may not.
 
 ---
 
@@ -405,7 +444,7 @@ Removing the entry first gives a parked coordinator a bounded stop with `discard
 - **Errors:** `cannot_connect`, `invalid_barcode`, `missing_string`, `missing_name`, `missing_barcode`, `duplicate_barcode`, `no_modules`, `invalid_host`, `invalid_port`, `invalid_serial_port`, `invalid_baud_rate`, `invalid_connection_type`, `serial_port_in_use`, `connection_in_use`, `unsupported_serial_settings`.
 - **Entity names:** all sensors, plus `module_discovery` states.
 - **Selector:** `stale_action` options (Unavailable, Zero, Hold last value).
-- **Exceptions:** setup errors (`previous_listener_stopping`, `invalid_connection_settings`).
+- **Exceptions:** setup errors (`previous_listener_stopping`, `invalid_connection_settings`) and capture action errors (including `capture_failed`, `capture_invalid` and `export_insufficient_space`).
 
 `translations/en.json` mirrors `strings.json` exactly.
 
@@ -448,6 +487,7 @@ Tigo Gateway (TCP / serial / ESPHome proxy)
     ▼
 source.read(4096)                          [executor thread]
     │
+    ├── capture.record(bytes)  (optional)
     ▼
 Parser.feed(bytes) → list[Event]           [executor thread]
     │
@@ -493,9 +533,14 @@ Home Assistant frontend / automations / history
 | `test_freshness_listeners.py`     | Freshness transitions re-render only the affected panels and aggregates; listener registration, membership changes and unload                                             |
 | `test_review2_data.py`            | Default stale action, domain-wide barcode claims, selective re-rendering on publish, midnight-reset ordering, save scheduling, aggregate performance and restore          |
 | `test_review2_lifecycle.py`       | Orphan-device cleanup, unreadable Store, device deletion, serial path normalisation/character-device checks, parked listeners, entry removal, setup recovery, outage logs |
+| `test_review2_capture.py`         | Domain-wide capture jobs, orphan archives, export budget/disk space, format 1/2, nested manifests, unknown replay verdicts, error types, symlink-safe export inputs       |
 | `test_module_discovery.py`        | Passive admission, persistence, live entities, metadata edits                                                                                                             |
 | `test_listener_lifecycle.py`      | Worker finishes and releases the port before unload/reload                                                                                                                |
-| `test_review_fixes.py`            | TCP interrupt, slow stop, invalid saved port, cross-entry discovery, device removal, `/dev/` paths, symlinks, one-time connection-loss log                                |
+| `test_review_fixes.py`            | TCP interrupt, slow stop, shutdown capture finalisation, invalid saved port, cross-entry discovery, device removal, `/dev/` paths, symlinks, one-time connection-loss log |
+| `test_packet_capture.py`          | Raw fidelity, bounded I/O, replay, export                                                                                                                                 |
+| `test_capture_integrity.py`       | Durability, manifest validation, deletion                                                                                                                                 |
+| `test_capture_scanner.py`         | `FrameScanner` verdicts match `Parser.feed`                                                                                                                               |
+| `test_capture_services.py`        | Capture actions, lifecycle, privacy, capture-before-parse ordering                                                                                                        |
 | `test_sensor.py`                  | Sensor platform entities, values, aggregates                                                                                                                              |
 | `test_diagnostics.py`             | Diagnostics payload and redaction                                                                                                                                         |
 | `test_energy.py`                  | Pure energy accumulation                                                                                                                                                  |
@@ -523,7 +568,7 @@ python3 -m pytest tests/ -vv --tb=short
 PYTHONPATH=custom_components/pytap python3 -c 'import pytap, pytest; raise SystemExit(pytest.main(["custom_components/pytap/pytap/tests/", "--import-mode=importlib", "-vv"]))'
 
 # Lint
-python3 -m ruff check custom_components/pytap/ tests/
+python3 -m ruff check custom_components/pytap/ tests/ scripts/
 ```
 
 ---
@@ -742,24 +787,31 @@ Created this implementation document capturing all development work to date.
 - Dynamic entity creation in the sensor platform; `module_discovery` status sensor.
 - Config entry version 7 keeps manual mode on existing entries.
 
-### Phase 21 — Stale Readings and Review Fixes
+### Phase 21 — Packet Capture and Offline Replay
+
+- `pytap/core/capture.py`, `capture_services.py` admin actions, `pytap/core/replay.py` and `scripts/replay_capture.py`.
+- `Parser(clock=...)` / `create_parser(persistent_state, *, clock=None)` so replay uses recorded observation times.
+
+### Phase 22 — Stale Readings and Review Fixes
 
 - Configurable stale-reading action/timeout (`change_stale` options step) replacing a fixed report timeout; freshness check every 5 s that re-renders only the entities of panels whose reporting state changed (per-barcode freshness listeners).
 - Coordinator stored in `entry.runtime_data`; `hass.data[DOMAIN]` kept only as a registry of coordinators still stopping after a timed-out unload.
 - Worker-owned `_state` with published copies; DST-safe midnight reset via `async_track_time_change`.
 - Aggregate energy accumulates member increases with restored baselines.
-- Lifecycle: bounded stop with `ConfigEntryNotReady` retry, `TcpSource.interrupt()`, listener stopped on `EVENT_HOMEASSISTANT_STOP`, saved state deleted with the entry.
+- Lifecycle: bounded stop with `ConfigEntryNotReady` retry, `TcpSource.interrupt()`, capture finalised on `EVENT_HOMEASSISTANT_STOP`, captures deleted with the entry.
 - Devices: UI deletion of optimizer and empty string devices; orphaned devices removed at setup; discovery skips barcodes owned by another entry.
 - Connection: `/dev/` paths only, symlink-aware port comparison, probe-then-resubmit, one-time connection-loss log, `ConfigEntryError` for invalid saved settings.
-- Parser: an invalid header slot counter never updates the slot clock; power reports with invalid slot counters are dropped; both increment `invalid_slots` (refined in Phase 22).
+- Parser: an invalid header slot counter never updates the slot clock; power reports with invalid slot counters are dropped; both increment `invalid_slots` (refined in Phase 23).
+- Capture: `delete_capture`, exports count toward the budget, manifests written on change with fsync ordering, `events.jsonl` checksum, recoverable exports of interrupted captures, `live_parser_would_drop` / `giant` inspection flags, translated action errors, no capture path in diagnostics.
 
-### Phase 22 — Second Review Fixes
+### Phase 23 — Second Review Fixes
 
 - Stale readings: default `hold` for all entries (`unavailable` / `zero` opt-in); in `zero` mode aggregate performance divides by every present member's rating.
 - Publishing: per-barcode data listeners, so a publish re-renders only changed panels and their aggregates; snapshot sequence numbers protect the midnight reset.
 - Discovery: domain-wide atomic `BarcodeClaims`; configured barcodes claimed at coordinator creation.
 - Lifecycle: timed-out stops still cancel timers/saves; parked coordinators claim their endpoint in config flows and clean up when their worker exits; entry removal waits (bounded) for them and blocks their saves; setup failures stop or park the listener; corrected connection settings recover a failed setup; unreadable Store blocks saves and orphan cleanup; orphan cleanup only removes excluded optimizers and empty strings; device deletion always excludes the barcode; normalised serial paths and character-device checks; outage logged once until data flows.
 - Parser: invalid-header-slot frames kept only when the strict packet walk succeeds (`invalid_slot_frames_kept` / `invalid_slot_frames_dropped`); `no_slot_clock_drops`, with the warning logged once per gateway per parser.
+- Capture: domain-wide export/delete job tracking; orphan-archive deletion; export budget excludes the exported capture, defaults to its own budget and checks free disk space; manifest format 2 (format 1 readable); nested-manifest rejection; unknown replay verdicts after a mid-connection start or gap; `giant` for oversized frames with a bad escape; `HomeAssistantError` for runtime failures; symlink-safe export inputs.
 
 ---
 

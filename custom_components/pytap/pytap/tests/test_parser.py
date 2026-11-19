@@ -5,7 +5,6 @@ import logging
 
 import pytest
 
-from pytap.core import parser as parser_module
 from pytap.core.crc import crc
 from pytap.core.parser import Parser
 from pytap.core.types import SlotCounter
@@ -1221,23 +1220,20 @@ def _power_packet_with(node_id: int, *, slot: int = 0x64D4) -> bytes:
     return bytes(packet)
 
 
-def _stepping_datetime(start: datetime, step: timedelta = timedelta(seconds=1)) -> type[datetime]:
-    """A datetime whose now() is deterministic and advances by `step` on every call."""
+def _stepping_clock(start: datetime, step: timedelta = timedelta(seconds=1)):
+    """Deterministic clock that advances by `step` on every call."""
     calls = [0]
 
-    class _SteppingDatetime(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            calls[0] += 1
-            return start + step * (calls[0] - 1)
+    def clock() -> datetime:
+        calls[0] += 1
+        return start + step * (calls[0] - 1)
 
-    return _SteppingDatetime
+    return clock
 
 
-def test_invalid_header_slot_skips_clock_but_keeps_reports(monkeypatch):
+def test_invalid_header_slot_skips_clock_but_keeps_reports():
     """A corrupt header counter must not drop valid reports in the same frame."""
-    monkeypatch.setattr(parser_module, "datetime", _stepping_datetime(datetime(2001, 1, 1, 12, 0, 0)))
-    parser = Parser()
+    parser = Parser(clock=_stepping_clock(datetime(2001, 1, 1, 12, 0, 0)))
     gw_id = 0x1203
     parser.feed(_build_receive_request(gw_id, 0x0049))
     parser.feed(_build_receive_response(gw_id, _h_status(0x4A, 0xD457), b""))  # Establish the clock.

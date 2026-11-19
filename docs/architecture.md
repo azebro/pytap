@@ -54,6 +54,7 @@ pytap/                              # Repository root
 ├── custom_components/
 │   └── pytap/                      # HA custom component
 │       ├── __init__.py             # Setup / teardown, migrations, device removal
+│       ├── capture_services.py     # Admin packet-capture actions
 │       ├── config_flow.py          # UI-based configuration
 │       ├── connection.py           # Connection validation, serial/proxy source
 │       ├── const.py                # Domain, defaults, config keys
@@ -61,6 +62,7 @@ pytap/                              # Repository root
 │       ├── diagnostics.py          # HA diagnostics platform download
 │       ├── energy.py               # Pure energy accumulation helpers
 │       ├── sensor.py               # Sensor entities (power, voltage, etc.)
+│       ├── services.yaml           # Action descriptions
 │       ├── manifest.json           # HA integration metadata
 │       ├── strings.json            # UI strings (source)
 │       ├── translations/
@@ -74,8 +76,12 @@ pytap/                              # Repository root
 │               ├── events.py       # Event dataclasses
 │               ├── state.py        # SlotClock, NodeTableBuilder, PersistentState
 │               ├── source.py       # TcpSource, SerialSource
+│               ├── capture.py      # Raw capture writer, validation, export, deletion
+│               ├── replay.py       # Offline frame inspection and replay
 │               ├── crc.py          # CRC-16-CCITT
 │               └── barcode.py      # Tigo barcode encode/decode
+├── scripts/
+│   └── replay_capture.py           # Offline capture inspection/replay CLI
 ├── tests/                          # Integration tests (see Testing Strategy)
 ├── requirements.txt                # Home Assistant Core dependencies
 ├── requirements-test.txt           # Test harness dependencies
@@ -106,6 +112,7 @@ pytap/                              # Repository root
 │  │    connection│  │  • Event routing  │  │    grouping   │  │
 │  │  • Store     │  │  • Worker state + │  │               │  │
 │  │    config    │  │    published copy │  │               │  │
+│  │              │  │  • Packet capture │  │               │  │
 │  └──────┬───────┘  └────────┬──────────┘  └───────┬───────┘  │
 │         │                   │                     │          │
 │         │ ConfigEntry       │ pytap.Parser         │ reads    │
@@ -118,8 +125,9 @@ pytap/                              # Repository root
 ┌─────────────────────────────────────────────────────────────┐
 │  Parser Library  (pytap/pytap/)                              │
 │                                                              │
-│  pytap.api.create_parser() → Parser                          │
+│  pytap.api.create_parser(persistent_state, *, clock) → Parser│
 │  parser.feed(bytes) → list[Event]                            │
+│  core.capture / core.replay — recording and offline replay   │
 │                                                              │
 │  No HA dependency — pure protocol logic, stdlib only         │
 └──────────────────────────────────────────────────────────────┘
@@ -135,9 +143,10 @@ Entry point for Home Assistant:
 
 | Function | Purpose |
 | --- | --- |
+| `async_setup(hass, config)` | Register the capture actions once (independent of entries) |
 | `async_setup_entry(hass, entry)` | Create coordinator, start data streaming, forward platform setup |
 | `async_unload_entry(hass, entry)` | Stop the listener (bounded), unload platforms |
-| `async_remove_entry(hass, entry)` | Delete the entry's saved state |
+| `async_remove_entry(hass, entry)` | Delete the entry's packet captures and saved state |
 | `async_remove_config_entry_device(hass, entry, device)` | Allow deleting optimizer devices and empty string devices |
 | `async_migrate_entry(hass, entry)` | Migrate config entries v1 → v7 |
 
@@ -148,7 +157,7 @@ Platforms: `sensor`.
 2. Remove legacy `voltage`/`current` entity registry entries.
 3. Instantiate `PyTapDataUpdateCoordinator` (claims its configured barcodes). Invalid saved connection settings raise `ConfigEntryError` (`invalid_connection_settings`) instead of retrying forever; saving corrected settings in the options flow schedules a reload of an entry in setup error/retry.
 4. `async_config_entry_first_refresh()` and `async_start_listener()` (loads the Store, starts the worker, midnight reset and freshness timers). No connectivity check: an offline gateway is retried in the background.
-5. Store the coordinator in `entry.runtime_data` (typed `PyTapConfigEntry = ConfigEntry[PyTapDataUpdateCoordinator]`) and listen for `EVENT_HOMEASSISTANT_STOP` to stop the listener (HA does not unload entries on shutdown).
+5. Store the coordinator in `entry.runtime_data` (typed `PyTapConfigEntry = ConfigEntry[PyTapDataUpdateCoordinator]`) and listen for `EVENT_HOMEASSISTANT_STOP` to stop the listener and finalise any capture (HA does not unload entries on shutdown).
 6. If the Store was read without error, remove devices of excluded optimizers and of strings without modules (empty strings are kept while discovery is on and no saved state was restored). Other unknown optimizer devices are kept; users can delete them.
 7. Forward platform setup and register the options update listener (reloads the entry).
 
@@ -159,7 +168,7 @@ If a later step fails, the listener is stopped (releasing its barcode claims), o
 2. If it stopped, release the entry's barcode claims; otherwise park the coordinator (`hass.data[DOMAIN][entry_id]`) so the next setup waits for it and config flows treat its serial port or TCP host/port as in use. Once its worker exits, a parked coordinator finishes its own stop (final save) and releases its claims.
 3. Unload platforms.
 
-**Entry removal:** a parked coordinator gets a bounded stop with all later Store writes blocked; then its Store is deleted.
+**Entry removal:** a parked coordinator gets a bounded stop with all later Store writes blocked; then the entry's captures (after waiting up to 30 s for a running export/delete job, otherwise once it ends) and its Store are deleted.
 
 **Device removal:** deleting an optimizer device (any identifier that isn't the entry's own string/installation ID, so discovered optimizers too, even while the entry isn't loaded) removes its module from `entry.data["modules"]` if present and adds its barcode to `excluded_barcodes` (the entry update reloads PyTap). String devices can be deleted only when no module uses that string; the installation device cannot be deleted.
 
@@ -224,10 +233,11 @@ The coordinator is the central bridge between the blocking `pytap` parser and Ho
 │    • Exposes self.data (published copy)         │
 │    • async_set_updated_data() on each publish   │
 │    • Freshness check every 5 s                  │
-│    • Midnight reset, lifecycle                  │
+│    • Midnight reset, lifecycle, capture actions │
 │                                                 │
 │  Executor thread (blocking I/O):                │
 │    • open_source() → TCP or serial source       │
+│    • capture.record(bytes) (if capturing)       │
 │    • parser.feed(bytes) → Events                │
 │    • Updates private self._state                │
 │    • Publishes a copy via call_soon_threadsafe  │
@@ -283,7 +293,7 @@ The listener thread owns `self._state` and the energy accumulators (guarded by a
 2. **Publishing** — The worker publishes snapshots back to the event loop with `call_soon_threadsafe` (immediately in live mode, once per interval in averaged mode).
 3. **Midnight reset** — `async_track_time_change(hour=0, minute=0, second=0)` resets daily accumulators at every local midnight (DST-safe), even when no reports arrive overnight.
 4. **Freshness check** — `async_track_time_interval` every 5 s recomputes which panels are reporting. Entities register per-barcode callbacks with `async_add_freshness_listener(barcodes, callback)`: live per-optimizer sensors for their own barcode, every aggregate for its current members (re-registered when membership changes). Only the callbacks of panels that started or stopped reporting run (once per registration), not every entity.
-5. **Stopping** — `async_stop_listener()` sets a `threading.Event`, calls the TCP source's `interrupt()` (socket `shutdown`, waking a blocked `recv` immediately; serial reads are bounded to 1 s), cancels the midnight, freshness and save timers, then awaits the worker. The worker owns `close()`. The whole stop is bounded by `LISTENER_STOP_TIMEOUT`; on timeout it returns `False`, the coordinator is parked and reload is blocked until the worker exits. Once the worker has exited, the final Store save is shielded from cancellation.
+5. **Stopping** — `async_stop_listener()` sets a `threading.Event`, requests any capture to stop, calls the TCP source's `interrupt()` (socket `shutdown`, waking a blocked `recv` immediately; serial reads are bounded to 1 s), cancels the midnight, freshness and save timers, then awaits the worker. The worker owns `close()`. The whole stop is bounded by `LISTENER_STOP_TIMEOUT`; on timeout it returns `False`, the coordinator is parked and reload is blocked until the worker exits. Once the worker has exited, the final Store save is shielded from cancellation.
 
 ```
  HA Event Loop (main thread)          Executor Thread
@@ -299,6 +309,7 @@ The listener thread owns `self._state` and the energy accumulators (guarded by a
         │                                    │
         │                                    │ loop:
         │                                    │   data = source.read(4096)
+        │                                    │   capture.record(data)
         │                                    │   events = parser.feed(data)
         │                                    │   update self._state
         │  ◄── call_soon_threadsafe ─────────│   publish copy
@@ -369,6 +380,10 @@ INFO: Discovered unconfigured Tigo optimizer barcode: S-9999999Z (gateway=1, nod
 #### Module Reconfiguration
 
 Options changes reload the entry. Because the parser's node tables are restored from the Store, a newly added barcode that was seen before resolves from the next power report without waiting for another enumeration.
+
+#### Packet Capture
+
+`async_start_capture()` creates a `CaptureWriter` under `<config>/pytap_captures/<entry_id>`. The worker calls `record()` with each read **before** `parser.feed()`; the first admitted read snapshots `PersistentState` into the capture metadata. Connection open/close/error are recorded with `mark()`. The writer runs in its own thread and stops (never blocks the parser) on queue overflow, storage/duration limits or disk errors. Export and delete run in the executor; they are tracked per capture root in `hass.data` (not per coordinator), so at most one capture job runs at a time even across reloads.
 
 ### 5. `sensor.py` — Sensor Platform
 
@@ -449,7 +464,11 @@ The Tigo protocol identifies nodes by `node_id` (transient) and `barcode` (stabl
 - `open_source()` opens a `SerialProxySource` or `pytap` `TcpSource`, closing it again if `connect()` fails.
 - `connection_title()` never includes proxy URLs or serial identities.
 
-### 7. `manifest.json` — Integration Metadata
+### 7. `capture_services.py` — Packet-Capture Actions
+
+Admin-only actions with optional responses: `start_capture`, `stop_capture`, `capture_status`, `list_captures`, `export_capture` (optional `max_storage_mib`) and `delete_capture`. They require a loaded PyTap entry. `CaptureError` and other `ValueError`s (invalid evidence: `capture_invalid`) become `ServiceValidationError`; runtime failures — `CaptureRuntimeError` (e.g. `export_insufficient_space`) and `OSError`/`KeyError` (`capture_failed`, with only the exception type) — become `HomeAssistantError`. Export/delete jobs are registered per capture root (`track_capture_job()`), so they stay visible across reloads. `async_remove_captures()` deletes `pytap_captures/<entry_id>` when the entry is removed, after waiting up to 30 s for a running job (otherwise once it ends). Responses may include local paths; diagnostics do not.
+
+### 8. `manifest.json` — Integration Metadata
 
 ```json
 {
@@ -483,6 +502,8 @@ Key choices:
      │  TCP stream / local serial / ESPHome serial proxy
      ▼
  TcpSource / SerialProxySource .read(4096)   [executor thread]
+     │
+     ├──► CaptureWriter.record(bytes)          (only while capturing)
      │
      │  raw bytes
      ▼
@@ -518,7 +539,7 @@ The `pytap` parser library is bundled inside the custom component at `custom_com
 - **No PyPI publishing required** — Reduces release complexity for a niche integration.
 - The only runtime requirement is `serialx`, for serial and proxy access.
 
-The library has **no Home Assistant imports** and can be used standalone (scripts, other platforms). Persistence is handled externally — the parser accepts a `PersistentState` object and mutates it in memory; the caller owns serialization.
+The library has **no Home Assistant imports** and can be used standalone (e.g. `scripts/replay_capture.py`). Persistence is handled externally — the parser accepts a `PersistentState` object and mutates it in memory; the caller owns serialization. An optional `clock` lets offline replay supply recorded timestamps.
 
 ### 2. Push-Based Streaming (Not Polling)
 
@@ -628,6 +649,7 @@ Configurable at runtime without removing the integration: connection, reporting 
 | Barcode not yet identified | Report counted as pending until a node table resolves it |
 | Unconfigured barcode seen | Logged at INFO; admitted if discovery is on and it isn't excluded or owned by another entry |
 | First infra event without node table | Logged at INFO; existing mappings kept |
+| Capture queue full / storage or duration limit / disk error | Capture stops with a reason; loss counted; earlier evidence never deleted |
 
 ---
 
@@ -646,9 +668,14 @@ Configurable at runtime without removing the integration: connection, reporting 
 | `test_freshness_listeners.py` | Freshness changes re-render only affected panels and aggregates |
 | `test_review2_data.py` | Stale default, barcode claims, selective updates, aggregates |
 | `test_review2_lifecycle.py` | Device cleanup, serial path checks, parked listeners, removal |
+| `test_review2_capture.py` | Capture jobs, export budget, formats, replay verdicts, errors |
 | `test_module_discovery.py` | Passive admission, persistence, metadata edits |
 | `test_listener_lifecycle.py` | Worker stop/port release before unload/reload |
 | `test_review_fixes.py` | Lifecycle, device registry and connection-safety regressions |
+| `test_packet_capture.py` | Capture fidelity, bounded I/O, replay, export |
+| `test_capture_integrity.py` | Manifest validation, durability, deletion |
+| `test_capture_scanner.py` | Offline `FrameScanner` verdicts match `Parser.feed` |
+| `test_capture_services.py` | Capture actions, lifecycle, privacy |
 | `test_sensor.py` | Entity creation, state updates, aggregates |
 | `test_diagnostics.py` | Diagnostics payload and redaction |
 | `test_energy.py` | Trapezoidal energy accumulation |
@@ -668,6 +695,6 @@ Configurable at runtime without removing the integration: connection, reporting 
 ### Integration Testing
 
 - **Dev container** — The repository includes a dev container with HA installed. Run `python3 -m homeassistant --config config/ --debug` to test the full integration locally.
-- **Mock source** — For automated tests, the coordinator can be tested with a mock `Source` that replays captured byte sequences.
+- **Captured traffic** — `scripts/replay_capture.py` replays a recorded capture through the parser offline.
 
 

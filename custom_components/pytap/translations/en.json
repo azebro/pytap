@@ -319,6 +319,54 @@
     },
     "invalid_connection_settings": {
       "message": "The saved {field} setting is invalid. Update it with Configure → Change connection settings; the entry then retries setup."
+    },
+    "capture_entry_not_loaded": {
+      "message": "Select a loaded PyTap config entry."
+    },
+    "capture_busy": {
+      "message": "A packet capture, export or deletion is already running or stopping."
+    },
+    "stop_before_export": {
+      "message": "Stop the packet capture before exporting it."
+    },
+    "capture_id_required": {
+      "message": "Select a stopped capture ID."
+    },
+    "invalid_capture_id": {
+      "message": "The capture ID is invalid."
+    },
+    "capture_not_found": {
+      "message": "Capture {capture_id} was not found."
+    },
+    "capture_active": {
+      "message": "Stop the active packet capture before deleting it."
+    },
+    "capture_unsafe": {
+      "message": "The capture contains unexpected files or links and was not changed."
+    },
+    "listener_not_running": {
+      "message": "The PyTap listener is not running."
+    },
+    "invalid_duration": {
+      "message": "Duration must be between {min} and {max} minutes."
+    },
+    "invalid_storage": {
+      "message": "Storage budget must be between {min} and {max} MiB."
+    },
+    "storage_budget_exhausted": {
+      "message": "No packet capture storage budget remains ({available_mib} MiB available). Delete old captures or raise the budget."
+    },
+    "export_budget_exceeded": {
+      "message": "Exporting needs about {required_mib} MiB but only {available_mib} MiB of the storage budget remains. Delete old captures or raise the budget."
+    },
+    "capture_failed": {
+      "message": "Packet capture action failed ({error}); check capture status and available storage."
+    },
+    "capture_invalid": {
+      "message": "The selected packet capture is incomplete, corrupt or in an unsupported format; inspect it with the offline replay script or delete it."
+    },
+    "export_insufficient_space": {
+      "message": "Exporting needs about {required_mib} MiB but only {available_mib} MiB of disk space is free. Free disk space or delete old captures."
     }
   }
 }

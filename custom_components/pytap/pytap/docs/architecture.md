@@ -4,14 +4,14 @@
 
 `pytap` is a simplified, flat-architecture Python implementation of the TapTap protocol for passive monitoring of Tigo TAP solar energy systems. Unlike the layered `python/taptap` port (which mirrors the Rust crate's sink-chain design), `pytap` collapses the entire protocol stack into a single-pass pipeline that converts raw bytes directly into final parsed events.
 
-The primary design goal is **ease of integration**: the full parsing functionality lives in a library module that can be called programmatically. The library has no file I/O — persistence is handled externally by the caller (e.g., the HA coordinator).
+The primary design goal is **ease of integration**: the full parsing functionality lives in a library module that can be called programmatically. The parser has no file I/O — persistence is handled externally by the caller (e.g., the HA coordinator). The separate, optional `core.capture` module records raw bytes to disk, and `core.replay` inspects and replays those recordings offline.
 
 ## Comparison with `python/taptap`
 
 | Aspect | `python/taptap` | `pytap` |
 |--------|-----------------|---------|
 | Architecture | Layered sink-chain (5 layers, 3 Sink protocols) | Flat pipeline, single `Parser` class |
-| Module count | ~25 files across 8 packages | ~8 files in 2 packages |
+| Module count | ~25 files across 8 packages | ~10 files in 2 packages |
 | Integration | Requires wiring 4 receivers + observer | Single `pytap.create_parser()` call |
 | Extensibility | Add new Sink implementations | Subclass or compose `Parser` |
 | Output | JSON to stdout only | Returns Python objects; caller serializes |
@@ -24,7 +24,7 @@ The primary design goal is **ease of integration**: the full parsing functionali
 │                                                     │
 │  connect(source_config) → TcpSource | SerialSource  │
 │  parse_bytes(data) → list[Event]                    │
-│  create_parser(persistent_state) → Parser            │
+│  create_parser(persistent_state, *, clock) → Parser │
 └──────────────────────┬──────────────────────────────┘
                        │ uses
                        ▼
@@ -71,6 +71,13 @@ The primary design goal is **ease of integration**: the full parsing functionali
 │  │  SlotClock, NodeTableBuilder (internal),  │      │
 │  │  PersistentState (caller-owned)           │      │
 │  └───────────────────────────────────────────┘      │
+│                                                     │
+│  ┌───────────────────────────────────────────┐      │
+│  │  Capture & Replay (optional, offline)     │      │
+│  │  CaptureWriter, iter_capture,             │      │
+│  │  export_archive, FrameScanner,            │      │
+│  │  replay_events                            │      │
+│  └───────────────────────────────────────────┘      │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -87,6 +94,8 @@ pytap/
 │   ├── parser.py            # The single Parser class
 │   ├── source.py            # SerialSource, TcpSource
 │   ├── state.py             # SlotClock, NodeTableBuilder, PersistentState
+│   ├── capture.py           # Raw byte recording, validation, export, deletion
+│   ├── replay.py            # Offline frame inspection and timestamped replay
 │   ├── crc.py               # CRC-16-CCITT calculation
 │   └── barcode.py           # Tigo barcode encoding/decoding
 ├── docs/
@@ -220,17 +229,30 @@ Node addresses in `NODE_TABLE_RESPONSE` entries are 16-bit values where bit 15 i
 
 Slot counters outside 0–11999 are counted in `counters["invalid_slots"]`. An invalid counter in a receive-response header never updates the slot clock (in earlier versions it raised `IndexError` out of `feed()`). It also suggests the variable-length header was mis-decoded, so the frame's packets are kept only if a strict walk consumes the payload exactly and every packet is well-formed (`invalid_slot_frames_kept`); otherwise the whole frame is dropped (`invalid_slot_frames_dropped`). Kept power reports still need an existing slot clock for their gateway, like any report; without one they are dropped (`no_slot_clock_drops`, warned once per gateway per parser). A power report whose own counter is invalid has no valid timestamp and is dropped.
 
+### 8. Injectable Clock
+
+`Parser(clock=...)` supplies "now" for slot-clock synchronisation and non-power-report event timestamps. Live use defaults to `datetime.now()`; `core.replay.replay_events()` passes each recorded chunk's UTC observation time so replayed events carry the original times.
+
+### 9. Capture and Replay Outside the Parser
+
+`core.capture` records raw reads before they reach the parser, so unsupported frames, bad CRCs and noise are preserved. Recording uses a bounded queue drained by a writer thread (`record()` never blocks the reader), private files, SHA-256 checksums in a manifest written only after the data is flushed, and explicit loss/stop reasons. `core.replay.FrameScanner` mirrors the parser's framing to report frames the live parser would drop (`live_parser_would_drop`, `giant`); when the parser's starting state is unknown (a capture started mid-connection, or lost bytes), the verdict is `None` until all possible states converge. Neither module changes `Parser` behaviour.
+
 ## Public API Surface
 
 ### `pytap.api`
 
 ```python
-def create_parser(persistent_state: Optional[PersistentState] = None) -> Parser:
+def create_parser(
+    persistent_state: PersistentState | None = None,
+    *,
+    clock: Callable[[], datetime] | None = None,
+) -> Parser:
     """Create a new protocol parser.
 
     Args:
         persistent_state: Optional PersistentState object for infrastructure
             state. The parser mutates it in memory; caller owns persistence.
+        clock: Optional source of "now" (e.g. recorded times during replay).
 
     Returns:
         A Parser instance ready to receive bytes via feed().
@@ -253,8 +275,13 @@ def connect(source_config: dict) -> TcpSource | SerialSource:
 
 ```python
 class Parser:
-    def __init__(self, persistent_state: Optional[PersistentState] = None):
-        """Initialize parser with optional persistent infrastructure state."""
+    def __init__(
+        self,
+        persistent_state: PersistentState | None = None,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ):
+        """Initialize parser with optional persistent infrastructure state and clock."""
 
     def feed(self, data: bytes) -> list[Event]:
         """Feed raw bytes and return any events parsed from them.
@@ -324,7 +351,7 @@ class StringEvent(Event):
 
 ## Implementation Plan
 
-The phased plan used to build the library is kept in [implementation_plan.md](implementation_plan.md). The command-line interface planned there was later removed; the library is used through the Home Assistant integration.
+The phased plan used to build the library is kept in [implementation_plan.md](implementation_plan.md). The command-line interface planned there was later removed; the library is used through the Home Assistant integration and the repository's `scripts/replay_capture.py`.
 
 ## Testing Strategy
 
@@ -335,10 +362,12 @@ Tests reuse captured protocol data from the Rust implementation (`src/test_data.
 3. **Integration**: Full parse pipeline with recorded data, assert correct events
 4. **Regression**: Edge cases from `python/taptap` test suite
 
+Capture and replay are tested by the integration's test suite (`tests/test_packet_capture.py`, `tests/test_capture_integrity.py`, `tests/test_capture_scanner.py`, `tests/test_review2_capture.py`).
+
 ## Dependencies
 
 | Package | Purpose | Required |
 |---------|---------|----------|
 | `pyserial` | Serial port access | Optional (`SerialSource` only) |
 
-Zero required dependencies for the core parser — it uses only the Python standard library.
+Zero required dependencies — the parser, capture and replay modules use only the Python standard library (capture and replay need Python 3.11+).

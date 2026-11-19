@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from datetime import datetime
 import logging
 
 from .core.events import Event
@@ -14,17 +16,21 @@ logger = logging.getLogger(__name__)
 
 def create_parser(
     persistent_state: PersistentState | None = None,
+    *,
+    clock: Callable[[], datetime] | None = None,
 ) -> Parser:
     """Create a new protocol parser instance.
 
     Args:
         persistent_state: Optional pre-loaded PersistentState object.
             If None, the parser starts with empty state.
+        clock: Optional source of "now" for event timestamps, e.g. recorded
+            observation times during offline replay. Defaults to wall time.
 
     Returns:
         A Parser ready to accept bytes via feed().
     """
-    return Parser(persistent_state=persistent_state)
+    return Parser(persistent_state=persistent_state, clock=clock)
 
 
 def parse_bytes(data: bytes) -> list[Event]:

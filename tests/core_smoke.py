@@ -23,6 +23,7 @@ from custom_components.pytap import async_migrate_entry
 from custom_components.pytap.config_flow import PyTapConfigFlow, PyTapOptionsFlow
 from custom_components.pytap.connection import open_source
 from custom_components.pytap.coordinator import PyTapDataUpdateCoordinator
+from custom_components.pytap.pytap.core.capture import iter_capture
 from custom_components.pytap.pytap.core.events import InfrastructureEvent
 
 ENDPOINT = "esphome-hass://esphome/entry-one?port_name=Tigo%20Bus"
@@ -160,3 +161,15 @@ class CoreSmoke(unittest.IsolatedAsyncioTestCase):
         finally:
             os.close(master)
             os.close(slave)
+
+    async def test_capture_lifecycle_on_supported_core(self):
+        entry = self.entry(version=7)
+        coordinator = PyTapDataUpdateCoordinator(self.hass, entry)
+        started = await coordinator.async_start_capture(duration_minutes=1, max_storage_mib=16)
+        self.assertEqual(started["state"], "capturing")
+        coordinator._capture.record(b"unchanged\x00\xff", 1)
+        stopped = await coordinator.async_stop_capture()
+        self.assertTrue(stopped["complete"])
+        chunks = list(iter_capture(Path(stopped["directory"])))
+        self.assertEqual(b"".join(c.data for c in chunks), b"unchanged\x00\xff")
+        self.assertTrue(await coordinator.async_stop_listener())
