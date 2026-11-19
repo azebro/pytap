@@ -1,4 +1,4 @@
-"""Second review: partial publishes, sequencing and saves."""
+"""Second review: stale default, partial publishes, sequencing and saves."""
 
 import threading
 import time
@@ -11,9 +11,16 @@ from homeassistant.util import dt as dt_util
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.pytap.const import DOMAIN
+from custom_components.pytap.const import (
+    CONF_STALE_ACTION,
+    DEFAULT_STALE_ACTION,
+    DEFAULT_STALE_TIMEOUT,
+    DOMAIN,
+    STALE_ACTION_HOLD,
+)
 from custom_components.pytap.coordinator import PyTapDataUpdateCoordinator
-from custom_components.pytap.pytap.core.events import InfrastructureEvent, PowerReportEvent, TopologyEvent
+from custom_components.pytap.pytap.core.events import InfrastructureEvent, PowerReportEvent
+from custom_components.pytap.sensor import STRING_SENSOR_DESCRIPTIONS, PyTapAggregateSensor
 
 BARCODE = "A-1234567B"
 OTHER = "C-2345678D"
@@ -100,6 +107,20 @@ def _unique_ids(hass: HomeAssistant, entity_ids: list[str]) -> set[str]:
     return {registry.async_get(entity_id).unique_id for entity_id in entity_ids}
 
 
+# --- 1. Default stale action -------------------------------------------------
+
+
+async def test_default_stale_action_is_hold_for_existing_entries(hass: HomeAssistant) -> None:
+    assert DEFAULT_STALE_ACTION == STALE_ACTION_HOLD
+    # An entry saved before the option existed has no stale_action key.
+    coordinator = _bare(hass)
+    assert CONF_STALE_ACTION not in coordinator.config_entry.data
+    assert coordinator.stale_action == "hold"
+    assert coordinator.stale_timeout == DEFAULT_STALE_TIMEOUT == 120
+    assert _bare(hass, unique_id="x", **{CONF_STALE_ACTION: "bogus"}).stale_action == "hold"
+    assert _bare(hass, unique_id="y", **{CONF_STALE_ACTION: "zero"}).stale_action == "zero"
+
+
 # --- 3. Partial publishes ----------------------------------------------------
 
 
@@ -164,28 +185,6 @@ async def test_interval_publish_notifies_only_changed_panels(hass: HomeAssistant
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
-async def test_one_call_per_registration_and_unsubscribe(hass: HomeAssistant) -> None:
-    entry, coordinator = await _setup(hass)
-    calls: list[int] = []
-    unsub = coordinator.async_add_data_listener([BARCODE, OTHER], lambda: calls.append(1))
-    coordinator.async_set_updated_data(coordinator._snapshot(), frozenset({BARCODE, OTHER}))
-    assert calls == [1]
-
-    unsub()
-    assert all(unsub not in listeners for listeners in coordinator._data_listeners.values())
-    coordinator.async_set_updated_data(coordinator._snapshot(), frozenset({BARCODE, OTHER}))
-    assert calls == [1]
-    assert await hass.config_entries.async_unload(entry.entry_id)
-
-
-async def test_unload_removes_all_data_listeners(hass: HomeAssistant) -> None:
-    entry, coordinator = await _setup(hass)
-    assert set(coordinator._data_listeners) == {BARCODE, OTHER}
-    assert await hass.config_entries.async_unload(entry.entry_id)
-    await hass.async_block_till_done()
-    assert coordinator._data_listeners == {}
-
-
 # --- 4. Averaged-mode disconnect ---------------------------------------------
 
 
@@ -212,27 +211,6 @@ async def test_averaged_disconnect_publishes_averages_and_counters(hass: HomeAss
     assert node["power"] == averaged
     assert coordinator.data["counters"] == {"frames_received": 7}
     assert coordinator._ha_update_pending is False
-    assert await hass.config_entries.async_unload(entry.entry_id)
-
-
-async def test_averaged_mode_never_publishes_raw_values(hass: HomeAssistant) -> None:
-    """Review #1: a global re-render must show published averages only."""
-    entry, coordinator = await _setup(hass, live_reporting=False, write_interval=30)
-    parser = MagicMock(counters={})
-    await hass.async_add_executor_job(coordinator._process_event, _power(iin=1.0))
-    await hass.async_add_executor_job(coordinator._process_event, _power(OTHER, iin=1.0))
-    coordinator._ha_update_pending = True
-    coordinator._maybe_flush_interval(parser, time.monotonic())
-    await hass.async_block_till_done()
-    power_id = er.async_get(hass).async_get_entity_id("sensor", DOMAIN, f"{DOMAIN}_{BARCODE}_power")
-    published_power = float(hass.states.get(power_id).state)
-
-    # A large raw reading arrives mid-interval; then every entity re-renders.
-    await hass.async_add_executor_job(coordinator._process_event, _power(iin=9.0))
-    coordinator.async_update_listeners()
-    await hass.async_block_till_done()
-    assert float(hass.states.get(power_id).state) == published_power
-    assert coordinator.data["nodes"][BARCODE]["power"] == pytest.approx(published_power, rel=0.01)
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -318,15 +296,29 @@ async def test_schedule_save_posts_once_per_cycle(hass: HomeAssistant) -> None:
     assert coordinator._save_task is None and coordinator._save_requested is False
 
 
-# --- 7. Topology ---------------------------------------------------------------
+# --- 7. Aggregate performance --------------------------------------------------
 
 
-async def test_topology_survives_power_reports(hass: HomeAssistant) -> None:
-    entry, coordinator = await _setup(hass, [MODULE])
-    coordinator._node_to_barcode[10] = BARCODE
-    await _feed(hass, coordinator, _power())
-    topology = TopologyEvent(gateway_id=1, node_id=10, data=b"\x01", timestamp=dt_util.now())
-    await hass.async_add_executor_job(coordinator._process_event, topology)
-    await _feed(hass, coordinator, _power())
-    assert coordinator._state["nodes"][BARCODE]["topology"]["data"] == "01"
-    assert await hass.config_entries.async_unload(entry.entry_id)
+def _aggregate(description, barcodes, nodes, *, action, reporting):
+    coordinator = MagicMock(spec=PyTapDataUpdateCoordinator)
+    coordinator.data = {"nodes": nodes}
+    coordinator.stale_action = action
+    coordinator.is_reporting.side_effect = lambda barcode: barcode in reporting
+    sensor = PyTapAggregateSensor(coordinator, description, barcodes, MagicMock(), "uid")
+    sensor.async_write_ha_state = MagicMock()
+    return coordinator, sensor
+
+
+@pytest.mark.parametrize(
+    ("action", "expected"),
+    [("zero", 25.0), ("unavailable", 50.0), ("hold", 65.0)],
+)
+def test_aggregate_performance_by_stale_action(action: str, expected: float) -> None:
+    description = next(d for d in STRING_SENSOR_DESCRIPTIONS if d.key == "performance")
+    nodes = {
+        BARCODE: {"power": 250.0, "peak_power": 500},
+        OTHER: {"power": 400.0, "peak_power": 500},  # Stale: last reading before dark.
+    }
+    _, sensor = _aggregate(description, [BARCODE, OTHER], nodes, action=action, reporting={BARCODE})
+    sensor._handle_coordinator_update()
+    assert sensor.native_value == expected

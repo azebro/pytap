@@ -128,7 +128,8 @@
           "add_module": "Add a module",
           "remove_module": "Remove a module",
           "done": "Save and close",
-          "change_reporting": "Change reporting settings"
+          "change_reporting": "Change reporting settings",
+          "change_stale": "Change stale reading behaviour"
         }
       },
       "change_connection": {
@@ -184,6 +185,18 @@
         "data_description": {
           "write_interval": "How often (in seconds) to push time-weighted averaged updates to Home Assistant. Range: 5\u2013300. Default: 30 seconds."
         }
+      },
+      "change_stale": {
+        "title": "Stale Readings",
+        "description": "Choose what live panel readings (power, voltage, current, temperature, duty cycle, RSSI and performance) do when a panel stops sending valid reports, for example at night or during radio dropouts. Energy totals are not affected.",
+        "data": {
+          "stale_action": "When a panel stops reporting",
+          "stale_timeout": "Timeout (seconds)"
+        },
+        "data_description": {
+          "stale_action": "Unavailable: show readings as unavailable. Zero: report 0 for power, voltage, current and performance (other readings become unavailable). Hold: keep the last values, including after a restart.",
+          "stale_timeout": "How long without a valid report before a panel counts as stale (60–600 s). In averaged reporting mode the reporting interval is added."
+        }
       }
     },
     "error": {
@@ -196,6 +209,15 @@
       "invalid_barcode": "Invalid barcode format. Expected format like A-1234567B.",
       "duplicate_barcode": "This barcode has already been added.",
       "missing_barcode": "Barcode is required."
+    }
+  },
+  "selector": {
+    "stale_action": {
+      "options": {
+        "unavailable": "Unavailable",
+        "zero": "Zero",
+        "hold": "Hold last value"
+      }
     }
   },
   "exceptions": {

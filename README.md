@@ -28,10 +28,10 @@ Please note that this integration requires RS485 to TCP converter that needs to 
 - **Persistent barcode mapping** — Discovered barcodes and node mappings are
     saved across restarts. When you add a previously-discovered barcode,
     it resolves instantly without waiting for the next gateway enumeration.
-- **Restart-safe availability** — Last known node readings are persisted and
-    restored on startup, so sensors stay available with the most recent value
-    even before the first live frame arrives (for example after a night restart).
-- **Energy accumulation** — Trapezoidal Wh integration with proactive midnight reset and monotonic lifetime totals. Daily sensors zero at exactly midnight local time.
+- **Stale-reading handling** — Choose what live readings do when a panel stops
+  reporting (for example at night): hold the last value (default), become
+  unavailable, or show zero. See [Stale readings](#stale-readings).
+- **Energy accumulation** — Trapezoidal Wh integration with proactive midnight reset and monotonic lifetime totals. Daily sensors zero at exactly midnight local time. Energy totals are restored after a restart.
 - **No external dependencies** — The protocol parser library is fully embedded; nothing to install from PyPI.
 - **Options flow** — Add or remove optimizer modules at any time without reconfiguring.
 
@@ -127,6 +127,7 @@ Go to **Settings → Devices & Services → PyTap → Configure** to:
 
 - **Change connection** — Update the gateway IP address and port. Connection changes save immediately and reload PyTap without changing module settings, entity IDs, or stored energy. If setup failed (for example because of invalid saved settings), saving corrected settings retries it.
 - **Change reporting settings** — Toggle live reporting or set the averaged reporting interval (see [Reporting modes](#reporting-modes)).
+- **Change stale reading behaviour** — Choose what live readings do when a panel stops reporting, and after how long (see [Stale readings](#stale-readings)).
 - **Add** new optimizer modules (if the barcode was previously seen on the bus, it resolves instantly).
 - **Remove** modules you no longer want to track.
 - **Save and close** to apply changes.
@@ -142,6 +143,20 @@ PyTap can deliver readings to Home Assistant in two ways, selectable under **Con
 
 Energy totals (daily and lifetime) are always integrated from the raw readings, so the reporting mode only affects the instantaneous values (power, voltage, current, temperature) shown on dashboards — never the accumulated energy figures.
 
+### Stale readings
+
+Optimizers stop reporting at night and during radio dropouts. Under **Configure → Change stale reading behaviour** you choose what each panel's live readings do once no valid report has arrived within the **timeout** (60–600 seconds, default 120). The default, **Hold last value**, applies to new and existing entries and keeps the behaviour of earlier versions; **Unavailable** and **Zero** are opt-in.
+
+| Action                    | Panel readings                                                                                                                                                                                     | String / installation power and performance                      |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| **Unavailable**           | Power, voltages, currents, temperature, duty cycle, RSSI and performance become unavailable.                                                                                                       | Count only panels that are reporting; unavailable when none are. |
+| **Zero**                  | Power, voltage in/out, current in/out and performance show 0. Temperature, duty cycle and RSSI become unavailable.                                                                                 | Stale panels count as 0 W; show 0 when none are.                 |
+| **Hold last value**       | Keep the last values, including after a restart.                                                                                                                                                   | Include every panel's last values.                               |
+
+Energy sensors (daily energy, total energy, readings today) are not affected by any action. In averaged reporting mode the reporting interval is added to the timeout, so panels don't flicker between updates. PyTap checks for stale panels every 5 seconds.
+
+After a restart, saved readings aren't treated as current: with **Unavailable** they stay unavailable, and with **Zero** they show 0, until each panel's first new report arrives. Energy totals are restored either way.
+
 ### Diagnostics Download
 
 PyTap diagnostics are available from the integration page:
@@ -151,7 +166,7 @@ PyTap diagnostics are available from the integration page:
 3. Use the menu (⋮) and select **Download diagnostics**.
 
 The diagnostics JSON includes parser counters, infrastructure and node mappings,
-discovered barcodes, connection state, and per-node summaries. Host/IP is redacted, including in the entry title.
+discovered barcodes, connection state, and per-node summaries (including whether each panel is currently reporting). Host/IP is redacted, including in the entry title.
 
 Power reports with an invalid slot counter are dropped. A receive-response
 frame with an invalid header slot counter never updates the slot clock; its
@@ -185,7 +200,7 @@ PyTap Coordinator
 
 PyTap uses a background listener thread that streams data, parses protocol frames, and keeps its own working copy of the readings. Home Assistant only ever receives finished copies, so entities never see half-updated data. Unload waits (up to a time limit) for the worker to release its gateway connection; if it is slow, setup is retried until it has stopped, so a replacement listener never shares the connection. Timers and pending saves are cancelled either way, the slow listener's host/port counts as in use for new entries, and it finishes its own cleanup once its worker exits. Only events matching your configured barcodes create or update sensor entities. Each publish re-renders only the entities of panels whose data changed (and the string/installation sensors containing them); global changes such as gateway updates refresh every entity. In the default **live reporting** mode each update is forwarded immediately; in **averaged interval** mode updates are buffered and flushed as a time-weighted average every few seconds (see [Reporting modes](#reporting-modes)).
 
-On startup, PyTap restores persisted coordinator state (barcode mappings, energy accumulators, and last node snapshots). Sensor entities also use Home Assistant restore fallback if needed, so a restart during low/no production does not force entities into unavailable when prior data exists. If the saved state can't be read, PyTap logs a warning and doesn't overwrite it until the next reload. If the connection drops, PyTap logs it once and keeps retrying quietly until data flows again.
+On startup, PyTap restores persisted coordinator state (barcode mappings, energy accumulators and last node snapshots). Energy sensors show their restored totals straight away. Whether live readings show their saved values depends on the [stale-reading action](#stale-readings): only **Hold last value** shows them before new reports arrive. If the saved state can't be read, PyTap logs a warning and doesn't overwrite it until the next reload. If the connection drops, PyTap logs it once and keeps retrying quietly until data flows again.
 
 ---
 

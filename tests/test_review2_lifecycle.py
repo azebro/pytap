@@ -112,6 +112,7 @@ async def test_timed_out_stop_still_cancels_timers_and_pending_save(hass):
         with patch(STOP_TIMEOUT, 0.05):
             assert await coordinator.async_stop_listener() is False
         assert coordinator._midnight_reset_unsub is None
+        assert coordinator._freshness_unsub is None
         assert coordinator._save_task is None and save_task.cancelled()
         assert coordinator._worker_future is not None  # Still guarding the port.
         release.set()
@@ -147,7 +148,7 @@ async def test_disabled_entry_parked_coordinator_cleans_up_when_worker_exits(has
         await hass.config_entries.async_set_disabled_by(entry.entry_id, ConfigEntryDisabler.USER)
         assert entry.state is ConfigEntryState.NOT_LOADED
         assert parked_coordinators(hass)[entry.entry_id] is coordinator
-        assert coordinator._midnight_reset_unsub is None
+        assert coordinator._midnight_reset_unsub is None and coordinator._freshness_unsub is None
         release.set()
         await _wait_for(lambda: entry.entry_id not in parked_coordinators(hass))
         await hass.async_block_till_done()
@@ -227,7 +228,7 @@ async def test_setup_failure_after_start_stops_the_listener(hass):
         coordinator = entry.runtime_data
     assert entry.state is ConfigEntryState.SETUP_ERROR
     assert coordinator._worker_future is None and coordinator._listener_task is None
-    assert coordinator._midnight_reset_unsub is None
+    assert coordinator._midnight_reset_unsub is None and coordinator._freshness_unsub is None
 
 
 async def test_setup_failure_with_stuck_worker_parks_it(hass):

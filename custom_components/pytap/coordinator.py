@@ -8,7 +8,7 @@ and filters events by user-configured barcodes.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import threading
 import time
@@ -16,7 +16,7 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
-from homeassistant.helpers.event import async_track_time_change
+from homeassistant.helpers.event import async_track_time_change, async_track_time_interval
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
@@ -29,17 +29,25 @@ from .const import (
     CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
     CONF_MODULES,
+    CONF_STALE_ACTION,
+    CONF_STALE_TIMEOUT,
     CONF_WRITE_INTERVAL,
     DEFAULT_LIVE_REPORTING,
     DEFAULT_PEAK_POWER,
+    DEFAULT_STALE_ACTION,
+    DEFAULT_STALE_TIMEOUT,
     DEFAULT_WRITE_INTERVAL,
     DOMAIN,
     ENERGY_GAP_THRESHOLD_SECONDS,
     ENERGY_LOW_POWER_THRESHOLD_W,
+    FRESHNESS_CHECK_INTERVAL_SECONDS,
     LISTENER_STOP_TIMEOUT,
+    MAX_STALE_TIMEOUT,
+    MIN_STALE_TIMEOUT,
     RECONNECT_DELAY,
     RECONNECT_RETRIES,
     RECONNECT_TIMEOUT,
+    STALE_ACTIONS,
 )
 from .energy import EnergyAccumulator, accumulate_energy
 from .pytap.core.events import (
@@ -72,7 +80,8 @@ _AVERAGED_FIELDS = (
     "rssi",
 )
 
-# Persisted per-node fields, restored on startup.
+# Persisted per-node fields, restored on startup (so "hold" can show them
+# after a restart). Report timing (report_monotonic) is session-only.
 _SNAPSHOT_FIELDS = (
     "gateway_id",
     "node_id",
@@ -162,6 +171,13 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except (TypeError, ValueError):
             self._write_interval = float(DEFAULT_WRITE_INTERVAL)
         self._write_interval = max(0.0, self._write_interval)
+        stale_action = entry.data.get(CONF_STALE_ACTION, DEFAULT_STALE_ACTION)
+        self._stale_action: str = stale_action if stale_action in STALE_ACTIONS else DEFAULT_STALE_ACTION
+        try:
+            stale_timeout = int(entry.data.get(CONF_STALE_TIMEOUT, DEFAULT_STALE_TIMEOUT))
+        except (TypeError, ValueError):
+            stale_timeout = DEFAULT_STALE_TIMEOUT
+        self._stale_timeout: int = max(MIN_STALE_TIMEOUT, min(MAX_STALE_TIMEOUT, stale_timeout))
 
         # Build barcode allowlist from configured modules
         self._configured_barcodes: set[str] = {
@@ -211,8 +227,13 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Midnight reset subscription
         self._midnight_reset_unsub: CALLBACK_TYPE | None = None
 
-        # Per-barcode entity callbacks re-rendered when that panel's data
+        # Periodic check that marks panels unavailable once reports stop.
+        self._freshness_unsub: CALLBACK_TYPE | None = None
+        self._reporting_barcodes: frozenset[str] = frozenset()
+        # Per-barcode entity callbacks re-rendered when that panel's freshness
         # changes, keyed by each registration's unsubscribe function.
+        self._freshness_listeners: dict[str, dict[CALLBACK_TYPE, CALLBACK_TYPE]] = {}
+        # Per-barcode entity callbacks re-rendered when that panel's data changes.
         self._data_listeners: dict[str, dict[CALLBACK_TYPE, CALLBACK_TYPE]] = {}
         # Worker side (under ``_state_lock``): panels changed since the last
         # publish, or a global change that needs every listener.
@@ -305,6 +326,37 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Normalised settings of the endpoint this coordinator's worker opens."""
         return dict(self._connection)
 
+    @property
+    def stale_action(self) -> str:
+        """What live readings do once a panel stops reporting."""
+        return self._stale_action
+
+    @property
+    def stale_timeout(self) -> int:
+        """Seconds without a valid report before a panel counts as stale."""
+        return self._stale_timeout
+
+    def seconds_since_report(self, barcode: str) -> float | None:
+        """Seconds since the published data's last valid report, if any this session."""
+        node = self.data.get("nodes", {}).get(barcode)
+        reported = node.get("report_monotonic") if node else None
+        return None if reported is None else time.monotonic() - reported
+
+    def is_reporting(self, barcode: str) -> bool:
+        """Whether live readings are current (a valid report within the timeout).
+
+        Averaged mode publishes at most once per interval, so the interval is
+        added to the allowance; otherwise panels would flap between flushes.
+        """
+        age = self.seconds_since_report(barcode)
+        allowance = self._stale_timeout + (0 if self._live_reporting else self._write_interval)
+        return age is not None and age < allowance
+
+    def _current_reporting(self) -> frozenset[str]:
+        return frozenset(
+            barcode for barcode in list(self.data.get("nodes", {})) if self.is_reporting(barcode)
+        )
+
     @callback
     def async_set_updated_data(self, data: dict[str, Any], changed: frozenset[str] | None = None) -> None:
         """Publish data and re-render the entities it affects.
@@ -330,6 +382,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if changed is None:
             self._missed_barcodes.clear()
             super().async_set_updated_data(data)
+            self._reporting_barcodes = self._current_reporting()
             return
         if self._missed_barcodes:
             changed = changed | self._missed_barcodes
@@ -338,13 +391,39 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.last_update_success = True
         if not changed:
             return
-        self._notify_data_listeners(changed)
+        # Time-based transitions of other panels are left to the freshness check.
+        self._reporting_barcodes = (self._reporting_barcodes - changed) | {
+            barcode for barcode in changed if self.is_reporting(barcode)
+        }
+        self._notify_barcode_listeners(self._data_listeners, changed)
 
-    def _notify_data_listeners(self, barcodes: frozenset[str]) -> None:
+    @staticmethod
+    def _add_barcode_listener(
+        registry: dict[str, dict[CALLBACK_TYPE, CALLBACK_TYPE]],
+        barcodes: list[str],
+        update_callback: CALLBACK_TYPE,
+    ) -> CALLBACK_TYPE:
+        watched = frozenset(barcodes)
+
+        @callback
+        def remove_listener() -> None:
+            for barcode in watched:
+                if (listeners := registry.get(barcode)) is not None:
+                    listeners.pop(remove_listener, None)
+                    if not listeners:
+                        del registry[barcode]
+
+        for barcode in watched:
+            registry.setdefault(barcode, {})[remove_listener] = update_callback
+        return remove_listener
+
+    def _notify_barcode_listeners(
+        self, registry: dict[str, dict[CALLBACK_TYPE, CALLBACK_TYPE]], barcodes: frozenset[str]
+    ) -> None:
         # One call per registration, even if several of its panels changed.
         affected: dict[CALLBACK_TYPE, CALLBACK_TYPE] = {}
         for barcode in barcodes:
-            affected.update(self._data_listeners.get(barcode, {}))
+            affected.update(registry.get(barcode, {}))
         for update_callback in affected.values():
             try:
                 update_callback()
@@ -352,24 +431,29 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.exception("Error updating PyTap entity")
 
     @callback
+    def async_add_freshness_listener(
+        self, barcodes: list[str], update_callback: CALLBACK_TYPE
+    ) -> CALLBACK_TYPE:
+        """Call ``update_callback`` when any of ``barcodes`` starts or stops reporting."""
+        return self._add_barcode_listener(self._freshness_listeners, barcodes, update_callback)
+
+    @callback
     def async_add_data_listener(self, barcodes: list[str], update_callback: CALLBACK_TYPE) -> CALLBACK_TYPE:
         """Call ``update_callback`` when published data of any of ``barcodes`` changes.
 
         Global updates still reach entities through their coordinator listener.
         """
-        watched = frozenset(barcodes)
+        return self._add_barcode_listener(self._data_listeners, barcodes, update_callback)
 
-        @callback
-        def remove_listener() -> None:
-            for barcode in watched:
-                if (listeners := self._data_listeners.get(barcode)) is not None:
-                    listeners.pop(remove_listener, None)
-                    if not listeners:
-                        del self._data_listeners[barcode]
-
-        for barcode in watched:
-            self._data_listeners.setdefault(barcode, {})[remove_listener] = update_callback
-        return remove_listener
+    @callback
+    def _async_check_freshness(self, _now: datetime | None = None) -> None:
+        """Re-render only entities of panels that started or stopped reporting."""
+        reporting = self._current_reporting()
+        changed = reporting ^ self._reporting_barcodes
+        if not changed:
+            return
+        self._reporting_barcodes = reporting
+        self._notify_barcode_listeners(self._freshness_listeners, changed)
 
     def get_diagnostics_data(self) -> dict[str, Any]:
         """Return coordinator diagnostics snapshot."""
@@ -419,6 +503,12 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             name="pytap_listener",
         )
         self._schedule_midnight_reset()
+        self._freshness_unsub = async_track_time_interval(
+            self.hass,
+            self._async_check_freshness,
+            timedelta(seconds=FRESHNESS_CHECK_INTERVAL_SECONDS),
+            cancel_on_shutdown=True,
+        )
 
     async def _async_listen(self) -> None:
         """Async wrapper to run the blocking listener in an executor."""
@@ -446,6 +536,9 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._midnight_reset_unsub is not None:
             self._midnight_reset_unsub()
             self._midnight_reset_unsub = None
+        if self._freshness_unsub is not None:
+            self._freshness_unsub()
+            self._freshness_unsub = None
         # Unsaved changes are written by the final save once the worker exits.
         self._cancel_scheduled_save()
 
@@ -939,6 +1032,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "readings_today": acc.readings_today,
             "daily_reset_date": acc.daily_reset_date,
             "last_update": now.isoformat(),
+            "report_monotonic": time.monotonic(),
         }
         if previous is not None and "topology" in previous:
             self._state["nodes"][barcode]["topology"] = previous["topology"]
