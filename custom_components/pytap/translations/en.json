@@ -42,18 +42,16 @@
       }
     },
     "error": {
-      "cannot_connect": "Failed to connect to the Tigo gateway. Check host and port.",
-      "invalid_auth": "Invalid authentication",
+      "cannot_connect": "Failed to connect to the Tigo gateway. Check host and port, or submit again to save them anyway and keep retrying in the background.",
       "invalid_barcode": "Invalid barcode format. Expected format like A-1234567B.",
       "missing_string": "String group is required.",
       "missing_name": "Module name is required.",
       "missing_barcode": "Barcode is required.",
       "duplicate_barcode": "This barcode has already been added.",
       "no_modules": "At least one module must be added.",
-      "unknown": "Unexpected error"
-    },
-    "abort": {
-      "already_configured": "This gateway is already configured."
+      "invalid_host": "Enter a hostname or IP address.",
+      "invalid_port": "Enter a port between 1 and 65535.",
+      "connection_in_use": "A PyTap entry that is still shutting down holds this connection. Wait a moment and try again."
     }
   },
   "entity": {
@@ -130,7 +128,8 @@
           "add_module": "Add a module",
           "remove_module": "Remove a module",
           "done": "Save and close",
-          "change_reporting": "Change reporting settings"
+          "change_reporting": "Change reporting settings",
+          "change_stale": "Change stale reading behaviour"
         }
       },
       "change_connection": {
@@ -186,7 +185,47 @@
         "data_description": {
           "write_interval": "How often (in seconds) to push time-weighted averaged updates to Home Assistant. Range: 5\u2013300. Default: 30 seconds."
         }
+      },
+      "change_stale": {
+        "title": "Stale Readings",
+        "description": "Choose what live panel readings (power, voltage, current, temperature, duty cycle, RSSI and performance) do when a panel stops sending valid reports, for example at night or during radio dropouts. Energy totals are not affected.",
+        "data": {
+          "stale_action": "When a panel stops reporting",
+          "stale_timeout": "Timeout (seconds)"
+        },
+        "data_description": {
+          "stale_action": "Unavailable: show readings as unavailable. Zero: report 0 for power, voltage, current and performance (other readings become unavailable). Hold: keep the last values, including after a restart.",
+          "stale_timeout": "How long without a valid report before a panel counts as stale (60–600 s). In averaged reporting mode the reporting interval is added."
+        }
       }
+    },
+    "error": {
+      "invalid_host": "Enter a hostname or IP address.",
+      "missing_name": "Module name is required.",
+      "missing_string": "String group is required.",
+      "invalid_port": "Enter a port between 1 and 65535.",
+      "connection_in_use": "A PyTap entry that is still shutting down holds this connection. Wait a moment and try again.",
+      "cannot_connect": "Failed to connect to the Tigo gateway. Check host and port, or submit again to save them anyway and keep retrying in the background.",
+      "invalid_barcode": "Invalid barcode format. Expected format like A-1234567B.",
+      "duplicate_barcode": "This barcode has already been added.",
+      "missing_barcode": "Barcode is required."
+    }
+  },
+  "selector": {
+    "stale_action": {
+      "options": {
+        "unavailable": "Unavailable",
+        "zero": "Zero",
+        "hold": "Hold last value"
+      }
+    }
+  },
+  "exceptions": {
+    "previous_listener_stopping": {
+      "message": "The previous PyTap listener is still releasing its connection; setup will retry."
+    },
+    "invalid_connection_settings": {
+      "message": "The saved {field} setting is invalid. Update it with Configure → Change connection settings; the entry then retries setup."
     }
   }
 }
