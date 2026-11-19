@@ -1,6 +1,6 @@
 {
   "name": "Home Assistant Integration Development",
-  "image": "mcr.microsoft.com/devcontainers/python:3.13",
+  "image": "mcr.microsoft.com/devcontainers/python:3.14",
 
   "features": {
     "ghcr.io/devcontainers/features/github-cli:1": {}
@@ -15,7 +15,7 @@
     }
   },
 
-  "postCreateCommand": "pip install --upgrade pip && pip install -r requirements.txt && pip install homeassistant colorlog && echo 'Setup complete!'",
+  "postCreateCommand": "pip install --upgrade pip && pip install 'homeassistant==2026.11.0' 'serialx==1.15.1' colorlog ruff",
   "customizations": {
     "vscode": {
       "extensions": [
