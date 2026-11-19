@@ -5,7 +5,7 @@ infrastructure state survive restarts via the consolidated HA Store.
 """
 
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
@@ -118,7 +118,7 @@ class TestLoadCoordinatorState:
         await coordinator._async_load_coordinator_state()
 
         assert coordinator._discovered_barcodes == {"X-9999999Z", "B-7654321A"}
-        assert coordinator.data["discovered_barcodes"] == [
+        assert coordinator._state["discovered_barcodes"] == [
             "B-7654321A",
             "X-9999999Z",
         ]
@@ -302,7 +302,7 @@ class TestLoadCoordinatorState:
 
         await coordinator._async_load_coordinator_state()
 
-        node = coordinator.data["nodes"]["A-1234567B"]
+        node = coordinator._state["nodes"]["A-1234567B"]
         assert node["power"] == 299.2
         assert node["voltage_in"] == 35.2
         assert node["last_update"] == "2026-02-24T20:00:00"
@@ -329,7 +329,7 @@ class TestSaveCoordinatorState:
                 last_reading_ts=datetime.now(),
             )
         }
-        coordinator.data["nodes"]["A-1234567B"] = {
+        coordinator._state["nodes"]["A-1234567B"] = {
             "gateway_id": 1,
             "node_id": 10,
             "barcode": "A-1234567B",
@@ -623,7 +623,7 @@ class TestPowerReportDeferredBeforeInfra:
 
         # Should be deferred (return False), not stored
         assert result is False
-        assert "A-1234567B" not in coordinator.data["nodes"]
+        assert "A-1234567B" not in coordinator._state["nodes"]
 
     def test_fallback_allowed_after_infra(self, hass: HomeAssistant) -> None:
         """Power report fallback should work after infra event is received."""
@@ -656,12 +656,13 @@ class TestPowerReportDeferredBeforeInfra:
         result = coordinator._handle_power_report(power_event)
 
         assert result is True
-        assert "A-1234567B" in coordinator.data["nodes"]
+        assert "A-1234567B" in coordinator._state["nodes"]
 
     def test_direct_barcode_works_before_infra(self, hass: HomeAssistant) -> None:
         """Power reports with a direct barcode should work even pre-infra."""
         entry = _make_entry(hass)
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
+        coordinator._schedule_save = MagicMock()
         coordinator._infra_received = False
 
         event = PowerReportEvent(
@@ -679,7 +680,7 @@ class TestPowerReportDeferredBeforeInfra:
         result = coordinator._handle_power_report(event)
 
         assert result is True
-        assert "A-1234567B" in coordinator.data["nodes"]
+        assert "A-1234567B" in coordinator._state["nodes"]
 
 
 class TestStopFlushesState:
@@ -715,6 +716,7 @@ class TestPowerReportPerformance:
         """Power report should populate performance in node payload."""
         entry = _make_entry(hass)
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
+        coordinator._schedule_save = MagicMock()
 
         event = PowerReportEvent(
             gateway_id=1,
@@ -731,7 +733,7 @@ class TestPowerReportPerformance:
         result = coordinator._handle_power_report(event)
 
         assert result is True
-        node = coordinator.data["nodes"]["A-1234567B"]
+        node = coordinator._state["nodes"]["A-1234567B"]
         assert "performance" in node
         assert node["peak_power"] == 455
 
@@ -739,6 +741,7 @@ class TestPowerReportPerformance:
         """Performance should be power/peak_power*100 rounded to 2 decimals."""
         entry = _make_entry(hass)
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
+        coordinator._schedule_save = MagicMock()
 
         event = PowerReportEvent(
             gateway_id=1,
@@ -754,7 +757,7 @@ class TestPowerReportPerformance:
         )
         coordinator._handle_power_report(event)
 
-        node = coordinator.data["nodes"]["A-1234567B"]
+        node = coordinator._state["nodes"]["A-1234567B"]
         assert node["performance"] == 54.95
 
     def test_power_report_default_peak_power(self, hass: HomeAssistant) -> None:
@@ -771,6 +774,7 @@ class TestPowerReportPerformance:
             ],
         }
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
+        coordinator._schedule_save = MagicMock()
 
         event = PowerReportEvent(
             gateway_id=1,
@@ -786,7 +790,7 @@ class TestPowerReportPerformance:
         )
         coordinator._handle_power_report(event)
 
-        node = coordinator.data["nodes"]["A-1234567B"]
+        node = coordinator._state["nodes"]["A-1234567B"]
         assert node["peak_power"] == DEFAULT_PEAK_POWER
 
 
@@ -859,7 +863,7 @@ class TestEnergyPrePopulation:
         await coordinator._async_load_coordinator_state()
 
         # Node data should be pre-populated with energy values
-        node = coordinator.data["nodes"].get("A-1234567B")
+        node = coordinator._state["nodes"].get("A-1234567B")
         assert node is not None
         assert node["total_energy_wh"] == 5000.0
         assert node["daily_energy_wh"] == 42.5
@@ -892,7 +896,7 @@ class TestEnergyPrePopulation:
 
         await coordinator._async_load_coordinator_state()
 
-        node = coordinator.data["nodes"]["A-1234567B"]
+        node = coordinator._state["nodes"]["A-1234567B"]
         assert node["power"] is None
         assert node["voltage_in"] is None
         assert node["voltage_out"] is None
@@ -936,8 +940,8 @@ class TestEnergyPrePopulation:
 
         await coordinator._async_load_coordinator_state()
 
-        assert "A-1234567B" in coordinator.data["nodes"]
-        assert "UNCONFIGURED-BARCODE" not in coordinator.data["nodes"]
+        assert "A-1234567B" in coordinator._state["nodes"]
+        assert "UNCONFIGURED-BARCODE" not in coordinator._state["nodes"]
 
     async def test_power_report_overwrites_prepopulated_data(
         self, hass: HomeAssistant
@@ -965,7 +969,7 @@ class TestEnergyPrePopulation:
         await coordinator._async_load_coordinator_state()
 
         # Pre-populated: power is None
-        assert coordinator.data["nodes"]["A-1234567B"]["power"] is None
+        assert coordinator._state["nodes"]["A-1234567B"]["power"] is None
 
         # Live power report arrives
         coordinator._infra_received = True
@@ -984,7 +988,7 @@ class TestEnergyPrePopulation:
         )
         coordinator._handle_power_report(event)
 
-        node = coordinator.data["nodes"]["A-1234567B"]
+        node = coordinator._state["nodes"]["A-1234567B"]
         # Live fields should now be populated
         assert node["power"] is not None
         assert node["voltage_in"] == 60.0
@@ -1015,7 +1019,7 @@ class TestMidnightReset:
             last_reading_ts=None,
             readings_today=42,
         )
-        coordinator.data["nodes"]["A-1234567B"] = {
+        coordinator._state["nodes"]["A-1234567B"] = {
             "daily_energy_wh": 150.0,
             "total_energy_wh": 5000.0,
             "readings_today": 42,
@@ -1030,7 +1034,7 @@ class TestMidnightReset:
         assert acc.daily_reset_date == today
         assert acc.total_energy_wh == 5000.0
 
-        node = coordinator.data["nodes"]["A-1234567B"]
+        node = coordinator._state["nodes"]["A-1234567B"]
         assert node["daily_energy_wh"] == 0.0
         assert node["readings_today"] == 0
         assert node["daily_reset_date"] == today
@@ -1068,29 +1072,47 @@ class TestMidnightReset:
         coordinator._schedule_save.assert_not_called()
         coordinator.async_set_updated_data.assert_not_called()
 
-    def test_perform_midnight_reset_reschedules(self, hass: HomeAssistant) -> None:
-        """Midnight reset should reschedule itself for the next midnight."""
+    def test_midnight_reset_uses_local_time_change(self, hass: HomeAssistant) -> None:
+        """The reset is a recurring local-time trigger (DST-safe), not a computed delay."""
+        entry = _make_entry(hass)
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+        with patch("custom_components.pytap.coordinator.async_track_time_change") as track:
+            coordinator._schedule_midnight_reset()
+        track.assert_called_once_with(hass, coordinator._perform_midnight_reset, hour=0, minute=0, second=0)
+        assert coordinator._midnight_reset_unsub is track.return_value
+
+    def test_midnight_reset_publishes_only_daily_fields(self, hass: HomeAssistant) -> None:
+        """Averaged (published) values survive the reset; raw worker values never leak."""
         entry = _make_entry(hass)
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
         coordinator._schedule_save = MagicMock()
         coordinator.async_set_updated_data = MagicMock()
+        yesterday = (dt_util.now().date() - timedelta(days=1)).isoformat()
+        coordinator._energy_state["A-1234567B"] = EnergyAccumulator(
+            daily_energy_wh=10.0, total_energy_wh=50.0, daily_reset_date=yesterday
+        )
+        coordinator._state["nodes"]["A-1234567B"] = {"power": 300.0, "daily_energy_wh": 10.0}
+        published = {"A-1234567B": {"power": 30.0, "daily_energy_wh": 10.0}}
+        coordinator.data = {**coordinator.data, "nodes": published}
 
         coordinator._perform_midnight_reset()
 
-        assert coordinator._midnight_reset_unsub is not None
+        published = coordinator.async_set_updated_data.call_args.args[0]["nodes"]["A-1234567B"]
+        assert published["power"] == 30.0
+        assert published["daily_energy_wh"] == 0.0
 
     def test_stop_cancels_midnight_timer(self, hass: HomeAssistant) -> None:
         """Stopping the listener should cancel the midnight reset timer."""
         entry = _make_entry(hass)
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
 
-        mock_timer = MagicMock()
-        coordinator._midnight_reset_unsub = mock_timer
+        mock_unsub = MagicMock()
+        coordinator._midnight_reset_unsub = mock_unsub
 
-        # async_stop_listener cancels the timer
+        # async_stop_listener cancels the subscription
         import asyncio
 
         asyncio.get_event_loop().run_until_complete(coordinator.async_stop_listener())
 
-        mock_timer.cancel.assert_called_once()
+        mock_unsub.assert_called_once()
         assert coordinator._midnight_reset_unsub is None

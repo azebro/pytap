@@ -316,6 +316,24 @@ class PowerReport:
         """DC-DC converter duty cycle (0.0-1.0)."""
         return self.dc_dc_duty_cycle_raw / 255.0
 
+    # Bytes 7 and 9 are undocumented. The meanings below come from correlation
+    # with ~217k captured reports and are not confirmed by Tigo.
+
+    @property
+    def high_output_mode(self) -> bool:
+        """Byte 7 bit 7: set almost only when input current exceeds ~0.5 A."""
+        return bool(self.unknown[0] & 0x80)
+
+    @property
+    def status_code(self) -> int:
+        """Byte 9 raw value: normally 0x64; 0x68 at low current, 0xE4 at low voltage."""
+        return self.unknown[2]
+
+    @property
+    def low_voltage_flag(self) -> bool:
+        """Byte 9 bit 7: mostly set when input voltage is low."""
+        return bool(self.unknown[2] & 0x80)
+
 
 # ---------------------------------------------------------------------------
 #  Infrastructure Helper Types

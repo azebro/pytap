@@ -2,11 +2,19 @@
 
 DOMAIN = "pytap"
 DEFAULT_NAME = "PyTap"
+INTEGRATION_VERSION = "1.2.0"
 
 # Configuration keys
 CONF_HOST = "host"
 CONF_PORT = "port"
+CONF_CONNECTION_TYPE = "connection_type"
+CONF_SERIAL_PORT = "serial_port"
+CONF_BAUD_RATE = "baud_rate"
+CONNECTION_TCP = "tcp"
+CONNECTION_SERIAL = "serial"
 CONF_MODULES = "modules"
+CONF_AUTO_DISCOVERY = "auto_discovery"
+CONF_EXCLUDED_BARCODES = "excluded_barcodes"
 CONF_LIVE_REPORTING = "live_reporting"
 CONF_WRITE_INTERVAL = "write_interval"
 
@@ -18,8 +26,13 @@ CONF_MODULE_PEAK_POWER = "peak_power"
 
 # Defaults
 DEFAULT_PORT = 502
+DEFAULT_BAUD_RATE = 38400
+CONNECTION_TIMEOUT = 10
+SERIAL_READ_TIMEOUT = 1
+LISTENER_STOP_TIMEOUT = 20
 DEFAULT_STRING_NAME = "Default"
 DEFAULT_PEAK_POWER = 455
+DEFAULT_DISCOVERED_STRING = "Discovered"
 DEFAULT_SCAN_INTERVAL = 30
 DEFAULT_LIVE_REPORTING = True
 DEFAULT_WRITE_INTERVAL = 30
@@ -32,3 +45,24 @@ RECONNECT_RETRIES = 0
 # Energy accumulation tuning
 ENERGY_GAP_THRESHOLD_SECONDS = 120
 ENERGY_LOW_POWER_THRESHOLD_W = 1.0
+
+# What live panel readings do once a panel stops sending valid reports.
+CONF_STALE_ACTION = "stale_action"
+CONF_STALE_TIMEOUT = "stale_timeout"
+STALE_ACTION_UNAVAILABLE = "unavailable"
+STALE_ACTION_ZERO = "zero"
+STALE_ACTION_HOLD = "hold"
+STALE_ACTIONS = (STALE_ACTION_UNAVAILABLE, STALE_ACTION_ZERO, STALE_ACTION_HOLD)
+DEFAULT_STALE_ACTION = STALE_ACTION_HOLD
+DEFAULT_STALE_TIMEOUT = 120
+MIN_STALE_TIMEOUT = 60
+MAX_STALE_TIMEOUT = 600
+FRESHNESS_CHECK_INTERVAL_SECONDS = 5
+
+# Readings outside these bounds are treated as corrupt, not as measurements.
+# TS4 optimizers only step voltage down, so output above input is impossible;
+# the tolerance covers rounding (never exceeded in 217k captured reports).
+MAX_PLAUSIBLE_VOLTAGE = 100.0
+MAX_OUTPUT_ABOVE_INPUT_VOLTS = 2.0
+MIN_PLAUSIBLE_TEMPERATURE = -40.0
+MAX_PLAUSIBLE_TEMPERATURE = 125.0

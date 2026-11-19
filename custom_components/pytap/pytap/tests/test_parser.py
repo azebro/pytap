@@ -1,7 +1,13 @@
 """Tests for the core protocol parser."""
 
+from datetime import datetime, timedelta
+import logging
+
+import pytest
+
 from pytap.core.crc import crc
 from pytap.core.parser import Parser
+from pytap.core.types import SlotCounter
 
 # -----------------------------------------------------------------------
 #  ENUMERATION_SEQUENCE test data (from Appendix B of implementation plan)
@@ -1197,3 +1203,151 @@ def test_g_firmware_receive_response_still_works():
     assert len(power_events) == 1
     assert power_events[0].gateway_id == gw_id
     assert power_events[0].node_id == 22
+
+
+# -----------------------------------------------------------------------
+#  Invalid slot counters and undocumented status bytes
+# -----------------------------------------------------------------------
+
+
+def _h_status(packet_number_lo: int, slot: int) -> bytes:
+    return bytes([0x01, 0x1E, 0x02, packet_number_lo]) + slot.to_bytes(2, "big")
+
+
+def _power_packet_with(node_id: int, *, slot: int = 0x64D4, unknown: bytes = b"\x96\x93\x00") -> bytes:
+    packet = bytearray(_build_power_report_packet(node_id))
+    packet[7 + 7 : 7 + 10] = unknown
+    packet[7 + 10 : 7 + 12] = slot.to_bytes(2, "big")
+    return bytes(packet)
+
+
+def _stepping_clock(start: datetime, step: timedelta = timedelta(seconds=1)):
+    """Deterministic clock that advances by `step` on every call."""
+    calls = [0]
+
+    def clock() -> datetime:
+        calls[0] += 1
+        return start + step * (calls[0] - 1)
+
+    return clock
+
+
+def test_invalid_header_slot_skips_clock_but_keeps_reports():
+    """A corrupt header counter must not drop valid reports in the same frame."""
+    parser = Parser(clock=_stepping_clock(datetime(2001, 1, 1, 12, 0, 0)))
+    gw_id = 0x1203
+    parser.feed(_build_receive_request(gw_id, 0x0049))
+    parser.feed(_build_receive_response(gw_id, _h_status(0x4A, 0xD457), b""))  # Establish the clock.
+    slot_clock = parser._slot_clocks[gw_id]
+    times_before = list(slot_clock._times)
+    last_before = (slot_clock._last_index, slot_clock._last_time)
+    expected_timestamp = slot_clock.get(SlotCounter(0x64D4))
+
+    parser.feed(_build_receive_request(gw_id, 0x004A))
+    frame = _build_receive_response(gw_id, _h_status(0x4B, 0xFFFF), _power_packet_with(27))
+    power_events = [e for e in parser.feed(frame) if e.event_type == "power_report"]
+
+    assert len(power_events) == 1
+    assert power_events[0].timestamp == expected_timestamp
+    assert parser._slot_clocks[gw_id] is slot_clock
+    assert slot_clock._times == times_before
+    assert (slot_clock._last_index, slot_clock._last_time) == last_before
+    assert parser.counters["invalid_slots"] == 1
+    assert parser.counters["invalid_slot_frames_kept"] == 1
+    assert parser.counters["invalid_slot_frames_dropped"] == 0
+    assert parser._rx_packet_numbers[gw_id] == 0x004B
+
+
+@pytest.mark.parametrize(
+    "pv_data",
+    [
+        pytest.param(_power_packet_with(27) + b"\x00", id="trailing-byte"),
+        pytest.param(b"\x00" + _power_packet_with(27), id="shifted-by-one"),
+        pytest.param(_power_packet_with(27)[:-1], id="truncated-data"),
+        pytest.param(_power_packet_with(27) + b"\x31\x00\x1b", id="truncated-header"),
+        pytest.param(b"\x55" + _power_packet_with(27)[1:], id="unknown-packet-type"),
+        pytest.param(_power_packet_with(0), id="broadcast-node"),
+        pytest.param(_power_packet_with(0x8001), id="implausible-node"),
+        pytest.param(
+            _power_packet_with(27)[:6] + b"\x0e" + _power_packet_with(27)[7:] + b"\x00",
+            id="power-report-length-14",
+        ),
+    ],
+)
+def test_invalid_header_slot_with_misaligned_payload_is_dropped(pv_data):
+    """An invalid header slot plus malformed packet framing drops the frame."""
+    parser = Parser()
+    gw_id = 0x1203
+    parser.feed(_build_receive_request(gw_id, 0x0049))
+    parser.feed(_build_receive_response(gw_id, _h_status(0x4A, 0xD457), b""))  # Establish the clock.
+
+    parser.feed(_build_receive_request(gw_id, 0x004A))
+    frame = _build_receive_response(gw_id, _h_status(0x4B, 0xFFFF), pv_data)
+
+    assert parser.feed(frame) == []
+    assert parser.counters["invalid_slots"] == 1
+    assert parser.counters["invalid_slot_frames_dropped"] == 1
+    assert parser.counters["invalid_slot_frames_kept"] == 0
+
+
+def test_valid_header_slot_keeps_lenient_packet_walk():
+    """Valid-slot frames keep ignoring trailing bytes, as before."""
+    parser = Parser()
+    gw_id = 0x1203
+    parser.feed(_build_receive_request(gw_id, 0x0049))
+    frame = _build_receive_response(gw_id, _h_status(0x4A, 0xD457), _power_packet_with(27) + b"\x00")
+    power_events = [e for e in parser.feed(frame) if e.event_type == "power_report"]
+
+    assert len(power_events) == 1
+    assert parser.counters["invalid_slot_frames_dropped"] == 0
+
+
+def test_invalid_header_slot_without_clock_drops_reports_quietly(caplog):
+    """With no slot clock yet, reports are counted and warned about only once."""
+    parser = Parser()
+    gw_id = 0x1203
+    caplog.set_level(logging.DEBUG)
+
+    for packet_number in (0x0049, 0x004A, 0x004B):
+        parser.feed(_build_receive_request(gw_id, packet_number))
+        frame = _build_receive_response(
+            gw_id, _h_status((packet_number + 1) & 0xFF, 0xFFFF), _power_packet_with(27)
+        )
+        assert parser.feed(frame) == []
+
+    assert gw_id not in parser._slot_clocks
+    assert parser.counters["invalid_slots"] == 3
+    assert parser.counters["invalid_slot_frames_kept"] == 3
+    assert parser.counters["no_slot_clock_drops"] == 3
+    no_clock = [r for r in caplog.records if "No slot clock" in r.getMessage()]
+    assert [r.levelno for r in no_clock] == [logging.WARNING, logging.DEBUG, logging.DEBUG]
+
+
+def test_counters_are_backwards_compatible():
+    """Counters only gain keys; the original ones are still present."""
+    counters = Parser().counters
+    for key in ("frames_received", "crc_errors", "runts", "giants", "noise_bytes", "invalid_slots"):
+        assert counters[key] == 0
+
+
+def test_invalid_report_slot_is_counted_and_dropped():
+    """A report whose own slot counter is invalid has no valid timestamp."""
+    parser = Parser()
+    gw_id = 0x1203
+    parser.feed(_build_receive_request(gw_id, 0x0049))
+    frame = _build_receive_response(gw_id, _h_status(0x4A, 0xD457), _power_packet_with(27, slot=0x3000))
+    assert [e for e in parser.feed(frame) if e.event_type == "power_report"] == []
+    assert parser.counters["invalid_slots"] == 1
+
+
+def test_parser_fills_status_fields_on_power_events():
+    """Byte 7 bit 7 and byte 9 reach PowerReportEvent through Parser.feed."""
+    parser = Parser()
+    gw_id = 0x1203
+    parser.feed(_build_receive_request(gw_id, 0x0049))
+    packet = _power_packet_with(27, unknown=b"\x93\x00\xe4")
+    frame = _build_receive_response(gw_id, _h_status(0x4A, 0xD457), packet)
+    (event,) = [e for e in parser.feed(frame) if e.event_type == "power_report"]
+    assert event.high_output_mode is True
+    assert event.status_code == 0xE4
+    assert event.low_voltage_flag is True
