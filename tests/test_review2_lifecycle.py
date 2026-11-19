@@ -1,4 +1,4 @@
-"""Second review: lifecycle, Store safety and endpoint checks."""
+"""Second review: lifecycle, Store safety, device registry and endpoint checks."""
 
 import asyncio
 import logging
@@ -12,9 +12,11 @@ from homeassistant import config_entries
 from homeassistant.config_entries import ConfigEntryDisabler, ConfigEntryState
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import device_registry as dr
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.pytap import async_remove_config_entry_device
 from custom_components.pytap.config_flow import serial_port_claimed
 from custom_components.pytap.connection import (
     InvalidConnectionSettings,
@@ -22,10 +24,21 @@ from custom_components.pytap.connection import (
     check_device_node,
     normalize_connection,
 )
-from custom_components.pytap.const import CONF_SERIAL_PORT, DOMAIN
-from custom_components.pytap.coordinator import PyTapDataUpdateCoordinator, parked_coordinators
+from custom_components.pytap.const import (
+    CONF_AUTO_DISCOVERY,
+    CONF_EXCLUDED_BARCODES,
+    CONF_SERIAL_PORT,
+    DEFAULT_DISCOVERED_STRING,
+    DOMAIN,
+)
+from custom_components.pytap.coordinator import (
+    PyTapDataUpdateCoordinator,
+    barcode_claims,
+    parked_coordinators,
+)
 
 BARCODE = "A-1234567B"
+DISCOVERED = "C-2345678D"
 MODULE = {"barcode": BARCODE, "name": "East", "string": "East", "peak_power": 400}
 LISTEN = "custom_components.pytap.coordinator.PyTapDataUpdateCoordinator._listen"
 STOP_TIMEOUT = "custom_components.pytap.coordinator.LISTENER_STOP_TIMEOUT"
@@ -33,15 +46,17 @@ LOAD = "custom_components.pytap.coordinator._MigratingStore.async_load"
 SAVE = "custom_components.pytap.coordinator._MigratingStore.async_save"
 
 
-def _entry(hass, *, modules=None, **data):
+def _entry(hass, *, modules=None, auto=False, **data):
     entry = MockConfigEntry(
         domain=DOMAIN,
-        version=6,
+        version=7,
         data={
             "connection_type": "tcp",
             "host": "gateway",
             "port": 502,
             "modules": [MODULE] if modules is None else modules,
+            CONF_AUTO_DISCOVERY: auto,
+            CONF_EXCLUDED_BARCODES: [],
             **data,
         },
     )
@@ -53,27 +68,108 @@ def _idle_listen(self):
     self._stop_event.wait()
 
 
+def _device(hass, entry, identifier):
+    return dr.async_get(hass).async_get_or_create(
+        config_entry_id=entry.entry_id, identifiers={(DOMAIN, identifier)}
+    )
+
+
 async def _wait_for(condition, timeout=2.0):
     async with asyncio.timeout(timeout):
         while not condition():
             await asyncio.sleep(0.01)
 
 
-# --- Store safety ---
+# --- Device registry (#1, #3, #6) ---
 
 
-async def test_unreadable_store_is_never_overwritten(hass, caplog):
-    entry = _entry(hass)
+async def test_orphan_cleanup_uses_async_remove_device(hass, caplog):
+    entry = _entry(hass, **{CONF_EXCLUDED_BARCODES: [DISCOVERED]})
+    excluded = _device(hass, entry, DISCOVERED)
+    registry = dr.async_get(hass)
+    with (
+        patch(LISTEN, _idle_listen),
+        patch.object(registry, "async_update_device", wraps=registry.async_update_device) as update,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        assert registry.async_get(excluded.id) is None
+        assert all("remove_config_entry_id" not in call.kwargs for call in update.call_args_list)
+        assert await hass.config_entries.async_unload(entry.entry_id)
+    assert "remove_config_entry_id" not in caplog.text
+
+
+async def test_empty_store_keeps_discovered_devices(hass):
+    """A corrupt Store is renamed and loads as None: discovered devices must survive."""
+    entry = _entry(hass, modules=[], auto=True)
+    optimizer = _device(hass, entry, DISCOVERED)
+    string = _device(hass, entry, f"{entry.entry_id}_string_{DEFAULT_DISCOVERED_STRING}")
+    registry = dr.async_get(hass)
+    with patch(LISTEN, _idle_listen), patch(LOAD, AsyncMock(return_value=None)):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        assert entry.runtime_data.store_loaded and not entry.runtime_data.store_restored
+        assert registry.async_get(optimizer.id) is not None
+        assert registry.async_get(string.id) is not None
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_unreadable_store_skips_cleanup_and_is_never_overwritten(hass, caplog):
+    entry = _entry(hass, **{CONF_EXCLUDED_BARCODES: [DISCOVERED]})
+    excluded = _device(hass, entry, DISCOVERED)
+    empty_string = _device(hass, entry, f"{entry.entry_id}_string_Old")
+    registry = dr.async_get(hass)
     save = AsyncMock()
     with patch(LISTEN, _idle_listen), patch(LOAD, AsyncMock(side_effect=OSError("io"))), patch(SAVE, save):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
         coordinator = entry.runtime_data
+        assert not coordinator.store_loaded
+        assert registry.async_get(excluded.id) is not None
+        assert registry.async_get(empty_string.id) is not None
         coordinator._unsaved_changes = True
         await coordinator._async_save_coordinator_state()
         assert await hass.config_entries.async_unload(entry.entry_id)
     save.assert_not_called()
     assert "won't be overwritten" in caplog.text
+
+
+async def test_deleting_discovered_device_while_not_loaded_excludes_it(hass):
+    entry = _entry(hass, modules=[MODULE], auto=True)
+    assert entry.state is ConfigEntryState.NOT_LOADED
+    assert await async_remove_config_entry_device(hass, entry, _device(hass, entry, DISCOVERED))
+    assert entry.data[CONF_EXCLUDED_BARCODES] == [DISCOVERED]
+    assert entry.data["modules"] == [MODULE]
+    assert await async_remove_config_entry_device(hass, entry, _device(hass, entry, BARCODE))
+    assert entry.data[CONF_EXCLUDED_BARCODES] == [BARCODE, DISCOVERED]
+    assert entry.data["modules"] == []
+
+
+async def test_deleting_discovered_device_of_loaded_entry_excludes_and_reloads(hass):
+    entry = _entry(hass, modules=[MODULE], auto=True)
+    with patch(LISTEN, _idle_listen):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        first = entry.runtime_data
+        with first._state_lock:
+            assert first._add_discovered_module(DISCOVERED, 2)
+        device = _device(hass, entry, DISCOVERED)
+        assert await async_remove_config_entry_device(hass, entry, device)
+        await hass.async_block_till_done()
+        assert entry.state is ConfigEntryState.LOADED
+        assert entry.runtime_data is not first
+        assert entry.data[CONF_EXCLUDED_BARCODES] == [DISCOVERED]
+        assert entry.data["modules"] == [MODULE]
+        assert DISCOVERED not in {module["barcode"] for module in entry.runtime_data.modules}
+        assert not entry.runtime_data._add_discovered_module(DISCOVERED, 2)
+        # The installation and a string that still has modules stay protected.
+        assert not await async_remove_config_entry_device(
+            hass, entry, _device(hass, entry, f"{entry.entry_id}_installation")
+        )
+        assert not await async_remove_config_entry_device(
+            hass, entry, _device(hass, entry, f"{entry.entry_id}_string_East")
+        )
+        assert await hass.config_entries.async_unload(entry.entry_id)
 
 
 # --- Endpoint validation (#5) and claims (#2) ---
@@ -247,6 +343,7 @@ async def test_disabled_entry_parked_coordinator_cleans_up_when_worker_exits(has
     with patch(LISTEN, _stuck_worker(release)), patch(STOP_TIMEOUT, 0.1):
         assert await hass.config_entries.async_setup(entry.entry_id)
         coordinator = entry.runtime_data
+        assert barcode_claims(hass).claim(BARCODE, "another") is False
         await hass.config_entries.async_set_disabled_by(entry.entry_id, ConfigEntryDisabler.USER)
         assert entry.state is ConfigEntryState.NOT_LOADED
         assert parked_coordinators(hass)[entry.entry_id] is coordinator
@@ -255,6 +352,8 @@ async def test_disabled_entry_parked_coordinator_cleans_up_when_worker_exits(has
         await _wait_for(lambda: entry.entry_id not in parked_coordinators(hass))
         await hass.async_block_till_done()
     assert coordinator._worker_future is None
+    # Its optimizers are free for other entries again.
+    assert barcode_claims(hass).claim(BARCODE, "another") is True
 
 
 async def test_remove_waits_for_parked_listener_and_blocks_its_saves(hass):
@@ -331,6 +430,7 @@ async def test_setup_failure_after_start_stops_the_listener(hass):
     assert entry.state is ConfigEntryState.SETUP_ERROR
     assert coordinator._worker_future is None and coordinator._listener_task is None
     assert coordinator._midnight_reset_unsub is None and coordinator._freshness_unsub is None
+    assert barcode_claims(hass).claim(BARCODE, "another") is True
 
 
 async def test_setup_failure_with_stuck_worker_parks_it(hass):

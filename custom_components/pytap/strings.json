@@ -35,10 +35,18 @@
       },
       "modules_menu": {
         "title": "Configure Modules",
-        "description": "{modules_list}\n\n{error}",
+        "description": "{modules_list}\n\nDiscovery mode: **{discovery_mode}**. With automatic discovery enabled, you can finish without adding modules. PyTap will listen for optimizer barcodes and create sensors as they arrive; this can take time.\n\n{error}",
         "menu_options": {
           "add_module": "Add a module",
+          "discovery": "Module discovery settings",
           "finish": "Finish setup"
+        }
+      },
+      "discovery": {
+        "title": "Module Discovery",
+        "description": "Automatically discover optimizers from passive bus traffic. No bus commands are sent. Names are based on barcodes, string grouping starts as Discovered, and rated panel power is unknown until edited. Turn this off to track only modules you add manually.",
+        "data": {
+          "auto_discovery": "Automatically discover modules"
         }
       },
       "add_module": {
@@ -68,7 +76,7 @@
       "missing_name": "Module name is required.",
       "missing_barcode": "Barcode is required.",
       "duplicate_barcode": "This barcode has already been added.",
-      "no_modules": "At least one module must be added.",
+      "no_modules": "Manual mode requires at least one module. Add a module, or go back and enable automatic discovery.",
       "invalid_host": "Enter a hostname or IP address.",
       "invalid_port": "Enter a port between 1 and 65535.",
       "invalid_serial_port": "Choose a serial device under /dev (for example /dev/serial/by-id/…) or a valid Home Assistant serial-proxy URL.",
@@ -81,6 +89,13 @@
   },
   "entity": {
     "sensor": {
+      "module_discovery": {
+        "name": "Module discovery",
+        "state": {
+          "waiting_for_modules": "Waiting for modules",
+          "modules_discovered": "Modules discovered"
+        }
+      },
       "performance": {
         "name": "Performance"
       },
@@ -147,14 +162,41 @@
     "step": {
       "init": {
         "title": "PyTap Options",
-        "description": "{modules_list}",
+        "description": "{modules_list}\n\nDiscovery mode: **{discovery_mode}**. Module and discovery changes are applied with Save and close.",
         "menu_options": {
           "change_connection": "Change connection settings",
           "add_module": "Add a module",
+          "edit_module": "Edit a module",
+          "change_discovery": "Change module discovery",
           "remove_module": "Remove a module",
           "done": "Save and close",
           "change_reporting": "Change reporting settings",
           "change_stale": "Change stale reading behaviour"
+        }
+      },
+      "change_discovery": {
+        "title": "Module Discovery",
+        "description": "Enable passive discovery of new optimizers. Disabling this stops adding new modules but keeps modules already discovered. Removed modules are ignored until explicitly added again. Save and close applies this setting.",
+        "data": {
+          "auto_discovery": "Automatically discover modules"
+        }
+      },
+      "edit_module": {
+        "title": "Edit Module",
+        "data": {
+          "barcode": "Select module"
+        }
+      },
+      "module_details": {
+        "title": "Module Details",
+        "description": "Edit the optimizer name, string group, and rated panel power. Barcode-based entity IDs and energy history are preserved. Save and close applies the changes.",
+        "data": {
+          "name": "Name",
+          "string": "String group",
+          "peak_power": "Peak power (Wp)"
+        },
+        "data_description": {
+          "peak_power": "Enter the panel's rated watts, or 0 if unknown. Performance percentages are unavailable until the rating is known."
         }
       },
       "change_connection": {
@@ -246,6 +288,7 @@
     },
     "error": {
       "invalid_host": "Enter a hostname or IP address.",
+      "no_modules": "Manual mode requires at least one module. Add a module, or enable automatic discovery before saving.",
       "missing_name": "Module name is required.",
       "missing_string": "String group is required.",
       "invalid_port": "Enter a port between 1 and 65535.",

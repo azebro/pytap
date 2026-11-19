@@ -23,6 +23,7 @@ from custom_components.pytap import async_migrate_entry
 from custom_components.pytap.config_flow import PyTapConfigFlow, PyTapOptionsFlow
 from custom_components.pytap.connection import open_source
 from custom_components.pytap.coordinator import PyTapDataUpdateCoordinator
+from custom_components.pytap.pytap.core.events import InfrastructureEvent
 
 ENDPOINT = "esphome-hass://esphome/entry-one?port_name=Tigo%20Bus"
 MODULE = {"string": "A", "name": "Panel", "barcode": "A-1234567B", "peak_power": 455}
@@ -75,11 +76,36 @@ class CoreSmoke(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["data"]["serial_port"], ENDPOINT)
         self.assertEqual(result["data"]["modules"], [MODULE])
 
+    async def test_empty_auto_setup_and_discovery_on_supported_core(self):
+        flow = PyTapConfigFlow()
+        flow.hass = self.hass
+        flow.context = {"source": "user"}
+        with patch("custom_components.pytap.config_flow.validate_connection", new=AsyncMock()):
+            await flow.async_step_tcp({"host": "gateway"})
+        result = await flow.async_step_finish()
+        self.assertTrue(result["data"]["auto_discovery"])
+        self.assertEqual(result["data"]["modules"], [])
+        entry = self.entry(version=7)
+        self.hass.config_entries.async_update_entry(entry, data=result["data"])
+        coordinator = PyTapDataUpdateCoordinator(self.hass, entry)
+        coordinator._schedule_save = MagicMock()
+        coordinator._process_event(
+            InfrastructureEvent(
+                gateways={},
+                nodes={1: {"barcode": "A-1234567B"}},
+                timestamp=entry.created_at,
+            )
+        )
+        self.assertEqual(coordinator.module_count, 1)
+        self.assertEqual(coordinator.modules[0]["peak_power"], 0)
+        self.assertEqual(coordinator.modules[0]["name"], "Optimizer A-1234567B")
+        await coordinator.async_stop_listener()
+
     async def test_native_migration_and_options_preserve_entry(self):
         entry = self.entry(version=5)
         entry_id = entry.entry_id
         self.assertTrue(await async_migrate_entry(self.hass, entry))
-        self.assertEqual(entry.version, 6)
+        self.assertEqual(entry.version, 7)
         self.assertEqual(entry.data["connection_type"], "tcp")
         flow = PyTapOptionsFlow(entry)
         flow.hass = self.hass

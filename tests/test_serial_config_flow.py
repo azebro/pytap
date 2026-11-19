@@ -109,7 +109,7 @@ async def test_complete_offline_serial_setup(hass, endpoint):
     assert result["data"][CONF_CONNECTION_TYPE] == CONNECTION_SERIAL
     assert result["data"][CONF_BAUD_RATE] == 38400
     assert "host" not in result["data"]
-    assert result["result"].version == 6
+    assert result["result"].version == 7
     assert result["result"].unique_id
     assert endpoint not in result["title"]
 

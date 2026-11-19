@@ -41,6 +41,7 @@ async def async_get_config_entry_diagnostics(
 
     return {
         "config_entry": async_redact_data(entry.as_dict(), TO_REDACT),
+        "modules": coordinator.modules,
         "counters": coordinator.data.get("counters", {}),
         "gateways": coordinator.data.get("gateways", {}),
         "discovered_barcodes": coordinator.data.get("discovered_barcodes", []),

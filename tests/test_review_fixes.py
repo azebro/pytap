@@ -9,30 +9,35 @@ import time
 from unittest.mock import MagicMock, patch
 
 from homeassistant.config_entries import ConfigEntryState
+from homeassistant.helpers import device_registry as dr
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.pytap import async_remove_config_entry_device
 from custom_components.pytap.connection import (
     InvalidConnectionSettings,
     normalize_connection,
     resolved_endpoint_key,
 )
-from custom_components.pytap.const import DOMAIN
+from custom_components.pytap.const import CONF_AUTO_DISCOVERY, CONF_EXCLUDED_BARCODES, DOMAIN
 from custom_components.pytap.pytap.core.source import TcpSource
 
 BARCODE = "A-1234567B"
+OTHER = "C-2345678D"
 MODULE = {"barcode": BARCODE, "name": "East", "string": "East", "peak_power": 400}
 
 
-def _entry(hass, *, modules=None, **data):
+def _entry(hass, *, modules=None, auto=False, **data):
     entry = MockConfigEntry(
         domain=DOMAIN,
-        version=6,
+        version=7,
         data={
             "connection_type": "tcp",
             "host": "gateway",
             "port": 502,
             "modules": [MODULE] if modules is None else modules,
+            CONF_AUTO_DISCOVERY: auto,
+            CONF_EXCLUDED_BARCODES: [],
             **data,
         },
     )
@@ -123,6 +128,61 @@ async def test_invalid_saved_port_is_a_clear_setup_error(hass):
     assert entry.state is ConfigEntryState.SETUP_ERROR
     assert entry.error_reason_translation_key == "invalid_connection_settings"
     assert entry.error_reason_translation_placeholders == {"field": "port"}
+
+
+async def test_second_entry_does_not_adopt_another_entrys_optimizer(hass):
+    """Review #9: two entries on one bus must not create clashing entities."""
+    manual = _entry(hass)
+    automatic = _entry(hass, modules=[], auto=True, host="other")
+    with patch("custom_components.pytap.coordinator.PyTapDataUpdateCoordinator._listen", return_value=None):
+        assert await hass.config_entries.async_setup(manual.entry_id)  # Sets up both entries.
+        await hass.async_block_till_done()
+        assert automatic.state is ConfigEntryState.LOADED
+        coordinator = automatic.runtime_data
+        assert coordinator._add_discovered_module(BARCODE, 1) is False
+        assert coordinator._add_discovered_module(OTHER, 2) is True
+        assert await hass.config_entries.async_unload(manual.entry_id)
+        assert await hass.config_entries.async_unload(automatic.entry_id)
+
+
+async def test_device_removal_rules(hass):
+    """Review #10: optimizer and empty string devices can be deleted; others can't."""
+    entry = _entry(hass, modules=[MODULE])
+    registry = dr.async_get(hass)
+
+    def device(identifier):
+        return registry.async_get_or_create(
+            config_entry_id=entry.entry_id, identifiers={(DOMAIN, identifier)}
+        )
+
+    assert not await async_remove_config_entry_device(hass, entry, device(f"{entry.entry_id}_installation"))
+    assert not await async_remove_config_entry_device(hass, entry, device(f"{entry.entry_id}_string_East"))
+    assert await async_remove_config_entry_device(hass, entry, device(f"{entry.entry_id}_string_Old"))
+    assert await async_remove_config_entry_device(hass, entry, device(BARCODE))
+    assert entry.data["modules"] == []
+    assert entry.data[CONF_EXCLUDED_BARCODES] == [BARCODE]
+
+
+async def test_orphaned_devices_are_removed_at_setup(hass):
+    entry = _entry(hass, **{CONF_EXCLUDED_BARCODES: [OTHER]})
+    registry = dr.async_get(hass)
+    stale = registry.async_get_or_create(config_entry_id=entry.entry_id, identifiers={(DOMAIN, OTHER)})
+    # Unknown, not excluded: possibly a discovered optimizer whose state was lost.
+    unknown = registry.async_get_or_create(
+        config_entry_id=entry.entry_id, identifiers={(DOMAIN, "E-3456789F")}
+    )
+    empty_string = registry.async_get_or_create(
+        config_entry_id=entry.entry_id, identifiers={(DOMAIN, f"{entry.entry_id}_string_Old")}
+    )
+    with patch("custom_components.pytap.coordinator.PyTapDataUpdateCoordinator._listen", return_value=None):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        assert registry.async_get(stale.id) is None
+        assert registry.async_get(unknown.id) is not None
+        assert registry.async_get(empty_string.id) is None
+        remaining = dr.async_entries_for_config_entry(registry, entry.entry_id)
+        assert any((DOMAIN, BARCODE) in device.identifiers for device in remaining)
+        assert await hass.config_entries.async_unload(entry.entry_id)
 
 
 @pytest.mark.parametrize("path", ["/config/secrets.yaml", "/tmp/port", "relative/tty"])

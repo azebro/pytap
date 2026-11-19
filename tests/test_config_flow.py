@@ -327,27 +327,6 @@ async def test_add_module_duplicate_barcode(hass: HomeAssistant) -> None:
     assert result["errors"] == {CONF_MODULE_BARCODE: "duplicate_barcode"}
 
 
-async def test_finish_without_modules_shows_error(hass: HomeAssistant) -> None:
-    """Finishing with no modules shows a visible error instead of the same menu."""
-    result = await _init_tcp_flow(hass)
-    with patch(
-        "custom_components.pytap.config_flow.validate_connection",
-        return_value={"title": f"PyTap ({MOCK_HOST})"},
-    ):
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {"host": MOCK_HOST, "port": MOCK_PORT},
-        )
-
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], {"next_step_id": "finish"}
-    )
-
-    assert result["type"] is FlowResultType.FORM
-    assert result["step_id"] == "add_module"
-    assert result["errors"] == {"base": "no_modules"}
-
-
 # ──────────────────────────────────────────────────────────
 # Options flow: change connection settings
 # ──────────────────────────────────────────────────────────

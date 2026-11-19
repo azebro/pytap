@@ -11,6 +11,7 @@ import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.pytap.const import (
+    CONF_AUTO_DISCOVERY,
     CONF_STALE_ACTION,
     CONF_STALE_TIMEOUT,
     DEFAULT_STALE_TIMEOUT,
@@ -45,13 +46,14 @@ async def _setup(
 ) -> tuple[MockConfigEntry, PyTapDataUpdateCoordinator]:
     entry = MockConfigEntry(
         domain=DOMAIN,
-        version=6,
+        version=7,
         unique_id="status-entry",
         data={
             "host": "gateway",
             "port": 502,
             "connection_type": "tcp",
             "modules": modules or [MODULE],
+            CONF_AUTO_DISCOVERY: False,
             **data,
         },
     )
@@ -248,7 +250,7 @@ def test_aggregate_energy_ignores_membership_changes() -> None:
     sensor._handle_coordinator_update()
     assert sensor.native_value == 1000.0
 
-    sensor._barcodes = [BARCODE, OTHER]  # OTHER moved into this string.
+    sensor.set_barcodes([BARCODE, OTHER])  # OTHER moved into this string.
     sensor._handle_coordinator_update()
     assert sensor.native_value == 1000.0
 
@@ -256,7 +258,7 @@ def test_aggregate_energy_ignores_membership_changes() -> None:
     sensor._handle_coordinator_update()
     assert sensor.native_value == 1030.0
 
-    sensor._barcodes = [OTHER]  # BARCODE moved out: no decrease.
+    sensor.set_barcodes([OTHER])  # BARCODE moved out: no decrease.
     sensor._handle_coordinator_update()
     assert sensor.native_value == 1030.0
 
