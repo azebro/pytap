@@ -155,8 +155,14 @@ Parse statistics:
     "runts": 0,
     "giants": 0,
     "noise_bytes": 15,
+    "invalid_slots": 0,
+    "invalid_slot_frames_kept": 0,
+    "invalid_slot_frames_dropped": 0,
+    "no_slot_clock_drops": 0,
 }
 ```
+
+`invalid_slots` counts slot counters outside the valid range (0–11999). A receive-response frame whose header slot counter is invalid never updates the slot clock; its packets are kept (`invalid_slot_frames_kept`) only if the packet walk consumes the payload exactly and every packet is well-formed (known packet type, node address 1–0x7FFF, valid power-report length), otherwise the whole frame is dropped (`invalid_slot_frames_dropped`). A power report with an invalid slot counter is dropped. `no_slot_clock_drops` counts power reports discarded because their gateway has no slot clock yet (including reports kept from such frames); the warning for this is logged once per gateway per parser, then at debug level.
 
 ---
 

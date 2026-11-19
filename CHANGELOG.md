@@ -14,6 +14,7 @@
 
 ### Fixed
 
+- An invalid slot counter in a receive-response header no longer crashes the parser (an `IndexError` escaped `Parser.feed` and forced a reconnect). Such a frame never updates the slot clock and keeps its reports only when the packet walk consumes the payload exactly and every packet is well-formed; otherwise the whole frame is dropped. Like any power report, kept reports are still dropped while the gateway has no slot clock yet. Power reports with an invalid slot counter are dropped. New parser counters `invalid_slots`, `invalid_slot_frames_kept`, `invalid_slot_frames_dropped` and `no_slot_clock_drops` record these cases. The "no slot clock" warning is logged once per gateway (per connection), then at debug level, instead of for every discarded report.
 - Live reporting no longer buffers readings internally, preventing unbounded memory growth over time in the default mode.
 - Live reporting now publishes an immutable copy of node data to Home Assistant, avoiding rare races where consumers (sensors, diagnostics) could observe the data changing mid-read.
 - Averaged interval mode now flushes buffered readings on schedule during quiet periods (e.g. at dusk), instead of waiting for the next reading or a reconnect.
