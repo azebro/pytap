@@ -371,3 +371,9 @@ class TestConfigEntryMigration:
         assert result is True
         assert entry.version == CONFIG_ENTRY_VERSION
         assert entry.data[CONF_WRITE_INTERVAL] == 60
+
+
+async def test_future_version_is_not_downgraded(hass: HomeAssistant) -> None:
+    entry = _make_entry(hass, version=CONFIG_ENTRY_VERSION + 1)
+    assert not await async_migrate_entry(hass, entry)
+    assert entry.version == CONFIG_ENTRY_VERSION + 1

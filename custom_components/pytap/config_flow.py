@@ -11,6 +11,7 @@ Options: init (menu) → add_module / remove_module / change_connection /
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from typing import Any
@@ -18,6 +19,7 @@ import uuid
 
 from homeassistant.config_entries import (
     ConfigEntry,
+    ConfigEntryState,
     ConfigFlow,
     ConfigFlowResult,
     OptionsFlow,
@@ -27,6 +29,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 import voluptuous as vol
 
+from .connection import InvalidConnectionSettings, normalize_connection, open_source
 from .const import (
     CONF_LIVE_REPORTING,
     CONF_MODULE_BARCODE,
@@ -43,6 +46,7 @@ from .const import (
     MAX_WRITE_INTERVAL,
     MIN_WRITE_INTERVAL,
 )
+from .coordinator import parked_coordinators
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -80,21 +84,63 @@ def validate_barcode(barcode: str) -> None:
 async def validate_connection(
     hass: HomeAssistant, data: dict[str, Any]
 ) -> dict[str, Any]:
-    """Validate connection to the Tigo gateway."""
-    host = data[CONF_HOST]
-    port = data.get(CONF_PORT, DEFAULT_PORT)
+    """Probe without consuming bytes; executor cleanup also runs on cancellation."""
+    settings = normalize_connection(data)
 
     def _test_connection() -> None:
-        from .pytap.core.source import TcpSource
+        source = open_source(settings)
+        source.close()
 
-        source = TcpSource(host, port)
-        try:
-            source.connect()
-        finally:
-            source.close()
+    # Shield the executor job: cancelling a flow must not cancel ownership of
+    # its open attempt. The bounded backend operation still closes in finally.
+    probe = hass.async_add_executor_job(_test_connection)
+    # If the flow is cancelled first, still retrieve the result so asyncio
+    # doesn't log "Future exception was never retrieved".
+    probe.add_done_callback(lambda done: done.cancelled() or done.exception())
+    await asyncio.shield(probe)
+    return {"title": f"PyTap ({settings[CONF_HOST]})"}
 
-    await hass.async_add_executor_job(_test_connection)
-    return {"title": f"PyTap ({host})"}
+
+def connection_claimed(
+    hass: HomeAssistant, settings: dict[str, Any], entry_id: str | None = None
+) -> bool:
+    """Avoid probing or saving a gateway connection held by a stopping listener.
+
+    A listener whose stop timed out may still hold its gateway connection
+    after its entry was unloaded, changed or even deleted.
+    """
+    return any(
+        str(coordinator.connection.get(CONF_HOST, "")).lower() == settings[CONF_HOST].lower()
+        and coordinator.connection.get(CONF_PORT, DEFAULT_PORT) == settings[CONF_PORT]
+        for parked_id, coordinator in parked_coordinators(hass).items()
+        if parked_id != entry_id
+    )
+
+
+async def connection_errors(
+    hass: HomeAssistant,
+    settings: dict[str, Any],
+    entry: ConfigEntry | None = None,
+    *,
+    accept_unreachable: bool = False,
+) -> dict[str, str]:
+    """Reject invalid settings; an unreachable gateway needs a second submit to save."""
+    if connection_claimed(hass, settings, entry.entry_id if entry else None):
+        return {"base": "connection_in_use"}
+    try:
+        await validate_connection(hass, settings)
+    except InvalidConnectionSettings as err:
+        return {err.field: err.error}
+    except Exception as err:
+        _LOGGER.warning(
+            "Could not connect to %s:%s (%s)",
+            settings[CONF_HOST],
+            settings[CONF_PORT],
+            type(err).__name__,
+        )
+        if not accept_unreachable:
+            return {"base": "cannot_connect"}
+    return {}
 
 
 def _modules_description(modules: list[dict[str, Any]]) -> str:
@@ -121,7 +167,9 @@ class PyTapConfigFlow(ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         """Initialize the config flow."""
         self._user_data: dict[str, Any] = {}
-        self._modules: list[dict[str, str]] = []
+        self._modules: list[dict[str, Any]] = []
+        # Settings whose probe failed; submitting them again saves anyway.
+        self._unreachable: dict[str, Any] | None = None
 
     @staticmethod
     @callback
@@ -136,25 +184,24 @@ class PyTapConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            self._user_data = user_input
-            # Stable unique ID — not tied to mutable connection settings
-            await self.async_set_unique_id(uuid.uuid4().hex)
-
-            # Optional connection test — warn but don't block
             try:
-                await validate_connection(self.hass, user_input)
-            except Exception:
-                _LOGGER.warning(
-                    "Could not connect to %s:%s — proceeding anyway",
-                    user_input[CONF_HOST],
-                    user_input.get(CONF_PORT, DEFAULT_PORT),
+                settings = normalize_connection(user_input)
+            except InvalidConnectionSettings as err:
+                errors[err.field] = err.error
+            else:
+                errors = await connection_errors(
+                    self.hass, settings, accept_unreachable=settings == self._unreachable
                 )
-
-            return await self.async_step_modules_menu()
+                self._unreachable = settings if errors == {"base": "cannot_connect"} else None
+                if not errors:
+                    self._user_data = settings
+                    # Stable unique ID — not tied to mutable connection settings
+                    await self.async_set_unique_id(uuid.uuid4().hex)
+                    return await self.async_step_modules_menu()
 
         return self.async_show_form(
             step_id="user",
-            data_schema=STEP_USER_DATA_SCHEMA,
+            data_schema=self.add_suggested_values_to_schema(STEP_USER_DATA_SCHEMA, user_input),
             errors=errors,
         )
 
@@ -227,7 +274,12 @@ class PyTapConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Finish the config flow — create the entry."""
         if not self._modules:
-            return await self.async_step_modules_menu()
+            return self.async_show_form(
+                step_id="add_module",
+                data_schema=ADD_MODULE_SCHEMA,
+                errors={"base": "no_modules"},
+                description_placeholders={"modules_list": _modules_description(self._modules)},
+            )
         data = {**self._user_data, CONF_MODULES: self._modules}
         title = f"PyTap ({self._user_data[CONF_HOST]})"
         return self.async_create_entry(title=title, data=data)
@@ -239,9 +291,10 @@ class PyTapOptionsFlow(OptionsFlow):
     def __init__(self, config_entry: ConfigEntry) -> None:
         """Initialize options flow."""
         self._config_entry = config_entry
-        self._modules: list[dict[str, str]] = list(
+        self._modules: list[dict[str, Any]] = list(
             config_entry.data.get(CONF_MODULES, [])
         )
+        self._unreachable: dict[str, Any] | None = None
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
@@ -276,38 +329,35 @@ class PyTapOptionsFlow(OptionsFlow):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            new_host = user_input[CONF_HOST].strip()
-            new_port = user_input.get(CONF_PORT, DEFAULT_PORT)
-
-            if not new_host:
-                errors[CONF_HOST] = "cannot_connect"
+            try:
+                settings = normalize_connection(user_input)
+            except InvalidConnectionSettings as err:
+                errors[err.field] = err.error
             else:
-                # Warn-only connection test (same as initial setup)
-                try:
-                    await validate_connection(
-                        self.hass, {CONF_HOST: new_host, CONF_PORT: new_port}
-                    )
-                except Exception:
-                    _LOGGER.warning(
-                        "Could not connect to %s:%s — saving anyway",
-                        new_host,
-                        new_port,
-                    )
-
-                # Update entry data with new connection details
-                new_data = {**self._config_entry.data}
-                new_data[CONF_HOST] = new_host
-                new_data[CONF_PORT] = new_port
-                self.hass.config_entries.async_update_entry(
-                    self._config_entry,
-                    data=new_data,
-                    title=f"PyTap ({new_host})",
+                errors = await connection_errors(
+                    self.hass, settings, self._config_entry, accept_unreachable=settings == self._unreachable
                 )
-                return await self.async_step_init()
+                self._unreachable = settings if errors == {"base": "cannot_connect"} else None
+                if not errors:
+                    # Update entry data with new connection details
+                    self.hass.config_entries.async_update_entry(
+                        self._config_entry,
+                        data={**self._config_entry.data, **settings},
+                        title=f"PyTap ({settings[CONF_HOST]})",
+                    )
+                    if self._config_entry.state in (
+                        ConfigEntryState.SETUP_ERROR,
+                        ConfigEntryState.SETUP_RETRY,
+                    ):
+                        # Setup failed (e.g. on invalid saved settings) before its
+                        # update listener existed: retry with the corrected ones.
+                        self.hass.config_entries.async_schedule_reload(self._config_entry.entry_id)
+                    return await self.async_step_init()
 
-        # Pre-fill with current values
-        current_host = self._config_entry.data.get(CONF_HOST, "")
-        current_port = self._config_entry.data.get(CONF_PORT, DEFAULT_PORT)
+        # Pre-fill with current values (or the rejected ones)
+        current = user_input if user_input is not None else self._config_entry.data
+        current_host = current.get(CONF_HOST, "")
+        current_port = current.get(CONF_PORT, DEFAULT_PORT)
         schema = vol.Schema(
             {
                 vol.Required(CONF_HOST, default=current_host): str,
@@ -476,14 +526,6 @@ class PyTapOptionsFlow(OptionsFlow):
             step_id="remove_module",
             data_schema=schema,
         )
-
-
-class CannotConnect(HomeAssistantError):
-    """Error to indicate we cannot connect."""
-
-
-class InvalidAuth(HomeAssistantError):
-    """Error to indicate there is invalid auth."""
 
 
 class InvalidModuleFormat(HomeAssistantError):
