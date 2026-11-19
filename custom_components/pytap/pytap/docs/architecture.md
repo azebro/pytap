@@ -214,6 +214,10 @@ data_to_save = state.to_dict()
 
 Node addresses in `NODE_TABLE_RESPONSE` entries are 16-bit values where bit 15 is a protocol flag (indicating router/repeater status), not part of the node ID. The parser masks all node table addresses to 15 bits (`& 0x7FFF`) before storing them, so that table keys match the node IDs used in power reports. Without this masking, flagged nodes would appear with IDs like 32793 (`0x8019`) instead of the correct 25 (`0x0019`).
 
+### 7. Invalid Slot Counters
+
+Slot counters outside 0–11999 are counted in `counters["invalid_slots"]`. An invalid counter in a receive-response header never updates the slot clock (in earlier versions it raised `IndexError` out of `feed()`). It also suggests the variable-length header was mis-decoded, so the frame's packets are kept only if a strict walk consumes the payload exactly and every packet is well-formed (`invalid_slot_frames_kept`); otherwise the whole frame is dropped (`invalid_slot_frames_dropped`). Kept power reports still need an existing slot clock for their gateway, like any report; without one they are dropped (`no_slot_clock_drops`, warned once per gateway per parser). A power report whose own counter is invalid has no valid timestamp and is dropped.
+
 ## Public API Surface
 
 ### `pytap.api`
