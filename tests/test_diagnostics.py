@@ -76,8 +76,7 @@ async def test_config_entry_diagnostics_redacts_host(hass: HomeAssistant) -> Non
         )
     }
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     diagnostics = await async_get_config_entry_diagnostics(hass, entry)
 
@@ -97,8 +96,7 @@ async def test_config_entry_diagnostics_includes_unredacted_barcodes(
     coordinator = PyTapDataUpdateCoordinator(hass, entry)
     coordinator._barcode_to_node = {"A-1234567B": 10}
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     diagnostics = await async_get_config_entry_diagnostics(hass, entry)
 
@@ -110,8 +108,7 @@ async def test_config_entry_diagnostics_fresh_install(hass: HomeAssistant) -> No
     entry = _make_entry()
     coordinator = PyTapDataUpdateCoordinator(hass, entry)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     diagnostics = await async_get_config_entry_diagnostics(hass, entry)
 
@@ -144,8 +141,7 @@ async def test_config_entry_diagnostics_all_keys_present(
         )
     }
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     diagnostics = await async_get_config_entry_diagnostics(hass, entry)
 
@@ -170,3 +166,14 @@ async def test_config_entry_diagnostics_all_keys_present(
 
     # Discovered barcodes pass through
     assert diagnostics["discovered_barcodes"] == ["Z-0000000A"]
+
+
+async def test_diagnostics_redact_title_containing_host(hass: HomeAssistant) -> None:
+    entry = _make_entry()
+    entry.as_dict.return_value["title"] = "PyTap (192.168.1.100)"
+    coordinator = PyTapDataUpdateCoordinator(hass, entry)
+    entry.runtime_data = coordinator
+    result = await async_get_config_entry_diagnostics(hass, entry)
+    assert result["config_entry"]["title"] == "**REDACTED**"
+    assert result["connection_state"][CONF_HOST] == "**REDACTED**"
+    assert "192.168.1.100" not in str(result)

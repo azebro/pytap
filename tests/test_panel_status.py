@@ -1,0 +1,264 @@
+"""Stale-reading actions."""
+
+import time
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from homeassistant.const import STATE_UNAVAILABLE
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
+from homeassistant.util import dt as dt_util
+import pytest
+from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+from custom_components.pytap.const import (
+    CONF_STALE_ACTION,
+    CONF_STALE_TIMEOUT,
+    DEFAULT_STALE_TIMEOUT,
+    DOMAIN,
+)
+from custom_components.pytap.coordinator import PyTapDataUpdateCoordinator
+from custom_components.pytap.pytap.core.events import PowerReportEvent
+
+BARCODE = "A-1234567B"
+OTHER = "C-2345678D"
+MODULE = {"barcode": BARCODE, "name": "East Panel", "string": "East", "peak_power": 500}
+MODULE_B = {"barcode": OTHER, "name": "West Panel", "string": "West", "peak_power": 500}
+
+
+def _event(barcode=BARCODE, *, iin=1.9):
+    return PowerReportEvent(
+        gateway_id=1,
+        node_id=10 if barcode == BARCODE else 11,
+        barcode=barcode,
+        voltage_in=31.0,
+        voltage_out=30.7,
+        current_in=iin,
+        temperature=18.0,
+        dc_dc_duty_cycle=1.0,
+        rssi=99,
+        timestamp=dt_util.now(),
+    )
+
+
+async def _setup(
+    hass: HomeAssistant, modules=None, **data
+) -> tuple[MockConfigEntry, PyTapDataUpdateCoordinator]:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        version=5,
+        unique_id="status-entry",
+        data={
+            "host": "gateway",
+            "port": 502,
+            "modules": modules or [MODULE],
+            **data,
+        },
+    )
+    entry.add_to_hass(hass)
+    with patch("custom_components.pytap.coordinator.PyTapDataUpdateCoordinator._listen", return_value=None):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    return entry, entry.runtime_data
+
+
+async def _feed(
+    hass: HomeAssistant, coordinator: PyTapDataUpdateCoordinator, event: PowerReportEvent
+) -> None:
+    """Process like the worker does, then publish through the real live path."""
+    await hass.async_add_executor_job(coordinator._process_event, event)
+    coordinator._ha_update_pending = True
+    coordinator._push_live_update(MagicMock(counters={}))
+    await hass.async_block_till_done()
+
+
+def _age(coordinator: PyTapDataUpdateCoordinator, barcode: str, seconds: float) -> None:
+    """Pretend the last report arrived `seconds` ago, then run the timer check."""
+    reported = time.monotonic() - seconds
+    with coordinator._state_lock:
+        node = coordinator._state["nodes"][barcode]
+        coordinator._state["nodes"][barcode] = {**node, "report_monotonic": reported}
+    nodes = dict(coordinator.data["nodes"])
+    nodes[barcode] = {**nodes[barcode], "report_monotonic": reported}
+    coordinator.data = {**coordinator.data, "nodes": nodes}
+    coordinator._async_check_freshness()
+
+
+def _state(hass: HomeAssistant, domain: str, unique_id: str):
+    entity_id = er.async_get(hass).async_get_entity_id(domain, DOMAIN, unique_id)
+    assert entity_id is not None, unique_id
+    return hass.states.get(entity_id)
+
+
+def _uid(key: str, barcode: str = BARCODE) -> str:
+    return f"{DOMAIN}_{barcode}_{key}"
+
+
+async def test_default_holds_values_with_120s_timeout(hass: HomeAssistant) -> None:
+    entry, coordinator = await _setup(hass)
+    assert coordinator.stale_action == "hold" and coordinator.stale_timeout == 120
+    await _feed(hass, coordinator, _event())
+    power = _state(hass, "sensor", _uid("power")).state
+    _age(coordinator, BARCODE, DEFAULT_STALE_TIMEOUT + 1)
+    await hass.async_block_till_done()
+    assert coordinator.is_reporting(BARCODE) is False
+    assert _state(hass, "sensor", _uid("power")).state == power
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_unavailable_after_120s_and_recovery(hass: HomeAssistant) -> None:
+    entry, coordinator = await _setup(hass, **{CONF_STALE_ACTION: "unavailable"})
+    assert coordinator.stale_action == "unavailable" and coordinator.stale_timeout == 120
+    installation_power = f"{DOMAIN}_{entry.entry_id}_installation_power"
+
+    # No report yet this session: live values unavailable.
+    assert _state(hass, "sensor", _uid("power")).state == STATE_UNAVAILABLE
+
+    await _feed(hass, coordinator, _event())
+    assert float(_state(hass, "sensor", _uid("power")).state) > 0
+
+    # Just inside the timeout: still live.
+    _age(coordinator, BARCODE, DEFAULT_STALE_TIMEOUT - 5)
+    await hass.async_block_till_done()
+    assert _state(hass, "sensor", _uid("power")).state != STATE_UNAVAILABLE
+
+    # Reports stop (darkness): live values go unavailable without new data;
+    # energy remains.
+    _age(coordinator, BARCODE, DEFAULT_STALE_TIMEOUT + 1)
+    await hass.async_block_till_done()
+    assert coordinator.is_reporting(BARCODE) is False
+    for domain, unique_id in (
+        ("sensor", _uid("power")),
+        ("sensor", _uid("temperature")),
+        ("sensor", installation_power),
+    ):
+        assert _state(hass, domain, unique_id).state == STATE_UNAVAILABLE, unique_id
+    assert _state(hass, "sensor", _uid("total_energy")).state != STATE_UNAVAILABLE
+
+    # The next reading restores live values.
+    await _feed(hass, coordinator, _event())
+    assert _state(hass, "sensor", _uid("power")).state != STATE_UNAVAILABLE
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_zero_action(hass: HomeAssistant) -> None:
+    entry, coordinator = await _setup(hass, **{CONF_STALE_ACTION: "zero", CONF_STALE_TIMEOUT: 60})
+    installation_power = f"{DOMAIN}_{entry.entry_id}_installation_power"
+    await _feed(hass, coordinator, _event())
+    _age(coordinator, BARCODE, 61)
+    await hass.async_block_till_done()
+
+    for key in ("power", "voltage_in", "voltage_out", "current_in", "current_out", "performance"):
+        assert float(_state(hass, "sensor", _uid(key)).state) == 0.0, key
+    for key in ("temperature", "dc_dc_duty_cycle", "rssi"):
+        assert _state(hass, "sensor", _uid(key)).state == STATE_UNAVAILABLE, key
+    assert float(_state(hass, "sensor", installation_power).state) == 0.0
+    assert _state(hass, "sensor", _uid("total_energy")).state != STATE_UNAVAILABLE
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_hold_action_keeps_values_and_restores_after_restart(hass: HomeAssistant) -> None:
+    stored = {
+        "barcode_to_node": {BARCODE: 10},
+        "node_snapshots": {BARCODE: {"power": 123.0, "temperature": 20.0}},
+    }
+    with patch(
+        "custom_components.pytap.coordinator._MigratingStore.async_load", new=AsyncMock(return_value=stored)
+    ):
+        entry, coordinator = await _setup(hass, **{CONF_STALE_ACTION: "hold"})
+    # Upstream behaviour: restored values are shown before any report.
+    assert float(_state(hass, "sensor", _uid("power")).state) == 123.0
+    await _feed(hass, coordinator, _event())
+    power = _state(hass, "sensor", _uid("power")).state
+    _age(coordinator, BARCODE, 600)
+    await hass.async_block_till_done()
+    assert _state(hass, "sensor", _uid("power")).state == power
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_averaged_mode_never_publishes_raw_values(hass: HomeAssistant) -> None:
+    """Review #1: freshness transitions must re-render published averages only."""
+    entry, coordinator = await _setup(hass, [MODULE, MODULE_B], live_reporting=False, write_interval=30)
+    parser = MagicMock(counters={})
+    await hass.async_add_executor_job(coordinator._process_event, _event(iin=1.0))
+    await hass.async_add_executor_job(coordinator._process_event, _event(OTHER, iin=1.0))
+    coordinator._ha_update_pending = True
+    coordinator._maybe_flush_interval(parser, time.monotonic())
+    await hass.async_block_till_done()
+    published_power = float(_state(hass, "sensor", _uid("power")).state)
+
+    # A large raw reading arrives mid-interval; then another panel goes stale,
+    # which re-renders every entity.
+    await hass.async_add_executor_job(coordinator._process_event, _event(iin=9.0))
+    _age(coordinator, OTHER, 1000)
+    await hass.async_block_till_done()
+    assert float(_state(hass, "sensor", _uid("power")).state) == published_power
+    assert coordinator.data["nodes"][BARCODE]["power"] == pytest.approx(published_power, rel=0.01)
+
+    # Allowance is timeout + write interval: no flapping between flushes.
+    _age(coordinator, BARCODE, DEFAULT_STALE_TIMEOUT + 20)
+    await hass.async_block_till_done()
+    assert coordinator.is_reporting(BARCODE) is True
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_live_timing_is_not_persisted(hass: HomeAssistant) -> None:
+    entry, coordinator = await _setup(hass)
+    await _feed(hass, coordinator, _event())
+
+    saved = AsyncMock()
+    with patch.object(coordinator._store, "async_save", saved):
+        await coordinator._async_save_coordinator_state()
+    snapshot = saved.call_args.args[0]["node_snapshots"][BARCODE]
+    assert "report_monotonic" not in snapshot
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_topology_survives_power_reports(hass: HomeAssistant) -> None:
+    from custom_components.pytap.pytap.core.events import TopologyEvent
+
+    entry, coordinator = await _setup(hass)
+    coordinator._node_to_barcode[10] = BARCODE
+    await _feed(hass, coordinator, _event())
+    topology = TopologyEvent(gateway_id=1, node_id=10, data=b"\x01", timestamp=dt_util.now())
+    await hass.async_add_executor_job(coordinator._process_event, topology)
+    await _feed(hass, coordinator, _event())
+    assert coordinator._state["nodes"][BARCODE]["topology"]["data"] == "01"
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_options_flow_stale_step(hass: HomeAssistant) -> None:
+    entry, _ = await _setup(hass)
+    with patch("custom_components.pytap.coordinator.PyTapDataUpdateCoordinator._listen", return_value=None):
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {"next_step_id": "change_stale"}
+        )
+        assert result["step_id"] == "change_stale"
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {CONF_STALE_ACTION: "zero", CONF_STALE_TIMEOUT: 300}
+        )
+        await hass.async_block_till_done()
+    assert result["step_id"] == "init"
+    assert entry.data[CONF_STALE_ACTION] == "zero"
+    assert entry.data[CONF_STALE_TIMEOUT] == 300
+    assert entry.runtime_data.stale_timeout == 300
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.parametrize("timeout", [59, 601])
+async def test_options_flow_stale_timeout_bounds(hass: HomeAssistant, timeout: int) -> None:
+    from homeassistant.data_entry_flow import InvalidData
+
+    entry, _ = await _setup(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "change_stale"}
+    )
+    with pytest.raises(InvalidData):
+        await hass.config_entries.options.async_configure(
+            result["flow_id"], {CONF_STALE_ACTION: "zero", CONF_STALE_TIMEOUT: timeout}
+        )
+    assert await hass.config_entries.async_unload(entry.entry_id)
+

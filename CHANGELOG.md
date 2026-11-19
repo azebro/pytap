@@ -4,16 +4,30 @@
 
 ### Added
 
+- **Stale reading behaviour** option (**Configure → Change stale reading behaviour**): choose what live panel readings do once a panel stops sending valid reports — **Hold last value** (default for new and existing entries, restored after a restart, so behaviour is unchanged for upgrading users unless they opt in), **Unavailable**, or **Zero** (power, voltage, current and performance report 0; other live readings become unavailable) — and the timeout (60–600 s, default 120 s; in averaged reporting mode the reporting interval is added). With **Unavailable** or **Zero**, string and installation power counts only reporting panels; with **Zero**, their performance still divides by every panel's rating, counting stale panels as 0 W. After a restart, those two modes don't show saved live readings as current until the first new report. Energy totals are never affected.
 - **Configurable reporting mode** — New "Live reporting" toggle (default on) under **Configure → Change reporting settings**. When disabled, readings are cached and delivered as a time-weighted average every *reporting interval* (5–300 s, default 30), reducing CPU and recorder load on installations with many panels. Energy totals are always integrated from raw readings, so only the instantaneous values are averaged.
 
 ### Changed
 
+- Entities are re-rendered only when their data changes: each publish updates just the entities of panels whose data changed and the string/installation aggregates containing them, and a panel starting or stopping reporting updates only that panel's entities and aggregates. Global changes (gateway or node-table changes) still update every entity.
+- An unreachable gateway in the setup or connection-change form now shows "cannot connect"; submitting the same settings again saves them and PyTap keeps retrying in the background.
+- Connection loss is logged once (with the error type and errno) instead of on every retry, until data flows again; reconnecting after a silent link is likewise warned about once per outage.
+- Home Assistant 2025.3+ is now required.
 - Reporting interval default changed from 5 to 30 seconds; allowed range tightened from 1–300 to 5–300 seconds.
 - Config entry schema bumped to version 5 (adds `live_reporting`, default `True`, via automatic migration).
 - The reporting interval is now collected on its own follow-up screen that appears only when live reporting is turned off, so the interval is never shown (effectively greyed out) while live reporting is enabled.
 
 ### Fixed
 
+- The listener thread now keeps its own state and Home Assistant only receives published copies, so averaged reporting mode no longer occasionally shows raw readings.
+- Unloading or reloading no longer gets stuck when the listener is slow to stop: setup is retried until the old listener has released its connection, so it is never shared. A stop that times out still cancels timers and pending saves; the stuck listener's host/port counts as in use for new entries until it exits, and it then cleans up after itself. Removing an entry waits (bounded) for it before deleting the saved state.
+- Stopping a TCP connection wakes the blocked socket read immediately.
+- The midnight reset of daily values is DST-safe.
+- Invalid saved connection settings (e.g. an out-of-range port from an older version) now give a clear setup error instead of retrying forever; saving corrected settings under **Configure → Change connection settings** retries setup.
+- If saved state can't be read, it is no longer replaced with empty state (losing energy totals and mappings): PyTap logs a warning and doesn't save until the next reload.
+- An invalid slot counter in a receive-response header no longer crashes the parser (an `IndexError` escaped `Parser.feed` and forced a reconnect). Such a frame never updates the slot clock and keeps its reports only when the packet walk consumes the payload exactly and every packet is well-formed; otherwise the whole frame is dropped. Like any power report, kept reports are still dropped while the gateway has no slot clock yet. Power reports with an invalid slot counter are dropped. New parser counters `invalid_slot_frames_kept`, `invalid_slot_frames_dropped` and `no_slot_clock_drops` sit alongside `invalid_slots`. The "no slot clock" warning is logged once per gateway (per connection), then at debug level, instead of for every discarded report.
+- Finish setup with no modules now shows a validation error instead of silently returning to the menu.
+- Diagnostics now also redact the entry title, which contains the gateway host.
 - Live reporting no longer buffers readings internally, preventing unbounded memory growth over time in the default mode.
 - Live reporting now publishes an immutable copy of node data to Home Assistant, avoiding rare races where consumers (sensors, diagnostics) could observe the data changing mid-read.
 - Averaged interval mode now flushes buffered readings on schedule during quiet periods (e.g. at dusk), instead of waiting for the next reading or a reconnect.
