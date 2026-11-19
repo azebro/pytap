@@ -59,6 +59,11 @@ PyTap also creates aggregate virtual devices:
 - **Tigo String <name>** — `performance`, `power`, `daily_energy`, `total_energy`
 - **Tigo Installation** — `performance`, `power`, `daily_energy`, `total_energy`
 
+String and installation energy totals add up each member panel's increase
+since it was last seen, so moving a panel to another string or adding a
+new panel doesn't add that panel's lifetime energy to the group. The daily
+aggregate resets at local midnight.
+
 ---
 
 ## Installation

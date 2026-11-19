@@ -1,15 +1,20 @@
 """Second review: stale default, partial publishes, sequencing and saves."""
 
+from datetime import date, datetime, timedelta
+from datetime import time as dt_time
 import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity import Entity
 from homeassistant.util import dt as dt_util
 import pytest
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    mock_restore_cache_with_extra_data,
+)
 
 from custom_components.pytap.const import (
     CONF_STALE_ACTION,
@@ -27,6 +32,7 @@ OTHER = "C-2345678D"
 MODULE = {"barcode": BARCODE, "name": "East Panel", "string": "East", "peak_power": 500}
 MODULE_B = {"barcode": OTHER, "name": "West Panel", "string": "West", "peak_power": 500}
 LISTEN = "custom_components.pytap.coordinator.PyTapDataUpdateCoordinator._listen"
+STORE_LOAD = "custom_components.pytap.coordinator._MigratingStore.async_load"
 
 
 def _power(barcode: str = BARCODE, *, iin: float = 1.9, node_id: int | None = None):
@@ -53,12 +59,13 @@ def _infra(*barcodes: str, gateways=None) -> InfrastructureEvent:
 
 
 def _entry(
-    hass: HomeAssistant, modules=None, *, unique_id="review2", **data
+    hass: HomeAssistant, modules=None, *, entry_id=None, unique_id="review2", **data
 ) -> MockConfigEntry:
     entry = MockConfigEntry(
         domain=DOMAIN,
         version=5,
         unique_id=unique_id,
+        entry_id=entry_id,
         data={
             "host": data.pop("host", "gateway"),
             "port": 502,
@@ -296,7 +303,7 @@ async def test_schedule_save_posts_once_per_cycle(hass: HomeAssistant) -> None:
     assert coordinator._save_task is None and coordinator._save_requested is False
 
 
-# --- 7. Aggregate performance --------------------------------------------------
+# --- 7. Aggregate performance and energy ----------------------------------------
 
 
 def _aggregate(description, barcodes, nodes, *, action, reporting):
@@ -322,3 +329,126 @@ def test_aggregate_performance_by_stale_action(action: str, expected: float) -> 
     _, sensor = _aggregate(description, [BARCODE, OTHER], nodes, action=action, reporting={BARCODE})
     sensor._handle_coordinator_update()
     assert sensor.native_value == expected
+
+
+def test_daily_aggregate_rolls_over_with_its_cycle_date() -> None:
+    description = next(d for d in STRING_SENSOR_DESCRIPTIONS if d.key == "daily_energy")
+    coordinator, sensor = _aggregate(
+        description, [BARCODE], {BARCODE: {"daily_energy_wh": 400.0}}, action="hold", reporting={BARCODE}
+    )
+    today = dt_util.now(dt_util.UTC).date()
+    yesterday = (today - timedelta(days=1)).isoformat()
+    sensor._energy_total, sensor._baselines, sensor._cycle_date = 500.0, {BARCODE: 390.0}, yesterday
+
+    # The member reset at midnight: a new cycle starts at zero, no negative step.
+    coordinator.data = {"nodes": {BARCODE: {"daily_energy_wh": 20.0}}}
+    sensor._handle_coordinator_update()
+    assert sensor.native_value == 0.0
+    assert sensor.extra_restore_state_data.as_dict()["cycle_date"] == today.isoformat()
+    assert sensor.last_reset == datetime.combine(today, dt_time.min, tzinfo=dt_util.UTC)
+
+    coordinator.data = {"nodes": {BARCODE: {"daily_energy_wh": 30.0}}}
+    sensor._handle_coordinator_update()
+    assert sensor.native_value == 10.0
+    assert date.fromisoformat(sensor._cycle_date) == today
+
+
+ENTRY_ID = "aggregate-restore"
+
+
+def _installation_uid(key: str) -> str:
+    return f"{DOMAIN}_{ENTRY_ID}_installation_{key}"
+
+
+async def _setup_with_restore(hass: HomeAssistant, restored: dict[str, tuple[str, dict]]):
+    """Set up with saved member totals and pre-seeded aggregate restore data."""
+    entry = _entry(hass, [MODULE], entry_id=ENTRY_ID)
+    registry = er.async_get(hass)
+    cache = []
+    for key, (state, extra) in restored.items():
+        registry.async_get_or_create(
+            "sensor", DOMAIN, _installation_uid(key), suggested_object_id=f"inst_{key}", config_entry=entry
+        )
+        cache.append((State(f"sensor.inst_{key}", state), extra))
+    mock_restore_cache_with_extra_data(hass, cache)
+    today = dt_util.now().date().isoformat()
+    stored = {
+        "energy_data": {
+            BARCODE: {"total_energy_wh": 1010.0, "daily_energy_wh": 15.0, "daily_reset_date": today}
+        },
+        "node_snapshots": {BARCODE: {"total_energy_wh": 1010.0, "daily_energy_wh": 15.0}},
+    }
+    with patch(STORE_LOAD, new=AsyncMock(return_value=stored)), patch(LISTEN, return_value=None):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    return entry, entry.runtime_data
+
+
+def _sensor_entity(hass: HomeAssistant, key: str) -> PyTapAggregateSensor:
+    entity_id = er.async_get(hass).async_get_entity_id("sensor", DOMAIN, _installation_uid(key))
+    return hass.data["sensor"].get_entity(entity_id)
+
+
+async def test_aggregate_restore_round_trip_with_baselines(hass: HomeAssistant) -> None:
+    today = dt_util.now().date().isoformat()
+    entry, coordinator = await _setup_with_restore(
+        hass,
+        {
+            "total_energy": (
+                "3000.0",
+                {
+                    "native_value": 3000.0,
+                    "native_unit_of_measurement": "Wh",
+                    "baselines": {BARCODE: 1000.0},
+                    "cycle_date": None,
+                },
+            ),
+            "daily_energy": (
+                "40.0",
+                {
+                    "native_value": 40.0,
+                    "native_unit_of_measurement": "Wh",
+                    "baselines": {BARCODE: 10.0},
+                    "cycle_date": today,
+                },
+            ),
+        },
+    )
+    total = _sensor_entity(hass, "total_energy")
+    daily = _sensor_entity(hass, "daily_energy")
+    # Own totals continue, plus what members produced since they were last seen.
+    assert float(hass.states.get(total.entity_id).state) == 3010.0
+    assert float(hass.states.get(daily.entity_id).state) == 45.0
+    saved = total.extra_restore_state_data.as_dict()
+    assert saved["native_value"] == 3010.0
+    assert saved["baselines"] == {BARCODE: 1010.0}
+    assert daily.extra_restore_state_data.as_dict()["cycle_date"] == today
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_aggregate_restore_upgrades_plain_sum(hass: HomeAssistant) -> None:
+    """Earlier versions stored only a sum: continue from it, rebase every member."""
+    entry, coordinator = await _setup_with_restore(
+        hass,
+        {
+            "total_energy": ("2500.0", {"native_value": 2500.0, "native_unit_of_measurement": "Wh"}),
+            "daily_energy": ("99.0", {"native_value": 99.0, "native_unit_of_measurement": "Wh"}),
+        },
+    )
+    total = _sensor_entity(hass, "total_energy")
+    daily = _sensor_entity(hass, "daily_energy")
+    assert float(hass.states.get(total.entity_id).state) == 2500.0
+    assert total.extra_restore_state_data.as_dict()["baselines"] == {BARCODE: 1010.0}
+    # A daily plain sum can't be trusted (unknown cycle): start from the members.
+    assert float(hass.states.get(daily.entity_id).state) == 15.0
+
+    await _feed(hass, coordinator, _power())
+    with coordinator._state_lock:
+        node = coordinator._state["nodes"][BARCODE]
+        coordinator._state["nodes"][BARCODE] = {**node, "total_energy_wh": 1020.0}
+        coordinator._mark_changed(BARCODE)
+    coordinator._ha_update_pending = True
+    coordinator._push_live_update(MagicMock(counters={}))
+    await hass.async_block_till_done()
+    assert float(hass.states.get(total.entity_id).state) == 2510.0
+    assert await hass.config_entries.async_unload(entry.entry_id)
