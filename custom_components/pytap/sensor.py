@@ -8,7 +8,7 @@ from the configured module list — no auto-discovery.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, tzinfo
 import logging
 from typing import Any
 
@@ -33,7 +33,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
@@ -46,7 +46,7 @@ from .const import (
     DEFAULT_PEAK_POWER,
     DOMAIN,
 )
-from .coordinator import PyTapDataUpdateCoordinator
+from .coordinator import PyTapConfigEntry, PyTapDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -260,15 +260,15 @@ INSTALLATION_SENSOR_DESCRIPTIONS: tuple[PyTapAggregateSensorDescription, ...] = 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: PyTapConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up PyTap sensors from a config entry.
 
     Creates sensor entities deterministically from the configured module list.
     Each configured module gets the full set of 12 sensor entities.
     """
-    coordinator: PyTapDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator = entry.runtime_data
     modules: list[dict[str, str]] = entry.data.get(CONF_MODULES, [])
 
     entities: list[SensorEntity] = []
@@ -378,6 +378,11 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
     async def async_added_to_hass(self) -> None:
         """Restore last known native value from Home Assistant state cache."""
         await super().async_added_to_hass()
+        # Coordinator listeners only see global updates; panel data changes
+        # notify just this panel's entities.
+        self.async_on_remove(
+            self.coordinator.async_add_data_listener([self._barcode], self._handle_coordinator_update)
+        )
         nodes = self.coordinator.data.get("nodes", {})
         node = nodes.get(self._barcode)
         # Only short-circuit to coordinator data if this sensor has a non-None value.
@@ -465,11 +470,12 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
         except ValueError:
             return None
 
-        timezone = dt_util.UTC
-        if self.hass is not None:
-            timezone = dt_util.get_time_zone(self.hass.config.time_zone)
+        return datetime.combine(reset_day, time.min, tzinfo=self._timezone())
 
-        return datetime.combine(reset_day, time.min, tzinfo=timezone)
+    def _timezone(self) -> tzinfo:
+        if self.hass is not None:
+            return dt_util.get_time_zone(self.hass.config.time_zone) or dt_util.UTC
+        return dt_util.UTC
 
 
 class PyTapAggregateSensor(
@@ -499,6 +505,10 @@ class PyTapAggregateSensor(
     async def async_added_to_hass(self) -> None:
         """Restore last known aggregate value from Home Assistant state cache."""
         await super().async_added_to_hass()
+        # Re-render when any member's data changes.
+        self.async_on_remove(
+            self.coordinator.async_add_data_listener(self._barcodes, self._handle_coordinator_update)
+        )
 
         nodes = self.coordinator.data.get("nodes", {})
         # Only short-circuit to live data if at least one node already has

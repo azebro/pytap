@@ -22,7 +22,7 @@ The primary design goal is **ease of integration**: the full parsing functionali
 ┌─────────────────────────────────────────────────────┐
 │  Public API  (pytap.api)                            │
 │                                                     │
-│  connect(source_config) → Connection                │
+│  connect(source_config) → TcpSource | SerialSource  │
 │  parse_bytes(data) → list[Event]                    │
 │  create_parser(persistent_state) → Parser            │
 └──────────────────────┬──────────────────────────────┘
@@ -51,7 +51,7 @@ The primary design goal is **ease of integration**: the full parsing functionali
 │  │  Types & Protocol Constants               │      │
 │  │  Frame, GatewayID, NodeID, LongAddress,   │      │
 │  │  SlotCounter, PacketType, PowerReport,    │      │
-│  │  Barcode, etc.                            │      │
+│  │  etc.                                     │      │
 │  └───────────────────────────────────────────┘      │
 │                                                     │
 │  ┌───────────────────────────────────────────┐      │
@@ -68,8 +68,8 @@ The primary design goal is **ease of integration**: the full parsing functionali
 │                                                     │
 │  ┌───────────────────────────────────────────┐      │
 │  │  State                                    │      │
-│  │  SlotClock, NodeTable, PersistentState    │      │
-│  │  (internal to Parser, not part of API)    │      │
+│  │  SlotClock, NodeTableBuilder (internal),  │      │
+│  │  PersistentState (caller-owned)           │      │
 │  └───────────────────────────────────────────┘      │
 └─────────────────────────────────────────────────────┘
 ```
@@ -78,10 +78,10 @@ The primary design goal is **ease of integration**: the full parsing functionali
 
 ```
 pytap/
-├── __init__.py              # Package root, re-exports pytap.api
+├── __init__.py              # Package root, re-exports api, events, types, state
 ├── api.py                   # Public API functions
 ├── core/
-│   ├── __init__.py          # Exports Parser, types, events
+│   ├── __init__.py          # Package docstring only
 │   ├── types.py             # All protocol types (flat, no layering)
 │   ├── events.py            # Event dataclasses
 │   ├── parser.py            # The single Parser class
@@ -91,7 +91,8 @@ pytap/
 │   └── barcode.py           # Tigo barcode encoding/decoding
 ├── docs/
 │   ├── architecture.md      # This file
-│   └── api_reference.md     # Public API documentation
+│   ├── api_reference.md     # Public API documentation
+│   └── implementation_plan.md  # Original phased build plan
 └── tests/
     ├── __init__.py
     ├── test_parser.py        # End-to-end parser tests
@@ -141,11 +142,12 @@ The entire protocol stack is collapsed into `Parser.feed(data: bytes) -> list[Ev
               │   COMMAND_RESPONSE     │
               │     → _handle_command  │
               │                        │
-              │   ENUMERATE_*          │
-              │     → _handle_enum     │
+              │   ENUMERATION_* /      │
+              │   IDENTIFY / VERSION   │
+              │     → infrastructure   │
               │                        │
-              │   PING/PONG/other      │
-              │     → _handle_misc     │
+              │   PING / unknown       │
+              │     → ignored          │
               └───────────┬────────────┘
                           │ extracted packet data
               ┌───────────┴────────────┐
@@ -174,7 +176,7 @@ Instead of 4 separate Receiver classes connected by Sink protocols, `pytap` uses
 - forwarding boilerplate (the existing `ApplicationReceiver` forwards 8 transport methods untouched)
 - the need to wire receivers together manually
 
-Internal methods are organized by concern (`_accumulate_frame`, `_decode_frame`, `_dispatch_frame`, `_parse_packet`) but are private — callers only see `feed()`.
+Internal methods are organized by concern (`_accumulate`, `_decode_frame`, `_dispatch_frame`, `_parse_pv_packet`) but are private — callers only see `feed()`.
 
 ### 2. Events as Return Values, Not Side Effects
 
@@ -240,10 +242,10 @@ def parse_bytes(data: bytes) -> list[Event]:
     Convenience for non-streaming use (e.g., parsing captured files).
     """
 
-def connect(source_config: dict) -> Source:
-    """Create and open a byte source (serial or TCP).
+def connect(source_config: dict) -> TcpSource | SerialSource:
+    """Create and open a byte source ({"tcp": host, "port": 502} or {"serial": path}).
 
-    Returns a Source with a read() method for manual feeding into a Parser.
+    Returns a source with read()/close() for manual feeding into a Parser.
     """
 ```
 
@@ -261,13 +263,17 @@ class Parser:
         across calls for partial frames.
         """
 
+    def reset(self) -> None:
+        """Reset frame accumulation (not infrastructure or slot clocks)."""
+
     @property
     def infrastructure(self) -> dict:
         """Current known infrastructure: gateways, nodes, barcodes."""
 
     @property
     def counters(self) -> dict:
-        """Parse statistics: frames, CRC errors, runts, etc."""
+        """frames_received, crc_errors, runts, giants, noise_bytes, invalid_slots,
+        invalid_slot_frames_kept, invalid_slot_frames_dropped, no_slot_clock_drops."""
 ```
 
 ### `pytap.core.events`
@@ -287,25 +293,25 @@ class PowerReportEvent(Event):
     barcode: str | None
     voltage_in: float       # Volts
     voltage_out: float      # Volts
-    current: float          # Amps
-    power: float            # Watts (voltage_out * current)
+    current_in: float       # Amps
+    power: float            # Watts (current_out * voltage_out)
+    current_out: float      # Amps ((voltage_in * current_in) / voltage_out)
     temperature: float      # °C
     dc_dc_duty_cycle: float # 0.0–1.0
-    rssi: int               # Signal strength
+    rssi: int               # Raw signal strength byte
 
 @dataclass
 class InfrastructureEvent(Event):
     """Infrastructure state change (gateway/node discovery)."""
-    gateways: dict[int, GatewayInfo]
-    nodes: dict[int, NodeInfo]
+    gateways: dict  # gateway_id → {"address", "version"}
+    nodes: dict     # node_id → {"address", "barcode", "gateway_id"}
 
 @dataclass
 class TopologyEvent(Event):
     """Mesh network topology report from a node."""
     gateway_id: int
     node_id: int
-    parent_address: int
-    neighbors: list[int]
+    data: bytes
 
 @dataclass
 class StringEvent(Event):
@@ -318,49 +324,14 @@ class StringEvent(Event):
 
 ## Implementation Plan
 
-### Phase 1 — Core Types & CRC (foundation)
-- [ ] `pytap/core/types.py` — All protocol types as dataclasses/NamedTuples
-- [ ] `pytap/core/crc.py` — CRC-16-CCITT (port from `python/taptap`)
-- [ ] `pytap/core/barcode.py` — Barcode encode/decode
-- [ ] Tests for types, CRC, barcode
-
-### Phase 2 — Parser (the big piece)
-- [ ] `pytap/core/parser.py` — Frame accumulator state machine
-- [ ] Frame decoding (unescape + CRC + parse)
-- [ ] Frame dispatch (route by frame type)
-- [ ] Transport-level handling (receive, command correlation, enumeration)
-- [ ] PV packet extraction and parsing
-- [ ] Event generation (PowerReport, Infrastructure, Topology, String)
-- [ ] Tests with captured test data
-
-### Phase 3 — State Management
-- [ ] `pytap/core/state.py` — SlotClock, NodeTable, PersistentState
-- [ ] Integration into Parser
-- [ ] State persistence tests
-
-### Phase 4 — Events & API
-- [ ] `pytap/core/events.py` — Event dataclasses with JSON serialization
-- [ ] `pytap/api.py` — Public API functions
-- [ ] `pytap/__init__.py` — Package exports
-- [ ] API tests
-
-### Phase 5 — Sources & CLI
-- [ ] `pytap/core/source.py` — SerialSource, TcpSource
-- [ ] `pytap/cli/main.py` — Click CLI
-- [ ] End-to-end integration tests
-
-### Phase 6 — Documentation & Polish
-- [ ] `pytap/docs/api_reference.md`
-- [ ] README.md
-- [ ] Type hints, docstrings, logging
-- [ ] Edge case tests (CRC errors, truncated frames, epoch wraparound)
+The phased plan used to build the library is kept in [implementation_plan.md](implementation_plan.md). The command-line interface planned there was later removed; the library is used through the Home Assistant integration.
 
 ## Testing Strategy
 
-Tests reuse captured protocol data from the Rust implementation (`src/test_data.rs`) to validate byte-level correctness. Each phase includes tests:
+Tests reuse captured protocol data from the Rust implementation (`src/test_data.rs`) to validate byte-level correctness:
 
 1. **Unit**: CRC values, barcode encoding, type construction
-2. **Parser**: Feed known byte sequences, assert expected events
+2. **Parser**: Feed known byte sequences, assert expected events (including invalid slot counters)
 3. **Integration**: Full parse pipeline with recorded data, assert correct events
 4. **Regression**: Edge cases from `python/taptap` test suite
 
@@ -368,6 +339,6 @@ Tests reuse captured protocol data from the Rust implementation (`src/test_data.
 
 | Package | Purpose | Required |
 |---------|---------|----------|
-| `pyserial` | Serial port access | Optional (serial sources only) |
+| `pyserial` | Serial port access | Optional (`SerialSource` only) |
 
 Zero required dependencies for the core parser — it uses only the Python standard library.

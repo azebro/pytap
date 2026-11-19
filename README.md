@@ -1,7 +1,7 @@
 # PyTap
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![HA Version](https://img.shields.io/badge/Home%20Assistant-2024.1%2B-blue.svg)](https://www.home-assistant.io/)
+[![HA Version](https://img.shields.io/badge/Home%20Assistant-2025.3%2B-blue.svg)](https://www.home-assistant.io/)
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://hacs.xyz/)
 [![Validate](https://github.com/azebro/pytap/actions/workflows/validate.yml/badge.svg)](https://github.com/azebro/pytap/actions/workflows/validate.yml)
 
@@ -52,7 +52,7 @@ Each configured Tigo TS4 optimizer exposes the following sensors:
 | RSSI | dBm | `signal_strength` |
 | Daily Energy | Wh | `energy` |
 | Total Energy | Wh | `energy` |
-| Readings Today | — | — |
+| Readings Today | — | — (diagnostic) |
 
 PyTap also creates aggregate virtual devices:
 
@@ -88,9 +88,12 @@ PyTap is configured entirely through the Home Assistant UI — no YAML needed.
 2. Search for **PyTap**.
 3. Enter your Tigo gateway's **host** (IP address or hostname) and **port** (default: 502).
 
-> **Note:** The connection test is non-blocking. If the gateway is temporarily
-> unreachable (e.g., powered off at night), setup will proceed and connect
+> **Note:** The connection test runs off the event loop and is bounded. If the gateway is temporarily
+> unreachable (e.g., powered off at night), the form shows **Could not connect**. Submit the same
+> settings again to save them anyway; PyTap keeps retrying in the background and connects
 > when the gateway becomes available.
+
+A gateway host/port still held by a PyTap listener that is shutting down counts as in use until it is released.
 
 ### Step 2: Add Modules
 
@@ -104,6 +107,8 @@ After entering connection details, you'll see a modules menu:
    - **Peak power (Wp)** — The panel's peak power rating in watts (default: 455 Wp). Used to calculate performance percentage.
 3. Repeat for each optimizer you want to monitor.
 4. Click **"Finish setup"** when done.
+
+Setup requires at least one module; finishing without one shows an explicit error and the add-module form.
 
 ### Finding Barcodes
 
@@ -120,7 +125,7 @@ Check your Home Assistant logs after the gateway has been running for a while (u
 
 Go to **Settings → Devices & Services → PyTap → Configure** to:
 
-- **Change connection** — Update the gateway IP address and port.
+- **Change connection** — Update the gateway IP address and port. Connection changes save immediately and reload PyTap without changing module settings, entity IDs, or stored energy. If setup failed (for example because of invalid saved settings), saving corrected settings retries it.
 - **Change reporting settings** — Toggle live reporting or set the averaged reporting interval (see [Reporting modes](#reporting-modes)).
 - **Add** new optimizer modules (if the barcode was previously seen on the bus, it resolves instantly).
 - **Remove** modules you no longer want to track.
@@ -146,7 +151,15 @@ PyTap diagnostics are available from the integration page:
 3. Use the menu (⋮) and select **Download diagnostics**.
 
 The diagnostics JSON includes parser counters, infrastructure and node mappings,
-discovered barcodes, connection state, and per-node summaries. Host/IP is redacted.
+discovered barcodes, connection state, and per-node summaries. Host/IP is redacted, including in the entry title.
+
+Power reports with an invalid slot counter are dropped. A receive-response
+frame with an invalid header slot counter never updates the slot clock; its
+reports are kept only if its packets parse exactly and are all well-formed
+(otherwise the whole frame is dropped), and like any report they are dropped
+while the gateway has no slot clock yet. The parser counts these in
+`invalid_slots`, `invalid_slot_frames_kept`, `invalid_slot_frames_dropped` and
+`no_slot_clock_drops`.
 
 ---
 
@@ -166,13 +179,13 @@ PyTap Coordinator
     │   ├── Configured → update sensor entities
     │   └── Unconfigured → log for discovery
     │
-    └── Push to Home Assistant event loop
+    └── Push copies to Home Assistant event loop
         └── Sensor entities update in real time
 ```
 
-PyTap uses a background listener thread that streams data from the gateway, parses protocol frames, and dispatches events to the Home Assistant event loop. Only events matching your configured barcodes create or update sensor entities. In the default **live reporting** mode each update is forwarded immediately; in **averaged interval** mode updates are buffered and flushed as a time-weighted average every few seconds (see [Reporting modes](#reporting-modes)).
+PyTap uses a background listener thread that streams data, parses protocol frames, and keeps its own working copy of the readings. Home Assistant only ever receives finished copies, so entities never see half-updated data. Unload waits (up to a time limit) for the worker to release its gateway connection; if it is slow, setup is retried until it has stopped, so a replacement listener never shares the connection. Timers and pending saves are cancelled either way, the slow listener's host/port counts as in use for new entries, and it finishes its own cleanup once its worker exits. Only events matching your configured barcodes create or update sensor entities. Each publish re-renders only the entities of panels whose data changed (and the string/installation sensors containing them); global changes such as gateway updates refresh every entity. In the default **live reporting** mode each update is forwarded immediately; in **averaged interval** mode updates are buffered and flushed as a time-weighted average every few seconds (see [Reporting modes](#reporting-modes)).
 
-On startup, PyTap restores persisted coordinator state (barcode mappings, energy accumulators, and last node snapshots). Sensor entities also use Home Assistant restore fallback if needed, so a restart during low/no production does not force entities into unavailable when prior data exists.
+On startup, PyTap restores persisted coordinator state (barcode mappings, energy accumulators, and last node snapshots). Sensor entities also use Home Assistant restore fallback if needed, so a restart during low/no production does not force entities into unavailable when prior data exists. If the saved state can't be read, PyTap logs a warning and doesn't overwrite it until the next reload. If the connection drops, PyTap logs it once and keeps retrying quietly until data flows again.
 
 ---
 
@@ -185,11 +198,14 @@ This repository includes a dev container with Home Assistant pre-installed for l
 ```
 pytap/
 ├── custom_components/pytap/     # The HA custom component
-│   ├── __init__.py              # Integration lifecycle
+│   ├── __init__.py              # Integration lifecycle, migrations
 │   ├── config_flow.py           # Config & options flows
+│   ├── connection.py            # Connection settings validation and source opening
 │   ├── const.py                 # Constants
 │   ├── coordinator.py           # Push-based data coordinator
-│   ├── sensor.py                # Sensor platform (12 entity types)
+│   ├── diagnostics.py           # Diagnostics download
+│   ├── energy.py                # Energy accumulation helpers
+│   ├── sensor.py                # Sensor platform (12 per-optimizer types + aggregates)
 │   ├── manifest.json            # Integration metadata
 │   ├── strings.json             # UI strings
 │   ├── translations/en.json     # English translations
@@ -202,7 +218,8 @@ pytap/
 │   ├── architecture.md          # Architecture & design document
 │   └── implementation.md        # Implementation details & history
 ├── config/                      # Dev HA config directory
-├── requirements.txt             # HA + dev dependencies
+├── requirements.txt             # Home Assistant Core dependencies
+├── requirements-test.txt        # Test dependencies (custom-component test harness)
 └── pytest.ini                   # Test configuration
 ```
 
@@ -215,17 +232,20 @@ python3 -m homeassistant --config config/ --debug
 ### Running Tests
 
 ```bash
-# Integration tests (config flow + sensor platform)
+# Python 3.13 (as in CI); install the published custom-component test harness.
+pip install -r requirements-test.txt
+
+# Integration tests
 python3 -m pytest tests/ -vv --tb=short
 
 # Parser library tests
-python3 -m pytest custom_components/pytap/pytap/tests/ -vv
+PYTHONPATH=custom_components/pytap python3 -c 'import pytap, pytest; raise SystemExit(pytest.main(["custom_components/pytap/pytap/tests/", "--import-mode=importlib", "-vv"]))'
 ```
 
 ### Linting
 
 ```bash
-python3 -m ruff check custom_components/pytap/
+python3 -m ruff check custom_components/pytap/ tests/
 ```
 
 ### Deploying to a Home Assistant Instance

@@ -781,7 +781,7 @@ class Parser:
                 logger.warning(
                     "No slot clock for gateway %d yet, discarding power reports until one is established",
                     gw_id,
-                )
+            )
             return []
 
         timestamp = slot_clock.get(report.slot_counter)
