@@ -53,7 +53,7 @@ from .coordinator import (
 _LOGGER = logging.getLogger(__name__)
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
-PLATFORMS: list[Platform] = [Platform.SENSOR]
+PLATFORMS: list[Platform] = [Platform.BINARY_SENSOR, Platform.SENSOR]
 
 # Readable names for the setting named in an invalid_connection_settings error.
 _SETTING_NAMES: dict[str, str] = {

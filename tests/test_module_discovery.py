@@ -330,7 +330,7 @@ async def test_live_discovery_creates_entities_and_updates_aggregates(hass: Home
         )
         assert registry.async_get(performance_id).disabled_by is er.RegistryEntryDisabler.INTEGRATION
         count = len(er.async_entries_for_config_entry(registry, entry.entry_id))
-        assert count == 33  # 2 × 12 sensors + 4 string + 4 installation + 1 status.
+        assert count == 41  # 2 × (13 sensors + 3 binary) + 4 string + 4 installation + 1 status.
         coordinator._process_event(_infra(BARCODE, OTHER))
         coordinator.async_set_updated_data(coordinator._snapshot())
         await hass.async_block_till_done()

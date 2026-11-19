@@ -326,6 +326,9 @@ class PowerReportEvent(Event):
     temperature: float      # °C
     dc_dc_duty_cycle: float # 0.0–1.0
     rssi: int               # Raw signal strength byte
+    high_output_mode: bool | None # Byte 7 bit 7 (undocumented)
+    status_code: int | None # Byte 9 raw value (undocumented)
+    low_voltage_flag: bool | None # Byte 9 bit 7 (undocumented)
 
 @dataclass
 class InfrastructureEvent(Event):
@@ -348,6 +351,8 @@ class StringEvent(Event):
     direction: str  # "request" | "response"
     content: str
 ```
+
+The meanings of `high_output_mode`, `status_code` and `low_voltage_flag` are correlations from captured data, not confirmed by Tigo.
 
 ## Implementation Plan
 

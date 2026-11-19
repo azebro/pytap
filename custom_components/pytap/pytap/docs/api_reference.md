@@ -204,7 +204,12 @@ class PowerReportEvent(Event):
     temperature: float       # Module temperature (°C)
     dc_dc_duty_cycle: float  # DC-DC converter duty cycle (0.0–1.0)
     rssi: int                # Raw received signal strength byte (0–255)
+    high_output_mode: bool | None  # Byte 7 bit 7
+    status_code: int | None  # Byte 9 raw value
+    low_voltage_flag: bool | None  # Byte 9 bit 7
 ```
+
+The last three fields come from undocumented report bytes; their meanings are correlations from captured data, not confirmed by Tigo. `status_code` is normally `0x64`, `0x68` at low current (around dawn/dusk) and `0xE4` at low input voltage; `high_output_mode` is set almost only above ~0.5 A input current. They default to `None` when an event is constructed without them; the parser always sets them.
 
 **JSON example:**
 ```json
@@ -221,7 +226,10 @@ class PowerReportEvent(Event):
     "current_out": 8.0,
     "temperature": 45.2,
     "dc_dc_duty_cycle": 0.78,
-    "rssi": 120
+    "rssi": 120,
+    "high_output_mode": true,
+    "status_code": 100,
+    "low_voltage_flag": false
 }
 ```
 
@@ -279,7 +287,7 @@ These are available from `pytap.core.types` (and re-exported from `pytap`).
 | `PacketType` / `FrameType` | PV packet / gateway frame types | `IntEnum` |
 | `Frame` | Decoded gateway link-layer frame | dataclass |
 | `ReceivedPacketHeader` | Header of a packet inside a receive response | dataclass |
-| `PowerReport` | Raw 13-byte power report with decoded properties | dataclass |
+| `PowerReport` | Raw 13-byte power report with decoded properties (incl. `high_output_mode`, `status_code`, `low_voltage_flag`) | dataclass |
 | `GatewayInfo` | Gateway address + version | dataclass |
 | `NodeInfo` | Node address + barcode | dataclass |
 

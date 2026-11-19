@@ -40,18 +40,21 @@ LISTEN = "custom_components.pytap.coordinator.PyTapDataUpdateCoordinator._listen
 STORE_LOAD = "custom_components.pytap.coordinator._MigratingStore.async_load"
 
 
-def _power(barcode: str = BARCODE, *, iin: float = 1.9, node_id: int | None = None):
+def _power(barcode: str = BARCODE, *, iin: float = 1.9, node_id: int | None = None, vout: float = 30.7):
     return PowerReportEvent(
         gateway_id=1,
         node_id=node_id if node_id is not None else (10 if barcode == BARCODE else 11),
         barcode=barcode,
         voltage_in=31.0,
-        voltage_out=30.7,
+        voltage_out=vout,
         current_in=iin,
         temperature=18.0,
         dc_dc_duty_cycle=1.0,
         rssi=99,
         timestamp=dt_util.now(),
+        high_output_mode=True,
+        status_code=0x64,
+        low_voltage_flag=False,
     )
 
 
@@ -263,7 +266,8 @@ async def test_discovery_still_adds_entities(hass: HomeAssistant) -> None:
     await _feed(hass, coordinator, _power(OTHER, node_id=7))
     registry = er.async_get(hass)
     power_id = registry.async_get_entity_id("sensor", DOMAIN, f"{DOMAIN}_{OTHER}_power")
-    assert power_id is not None
+    flag_id = registry.async_get_entity_id("binary_sensor", DOMAIN, f"{DOMAIN}_{OTHER}_high_output_mode")
+    assert power_id is not None and flag_id is not None
     assert float(hass.states.get(power_id).state) > 0
     installation = registry.async_get_entity_id(
         "sensor", DOMAIN, f"{DOMAIN}_{entry.entry_id}_installation_power"
@@ -313,8 +317,9 @@ async def test_averaged_disconnect_publishes_averages_and_counters(hass: HomeAss
     await hass.async_block_till_done()
     averaged = coordinator.data["nodes"][BARCODE]["power"]
 
-    # Buffers are empty but an update is pending; the raw worker value
-    # differs from the published average.
+    # A fault leaves the buffers empty but marks an update pending; the raw
+    # worker value differs from the published average.
+    await hass.async_add_executor_job(coordinator._process_event, _power(vout=154.3))
     assert coordinator._reading_buffers == {}
     with coordinator._state_lock:
         node = coordinator._state["nodes"][BARCODE]
@@ -325,6 +330,7 @@ async def test_averaged_disconnect_publishes_averages_and_counters(hass: HomeAss
     await hass.async_block_till_done()
     node = coordinator.data["nodes"][BARCODE]
     assert node["power"] == averaged
+    assert node["reading_fault"] is True
     assert coordinator.data["counters"] == {"frames_received": 7}
     assert coordinator._ha_update_pending is False
     assert await hass.config_entries.async_unload(entry.entry_id)

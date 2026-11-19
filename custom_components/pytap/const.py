@@ -58,3 +58,11 @@ DEFAULT_STALE_TIMEOUT = 120
 MIN_STALE_TIMEOUT = 60
 MAX_STALE_TIMEOUT = 600
 FRESHNESS_CHECK_INTERVAL_SECONDS = 5
+
+# Readings outside these bounds are treated as corrupt, not as measurements.
+# TS4 optimizers only step voltage down, so output above input is impossible;
+# the tolerance covers rounding (never exceeded in 217k captured reports).
+MAX_PLAUSIBLE_VOLTAGE = 100.0
+MAX_OUTPUT_ABOVE_INPUT_VOLTS = 2.0
+MIN_PLAUSIBLE_TEMPERATURE = -40.0
+MAX_PLAUSIBLE_TEMPERATURE = 125.0

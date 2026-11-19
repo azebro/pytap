@@ -88,6 +88,17 @@
     }
   },
   "entity": {
+    "binary_sensor": {
+      "high_output_mode": {
+        "name": "High output mode"
+      },
+      "low_voltage_flag": {
+        "name": "Low voltage flag"
+      },
+      "reading_fault": {
+        "name": "Reading fault"
+      }
+    },
     "sensor": {
       "module_discovery": {
         "name": "Module discovery",
@@ -155,6 +166,9 @@
       },
       "rssi": {
         "name": "RSSI"
+      },
+      "status_code": {
+        "name": "Status code"
       }
     }
   },
@@ -275,7 +289,7 @@
       },
       "change_stale": {
         "title": "Stale Readings",
-        "description": "Choose what live panel readings (power, voltage, current, temperature, duty cycle, RSSI and performance) do when a panel stops sending valid reports, for example at night or during radio dropouts. Energy totals are not affected.",
+        "description": "Choose what live panel readings (power, voltage, current, temperature, duty cycle, RSSI, performance and status) do when a panel stops sending valid reports, for example at night or during radio dropouts. Energy totals are not affected.",
         "data": {
           "stale_action": "When a panel stops reporting",
           "stale_timeout": "Timeout (seconds)"

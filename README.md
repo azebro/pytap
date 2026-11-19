@@ -18,9 +18,10 @@ Use a suitably rated RS-485 transceiver; never connect ESP GPIO pins directly to
 
 - **Real-time streaming** — Push-based data delivery with sub-second latency (no polling).
 - **Configurable reporting** — Choose **live reporting** (default; every reading delivered as it arrives) or a **time-weighted averaged interval** that caches readings and pushes a single representative value every few seconds to reduce CPU and recorder load on large installations.
-- **Per-optimizer sensors** — 12 sensor entities per Tigo TS4 module: performance,
+- **Per-optimizer entities** — 13 sensors per Tigo TS4 module (performance,
   power, voltage in/out, current in/out, temperature, DC-DC duty cycle, RSSI,
-  daily energy, total energy, and readings today.
+  daily energy, total energy, readings today, status code) plus 3 diagnostic
+  binary sensors (high output mode, low voltage flag, reading fault).
 - **Aggregate sensors** — 4 sensors per string and 4 for the full installation: performance, power, daily energy, total energy.
 - **Performance tracking** — Per-optimizer, per-string, and installation-wide performance percentage based on configurable peak panel power (Wp).
 - **Diagnostics download** — Integration diagnostics export includes parser counters, infrastructure/mapping state, and per-node summaries.
@@ -33,6 +34,8 @@ Use a suitably rated RS-485 transceiver; never connect ESP GPIO pins directly to
 - **Stale-reading handling** — Choose what live readings do when a panel stops
   reporting (for example at night): hold the last value (default), become
   unavailable, or show zero. See [Stale readings](#stale-readings).
+- **Reading fault detection** — Physically impossible reports are discarded and
+  flagged instead of being shown or added to energy.
 - **Energy accumulation** — Trapezoidal Wh integration with proactive midnight reset and monotonic lifetime totals. Daily sensors zero at exactly midnight local time. Energy totals are restored after a restart.
 - **Embedded parser** — The protocol parser is bundled; Home Assistant installs `serialx` for serial access automatically.
 - **Native serial selection** — Choose local adapters and ESPHome proxy ports using Home Assistant's serial-port picker.
@@ -57,6 +60,38 @@ Each tracked Tigo TS4 optimizer (configured or discovered) exposes the following
 | Daily Energy | Wh | `energy` |
 | Total Energy | Wh | `energy` |
 | Readings Today | — | — (diagnostic) |
+| Status Code | — | — (diagnostic) |
+
+and these diagnostic binary sensors:
+
+| Binary sensor    | Device Class |
+| ---------------- | ------------ |
+| High Output Mode | —            |
+| Low Voltage Flag | —            |
+| Reading Fault    | `problem`    |
+
+**Status entities.** Status code, Low voltage flag and High output mode come
+from power-report bytes that Tigo has not documented. Their names describe
+patterns seen in captured data, not confirmed meanings:
+
+- **Status code** — the raw byte shown as hex. `0x64` is normal; `0x68` is
+  typical at low current around dawn/dusk; `0xE4` at low input voltage.
+- **Low voltage flag** — the top bit of that status byte.
+- **High output mode** — a separate bit, set almost only above about 0.5 A
+  input current.
+
+These three only record a new state when their value changes, so they don't
+add a database row for every report.
+
+**Reading fault** turns on when a report is physically impossible: output
+voltage more than 2 V above input, either voltage outside 0–100 V, or
+temperature outside −40…125 °C. Such readings are discarded: they don't
+replace the last good values, add energy, or count as a fresh report. The
+fault clears on the next valid report. It is unavailable while PyTap has no
+data for the panel (no report yet and nothing saved), and unknown while the
+panel has data but no fault result yet (for example a newly discovered panel).
+It keeps its state across restarts, and has `fault_reasons` and
+`last_fault_at` attributes.
 
 PyTap also creates aggregate virtual devices:
 
@@ -212,11 +247,11 @@ Optimizers stop reporting at night and during radio dropouts. Under **Configure 
 
 | Action                    | Panel readings                                                                                                                                                                                     | String / installation power and performance                      |
 | ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
-| **Unavailable**           | Power, voltages, currents, temperature, duty cycle, RSSI and performance become unavailable.                                                                                                       | Count only panels that are reporting; unavailable when none are. |
-| **Zero**                  | Power, voltage in/out, current in/out and performance show 0 (performance stays unknown if the panel rating is unknown). Temperature, duty cycle and RSSI become unavailable.                      | Stale panels count as 0 W; show 0 when none are.                 |
-| **Hold last value**       | Keep the last values, including after a restart.                                                                                                                                                   | Include every panel's last values.                               |
+| **Unavailable**           | Power, voltages, currents, temperature, duty cycle, RSSI, performance, status code, high output mode and low voltage flag become unavailable.                                                      | Count only panels that are reporting; unavailable when none are. |
+| **Zero**                  | Power, voltage in/out, current in/out and performance show 0 (performance stays unknown if the panel rating is unknown). Temperature, duty cycle, RSSI and the status entities become unavailable. | Stale panels count as 0 W; show 0 when none are.                 |
+| **Hold last value**       | Keep the last values, including after a restart. Status code, high output mode and low voltage flag are restored too.                                                                              | Include every panel's last values.                               |
 
-Energy sensors (daily energy, total energy, readings today) are not affected by any action. In averaged reporting mode the reporting interval is added to the timeout, so panels don't flicker between updates. PyTap checks for stale panels every 5 seconds.
+Energy sensors (daily energy, total energy, readings today) and the reading-fault sensor are not affected by any action. In averaged reporting mode the reporting interval is added to the timeout, so panels don't flicker between updates. PyTap checks for stale panels every 5 seconds.
 
 After a restart, saved readings aren't treated as current: with **Unavailable** they stay unavailable, and with **Zero** they show 0, until each panel's first new report arrives. Energy totals are restored either way.
 
@@ -229,7 +264,7 @@ PyTap diagnostics are available from the integration page:
 3. Use the menu (⋮) and select **Download diagnostics**.
 
 The diagnostics JSON includes parser counters, infrastructure and node mappings,
-discovered barcodes, connection state, packet-capture status, and per-node summaries (including whether each panel is currently reporting). Host/IP, complete serial endpoints and capture file paths are not included; transport type, baud rate, and retry state remain visible.
+discovered barcodes, connection state, packet-capture status, and per-node summaries (including whether each panel is currently reporting, its status code and any reading fault). Host/IP, complete serial endpoints and capture file paths are not included; transport type, baud rate, and retry state remain visible.
 
 ---
 
@@ -250,12 +285,12 @@ PyTap Coordinator
     │   └── Unconfigured (discovery off, or removed) → log only
     │
     └── Push copies to Home Assistant event loop
-        └── Sensor entities update in real time
+        └── Sensor and binary sensor entities update in real time
 ```
 
 PyTap uses a background listener thread that streams data, parses protocol frames, and keeps its own working copy of the readings. Home Assistant only ever receives finished copies, so entities never see half-updated data. Serial connections use `serialx`'s async transport on HA's loop, bridged to the same parser thread with bounded reads. Unload waits (up to a time limit) for the worker to release its port; if it is slow, setup is retried until it has stopped, so a replacement listener never shares the port. Timers and pending saves are cancelled either way, the slow listener's port or host counts as in use for new entries, and it finishes its own cleanup once its worker exits. Only configured or automatically discovered optimizers get entities. Each publish re-renders only the entities of panels whose data changed (and the string/installation sensors containing them); global changes such as new modules or gateway updates refresh every entity. In the default **live reporting** mode each update is forwarded immediately; in **averaged interval** mode updates are buffered and flushed as a time-weighted average every few seconds (see [Reporting modes](#reporting-modes)).
 
-On startup, PyTap restores persisted coordinator state (barcode mappings, discovered modules, energy accumulators and last node snapshots). Energy sensors show their restored totals straight away. Whether live readings show their saved values depends on the [stale-reading action](#stale-readings): only **Hold last value** shows them before new reports arrive. If the saved state can't be read, PyTap logs a warning and doesn't overwrite it until the next reload. If the connection drops, PyTap logs it once and keeps retrying quietly until data flows again.
+On startup, PyTap restores persisted coordinator state (barcode mappings, discovered modules, energy accumulators, last node snapshots and reading-fault state). Energy sensors show their restored totals straight away. Whether live readings show their saved values depends on the [stale-reading action](#stale-readings): only **Hold last value** shows them before new reports arrive. If the saved state can't be read, PyTap logs a warning and doesn't overwrite it until the next reload. If the connection drops, PyTap logs it once and keeps retrying quietly until data flows again.
 
 ---
 
@@ -399,6 +434,7 @@ This repository includes a dev container with Home Assistant pre-installed for l
 pytap/
 ├── custom_components/pytap/     # The HA custom component
 │   ├── __init__.py              # Integration lifecycle, migrations, device removal
+│   ├── binary_sensor.py         # Binary sensor platform (status flags, reading fault)
 │   ├── capture_services.py      # Packet-capture actions (start/stop/status/list/export/delete)
 │   ├── config_flow.py           # Config & options flows
 │   ├── connection.py            # TCP/serial settings validation and serial source
@@ -406,7 +442,8 @@ pytap/
 │   ├── coordinator.py           # Push-based data coordinator
 │   ├── diagnostics.py           # Diagnostics download
 │   ├── energy.py                # Energy accumulation helpers
-│   ├── sensor.py                # Sensor platform (12 per-optimizer types + aggregates)
+│   ├── entity.py                # Shared optimizer device info
+│   ├── sensor.py                # Sensor platform (13 per-optimizer types + aggregates)
 │   ├── services.yaml            # Action descriptions
 │   ├── manifest.json            # Integration metadata
 │   ├── strings.json             # UI strings

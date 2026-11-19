@@ -810,6 +810,9 @@ class Parser:
             dc_dc_duty_cycle=report.duty_cycle,
             rssi=report.rssi,
             timestamp=timestamp,
+            high_output_mode=report.high_output_mode,
+            status_code=report.status_code,
+            low_voltage_flag=report.low_voltage_flag,
         )
         return [event]
 

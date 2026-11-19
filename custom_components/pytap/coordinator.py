@@ -51,7 +51,11 @@ from .const import (
     FRESHNESS_CHECK_INTERVAL_SECONDS,
     INTEGRATION_VERSION,
     LISTENER_STOP_TIMEOUT,
+    MAX_OUTPUT_ABOVE_INPUT_VOLTS,
+    MAX_PLAUSIBLE_TEMPERATURE,
+    MAX_PLAUSIBLE_VOLTAGE,
     MAX_STALE_TIMEOUT,
+    MIN_PLAUSIBLE_TEMPERATURE,
     MIN_STALE_TIMEOUT,
     RECONNECT_DELAY,
     RECONNECT_RETRIES,
@@ -104,17 +108,37 @@ _SNAPSHOT_FIELDS = (
     "temperature",
     "dc_dc_duty_cycle",
     "rssi",
+    "high_output_mode",
+    "status_code",
+    "low_voltage_flag",
     "daily_energy_wh",
     "total_energy_wh",
     "readings_today",
     "daily_reset_date",
     "last_update",
     "topology",
+    "reading_fault",
+    "fault_reasons",
+    "last_fault_at",
 )
 
 
 def _daily_reset_fields(today: str) -> dict[str, Any]:
     return {"daily_energy_wh": 0.0, "readings_today": 0, "daily_reset_date": today}
+
+
+def reading_faults(event: PowerReportEvent) -> list[str]:
+    """Return why a power report is physically impossible (empty if plausible)."""
+    faults: list[str] = []
+    if not 0 <= event.voltage_in <= MAX_PLAUSIBLE_VOLTAGE:
+        faults.append("voltage_in_out_of_range")
+    if not 0 <= event.voltage_out <= MAX_PLAUSIBLE_VOLTAGE:
+        faults.append("voltage_out_out_of_range")
+    if event.voltage_out > event.voltage_in + MAX_OUTPUT_ABOVE_INPUT_VOLTS:
+        faults.append("voltage_out_above_input")
+    if not MIN_PLAUSIBLE_TEMPERATURE <= event.temperature <= MAX_PLAUSIBLE_TEMPERATURE:
+        faults.append("temperature_out_of_range")
+    return faults
 
 
 class BarcodeClaims:
@@ -1326,11 +1350,34 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Get module metadata
         module_meta = self._module_lookup.get(barcode, {})
         previous = self._state["nodes"].get(barcode)
+        now = dt_util.now()
+
+        if faults := reading_faults(event):
+            # Keep the last good measurements and freshness; only flag the fault.
+            node = (
+                dict(previous)
+                if previous is not None
+                else self._build_node_payload(barcode, module_meta, event.node_id)
+            )
+            if not (node.get("reading_fault") and node.get("fault_reasons") == faults):
+                _LOGGER.warning(
+                    "Discarded impossible reading from %s (%s): %.2f V in, %.2f V out, %.1f °C",
+                    barcode,
+                    ", ".join(faults),
+                    event.voltage_in,
+                    event.voltage_out,
+                    event.temperature,
+                )
+            node.update(reading_fault=True, fault_reasons=faults, last_fault_at=now.isoformat())
+            self._state["nodes"][barcode] = node
+            self._mark_changed(barcode)
+            self._schedule_save()
+            return True
+
         peak_power = self.module_peak_power(barcode)
         performance: float | None = None
         if event.power is not None and peak_power > 0:
             performance = (max(event.power, 0.0) / peak_power) * 100.0
-        now = dt_util.now()
 
         acc = self._energy_state.setdefault(
             barcode,
@@ -1365,6 +1412,12 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "temperature": event.temperature,
             "dc_dc_duty_cycle": event.dc_dc_duty_cycle,
             "rssi": event.rssi,
+            "high_output_mode": event.high_output_mode,
+            "status_code": event.status_code,
+            "low_voltage_flag": event.low_voltage_flag,
+            "reading_fault": False,
+            "fault_reasons": [],
+            "last_fault_at": previous.get("last_fault_at") if previous else None,
             "daily_energy_wh": round(acc.daily_energy_wh, 2),
             "total_energy_wh": round(acc.total_energy_wh, 2),
             "readings_today": acc.readings_today,
@@ -1566,7 +1619,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         published = self.data.get("nodes", {})
         for barcode, node in snapshot_nodes.items():
             # No new reading this interval: keep the previously published
-            # averages, but take energy fields from the worker.
+            # averages, but take status/energy/fault fields from the worker.
             if not self._reading_buffers.get(barcode) and (old := published.get(barcode)) is not None:
                 for field in (*_AVERAGED_FIELDS, "performance"):
                     if field in old:
@@ -1640,6 +1693,13 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "temperature": None,
             "dc_dc_duty_cycle": None,
             "rssi": None,
+            "high_output_mode": None,
+            "status_code": None,
+            "low_voltage_flag": None,
+            # Unknown until the first report: no reading yet is not "no fault".
+            "reading_fault": None,
+            "fault_reasons": [],
+            "last_fault_at": None,
             "daily_energy_wh": 0.0,
             "total_energy_wh": 0.0,
             "readings_today": 0,

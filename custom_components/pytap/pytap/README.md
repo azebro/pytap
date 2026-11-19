@@ -95,7 +95,7 @@ print(address.hex(':'))  # "04:c0:5b:30:00:02:be:16"
 
 | Type | `event_type` | Description |
 |------|-------------|-------------|
-| `PowerReportEvent` | `power_report` | Solar optimizer voltage, current, power, temperature, duty cycle, and RSSI |
+| `PowerReportEvent` | `power_report` | Solar optimizer voltage, current, power, temperature, duty cycle, RSSI, and undocumented status bits (`high_output_mode`, `status_code`, `low_voltage_flag`) |
 | `InfrastructureEvent` | `infrastructure` | Gateway/node discovery (addresses, versions, barcodes) |
 | `TopologyEvent` | `topology` | Mesh network topology report |
 | `StringEvent` | `string` | Diagnostic string request/response |

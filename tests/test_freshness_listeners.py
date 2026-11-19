@@ -32,6 +32,9 @@ def _event(barcode: str) -> PowerReportEvent:
         dc_dc_duty_cycle=1.0,
         rssi=99,
         timestamp=dt_util.now(),
+        high_output_mode=True,
+        status_code=0x64,
+        low_voltage_flag=False,
     )
 
 
@@ -102,6 +105,7 @@ async def test_stale_panel_rerenders_only_its_entities_and_aggregates(hass: Home
         return _entity_id(hass, "sensor", f"{DOMAIN}_{entry.entry_id}_{name}_power")
 
     fresh_power, stale_power = uid("power", BARCODE), uid("power", OTHER)
+    stale_flag = _entity_id(hass, "binary_sensor", f"{DOMAIN}_{OTHER}_high_output_mode")
     east, west, installation = aggregate("string_East"), aggregate("string_West"), aggregate("installation")
     before = {eid: hass.states.get(eid).last_reported for eid in (fresh_power, east, installation)}
 
@@ -112,6 +116,7 @@ async def test_stale_panel_rerenders_only_its_entities_and_aggregates(hass: Home
         await hass.async_block_till_done()
 
     assert hass.states.get(stale_power).state == STATE_UNAVAILABLE
+    assert hass.states.get(stale_flag).state == STATE_UNAVAILABLE
     assert hass.states.get(west).state == STATE_UNAVAILABLE
     assert hass.states.get(installation).attributes["reporting_count"] == 1
     assert hass.states.get(installation).last_reported != before[installation]

@@ -40,7 +40,6 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_MODULE_BARCODE,
-    CONF_MODULE_NAME,
     CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
     DEFAULT_PEAK_POWER,
@@ -49,11 +48,12 @@ from .const import (
     STALE_ACTION_ZERO,
 )
 from .coordinator import PyTapConfigEntry, PyTapDataUpdateCoordinator
+from .entity import module_device_info
 
 _LOGGER = logging.getLogger(__name__)
 
 # Electrical readings that report 0 when the stale action is "zero". Others
-# (temperature, duty cycle, RSSI) have no meaningful zero and go
+# (temperature, duty cycle, RSSI, status) have no meaningful zero and go
 # unavailable instead.
 ZERO_WHEN_STALE = frozenset(
     {"power", "voltage_in", "voltage_out", "current_in", "current_out", "performance"}
@@ -84,6 +84,8 @@ class PyTapSensorEntityDescription(SensorEntityDescription):
     # Live readings follow the stale-reading action once a panel stops
     # reporting; energy totals stay available so history is preserved.
     live: bool = True
+    # Skip state writes when nothing changed (avoids a recorder row per report).
+    write_on_change: bool = False
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -195,6 +197,13 @@ SENSOR_DESCRIPTIONS: tuple[PyTapSensorEntityDescription, ...] = (
         value_key="readings_today",
         live=False,
     ),
+    PyTapSensorEntityDescription(
+        key="status_code",
+        translation_key="status_code",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_key="status_code",
+        write_on_change=True,
+    ),
 )
 
 
@@ -286,7 +295,7 @@ async def async_setup_entry(
     """Set up PyTap sensors from a config entry.
 
     Creates sensor entities deterministically from the configured module list.
-    Each configured module gets the full set of 12 sensor entities.
+    Each configured module gets the full set of 13 sensor entities.
     """
     coordinator = entry.runtime_data
     known_barcodes: set[str] = set()
@@ -459,25 +468,17 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
         self.entity_description = description
 
         self._barcode = module_config[CONF_MODULE_BARCODE]
-        self._module_name = module_config[CONF_MODULE_NAME]
         self._module_string = module_config.get(CONF_MODULE_STRING, "")
         self._module_peak_power = coordinator.module_peak_power(self._barcode)
 
         # Unique ID: domain + barcode + sensor key
         self._attr_unique_id = f"{DOMAIN}_{self._barcode}_{description.key}"
-
-        # Device info — groups all sensors for one optimizer under one device
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, self._barcode)},
-            name=f"Tigo TS4 {self._module_name}",
-            manufacturer="Tigo Energy",
-            model="TS4",
-            serial_number=self._barcode,
-        )
+        self._attr_device_info = module_device_info(module_config)
         if description.key == "performance" and self._module_peak_power <= 0:
             # No panel rating: nothing to compute until the user sets one.
             self._attr_entity_registry_enabled_default = False
         self._restored_native_value = False
+        self._last_written: tuple[Any, ...] | None = None
 
     async def async_added_to_hass(self) -> None:
         """Restore last known native value from Home Assistant state cache."""
@@ -564,11 +565,19 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
             elif key == "dc_dc_duty_cycle" and value is not None:
                 # Convert duty cycle from 0.0-1.0 to percentage
                 value = round(value * 100, 2)
+            elif key == "status_code" and value is not None:
+                value = f"0x{value:02X}"
             self._attr_native_value = value
             self._restored_native_value = False
         else:
             if not self._restored_native_value:
                 self._attr_native_value = None
+        if self.entity_description.write_on_change:
+            # Only record a state when it actually changes, not every report.
+            written = (self.available, self._attr_native_value, self.extra_state_attributes)
+            if written == self._last_written:
+                return
+            self._last_written = written
         self.async_write_ha_state()
 
     @property
@@ -581,7 +590,7 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
         if self._module_string:
             attrs["string_group"] = self._module_string
         last_update = node_data.get("last_update")
-        if last_update:
+        if last_update and not self.entity_description.write_on_change:
             attrs["last_update"] = last_update
         gateway_id = node_data.get("gateway_id")
         if gateway_id is not None:
