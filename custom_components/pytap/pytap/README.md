@@ -7,7 +7,7 @@ Passively monitors the RS-485 bus between a Tigo Cloud Connect Advanced (CCA) ga
 ## Requirements
 
 - Python 3.10+
-- No dependencies for core library usage
+- No dependencies for core library usage (`pyserial` only for `SerialSource`)
 
 ## Library Usage
 
@@ -80,16 +80,17 @@ print(address.hex(':'))  # "04:c0:5b:30:00:02:be:16"
 
 | Type | `event_type` | Description |
 |------|-------------|-------------|
-| `PowerReportEvent` | `power_report` | Solar optimizer voltage, current, power, temperature |
+| `PowerReportEvent` | `power_report` | Solar optimizer voltage, current, power, temperature, duty cycle, and RSSI |
 | `InfrastructureEvent` | `infrastructure` | Gateway/node discovery (addresses, versions, barcodes) |
 | `TopologyEvent` | `topology` | Mesh network topology report |
 | `StringEvent` | `string` | Diagnostic string request/response |
 
 ## Running Tests
 
+From the repository root:
+
 ```bash
-pip install -e ".[dev]"
-pytest pytap/tests/ -v
+PYTHONPATH=custom_components/pytap python3 -c 'import pytap, pytest; raise SystemExit(pytest.main(["custom_components/pytap/pytap/tests/", "--import-mode=importlib", "-vv"]))'
 ```
 
 ## Project Structure
@@ -106,6 +107,7 @@ pytap/
 │   ├── source.py      # TcpSource, SerialSource (byte providers)
 │   ├── state.py       # SlotClock, NodeTableBuilder, PersistentState
 │   └── types.py       # Protocol types (GatewayID, Frame, PowerReport, etc.)
+├── docs/              # Architecture, API reference, implementation plan
 └── tests/
     ├── test_api.py
     ├── test_barcode.py

@@ -1,6 +1,6 @@
 # PyTap — Implementation Document
 
-> Version 1.2.0 · Last updated: June 2026
+> Version 1.2.0 · Last updated: November 2026
 
 This document captures the current implementation state of the PyTap Home Assistant custom component. It describes what has been built, how each module works, the design decisions made during development, and the test coverage in place.
 
@@ -16,6 +16,7 @@ For the high-level architecture and design rationale, see [architecture.md](arch
    - [const.py — Constants](#constpy--constants)
    - [manifest.json — Integration Metadata](#manifestjson--integration-metadata)
    - [config_flow.py — Configuration Flow](#config_flowpy--configuration-flow)
+   - [connection.py — Transports](#connectionpy--transports)
    - [coordinator.py — Data Coordinator](#coordinatorpy--data-coordinator)
    - [energy.py — Energy Accumulation](#energypy--energy-accumulation)
    - [sensor.py — Sensor Platform](#sensorpy--sensor-platform)
@@ -34,7 +35,7 @@ For the high-level architecture and design rationale, see [architecture.md](arch
 
 ## Implementation Summary
 
-PyTap is a Home Assistant custom component that passively monitors Tigo TAP solar energy systems. It connects to a Tigo gateway over TCP, parses the proprietary RS-485 bus protocol in real time using an embedded Python parser library, and exposes per-optimizer sensor entities in Home Assistant.
+PyTap is a Home Assistant custom component that passively monitors Tigo TAP solar energy systems. It receives the RS-485 bus byte stream over TCP, a local serial adapter, or an ESPHome serial proxy, parses the protocol in real time using an embedded Python parser library, and exposes per-optimizer entities in Home Assistant.
 
 **Key characteristics of the current implementation:**
 
@@ -42,13 +43,13 @@ PyTap is a Home Assistant custom component that passively monitors Tigo TAP sola
 | --- | --- |
 | Integration type | Hub (`integration_type: "hub"`) |
 | Data delivery | Push-based streaming (`iot_class: "local_push"`); selectable live or time-weighted averaged interval reporting |
-| Entity creation | Deterministic from user-configured barcode list (no auto-discovery) |
-| Config flow | Menu-driven: add modules one at a time via individual form fields |
-| Threading model | Blocking parser in executor thread, bridged to async event loop |
-| Restart behavior | Coordinator restores last node snapshots + energy state; sensors use restore fallback to remain available when historical data exists |
-| External dependencies | None — parser library embedded, stdlib only |
-| Sensor types | 12 per optimizer + aggregate sensors per string and per installation (performance, power, daily energy, total energy) |
-| Test coverage | Expanded integration + parser coverage, including aggregate sensor, performance, and v3→v4 migration behavior |
+| Entity creation | Configured modules at setup; passively discovered modules added at runtime (discovery on by default for new setups, manual mode available) |
+| Config flow | Transport menu (TCP / serial), then menu-driven module list with discovery setting |
+| Threading model | Blocking parser in executor thread with private state; copies published to the async event loop |
+| Stale readings | Configurable action (`hold` default for all entries; opt-in `unavailable`, `zero`) after a 60–600 s timeout (default 120 s) |
+| Restart behavior | Store restores mappings, discovered modules, energy and node snapshots; live readings are shown before the first new report only with `hold` |
+| External dependencies | `serialx` (serial/proxy); parser library embedded |
+| Entity types | Per optimizer: 12 sensors; 4 aggregate sensors per string and per installation; discovery-status sensor when discovery is on |
 
 ---
 
@@ -56,40 +57,32 @@ PyTap is a Home Assistant custom component that passively monitors Tigo TAP sola
 
 ```
 custom_components/pytap/
-├── __init__.py          # ~201 lines — Integration lifecycle (setup, teardown, migration, options listener)
-├── config_flow.py       # 467 lines  — Menu-driven config & options flows
-├── const.py             # ~32 lines  — Domain, config keys, defaults, reporting & energy tuning constants
-├── coordinator.py       # ~1187 lines — Push-based DataUpdateCoordinator (live + averaged interval reporting)
-├── diagnostics.py       # ~46 lines  — Diagnostics download (config entry diagnostics)
-├── energy.py            # ~80 lines  — Pure trapezoidal energy accumulation helpers
-├── manifest.json        # 13 lines   — HA integration metadata
-├── sensor.py            # ~642 lines — 12 sensor entity types, CoordinatorEntity pattern
-├── strings.json         # ~100 lines — UI strings (source of truth)
+├── __init__.py          # Lifecycle (setup, teardown, migration v1→v7, device removal)
+├── config_flow.py       # Config & options flows
+├── connection.py        # Connection validation, serial/proxy source, endpoint comparison
+├── const.py             # Domain, config keys, defaults, reporting/stale/energy constants
+├── coordinator.py       # Push-based DataUpdateCoordinator
+├── diagnostics.py       # Diagnostics download (config entry diagnostics)
+├── energy.py            # Pure trapezoidal energy accumulation helpers
+├── manifest.json        # HA integration metadata
+├── sensor.py            # Per-optimizer, aggregate and discovery-status sensors
+├── strings.json         # UI strings (source of truth)
 ├── translations/
-│   └── en.json          # ~100 lines — English translations (mirrors strings.json)
-└── pytap/               # Embedded protocol parser library (persistence decoupled)
+│   └── en.json          # English translations (mirrors strings.json)
+└── pytap/               # Embedded protocol parser library (no HA imports)
     ├── api.py           # Public API: connect(), create_parser(), parse_bytes()
     └── core/
         ├── parser.py    # Protocol parser: bytes → events
         ├── types.py     # Protocol constants & frame types
         ├── events.py    # Event dataclasses (PowerReportEvent, etc.)
         ├── state.py     # SlotClock, NodeTableBuilder, PersistentState (to_dict/from_dict)
-        ├── source.py    # TcpSource, SerialSource
+        ├── source.py    # TcpSource (with interrupt()), SerialSource
         ├── crc.py       # CRC-16-CCITT
         └── barcode.py   # Tigo barcode encode/decode
 
-tests/
-├── conftest.py                    # 10 lines  — Auto-enable custom integrations fixture
-├── test_config_flow.py            # ~719 lines — config flow & options flow tests
-├── test_coordinator_persistence.py # ~1096 lines — coordinator & persistence tests
-├── test_diagnostics.py            # ~172 lines — 4 diagnostics platform tests
-├── test_energy.py                 # ~170 lines — 13 pure energy accumulation tests
-├── test_migration.py              # ~342 lines — config entry & legacy entity migration tests
-├── test_sensor.py                 # ~1074 lines — sensor platform tests
-└── test_write_interval.py         # ~556 lines — live/interval reporting & time-weighted averaging tests
-
+tests/                   # See Testing
 docs/
-├── architecture.md      # 656 lines — Architecture & design document
+├── architecture.md      # Architecture & design document
 └── implementation.md    # This file
 ```
 
@@ -99,35 +92,40 @@ docs/
 
 ### `const.py` — Constants
 
-Defines all integration-wide constants in a single location:
+Defines all integration-wide constants in a single location, including:
 
 ```python
 DOMAIN = "pytap"
-DEFAULT_PORT = 502                # Tigo gateway default TCP port
 
-# Config entry data keys
-CONF_MODULES = "modules"          # List of module dicts in ConfigEntry.data
-CONF_MODULE_STRING = "string"     # Required string/group label
-CONF_MODULE_NAME = "name"         # User-friendly optimizer name
-CONF_MODULE_BARCODE = "barcode"   # Tigo hardware barcode (stable ID)
-CONF_MODULE_PEAK_POWER = "peak_power"  # Peak panel power in Wp
+# Connection
+DEFAULT_PORT = 502
+DEFAULT_BAUD_RATE = 38400
+CONNECTION_TIMEOUT = 10           # Open/connect bound (s)
+SERIAL_READ_TIMEOUT = 1           # Idle serial read bound (s)
+LISTENER_STOP_TIMEOUT = 20        # Bound for stopping the listener (s)
 
-# Defaults
-DEFAULT_PEAK_POWER = 455          # Wp (watts peak) — STC rating
+# Modules
+DEFAULT_PEAK_POWER = 455          # Wp for manually added modules
+DEFAULT_DISCOVERED_STRING = "Discovered"
 
 # Reporting mode
-CONF_LIVE_REPORTING = "live_reporting"   # Push every reading vs. averaged interval
 DEFAULT_LIVE_REPORTING = True
-CONF_WRITE_INTERVAL = "write_interval"   # Seconds between averaged pushes
-DEFAULT_WRITE_INTERVAL = 30
+DEFAULT_WRITE_INTERVAL = 30       # 5–300 s
 
-# Reconnection tuning
-RECONNECT_TIMEOUT = 60            # Seconds of silence → reconnect
-RECONNECT_DELAY = 5               # Pause between reconnection attempts
-RECONNECT_RETRIES = 0             # 0 = infinite retries
+# Stale readings
+CONF_STALE_ACTION = "stale_action"     # "hold" | "unavailable" | "zero"
+CONF_STALE_TIMEOUT = "stale_timeout"
+DEFAULT_STALE_ACTION = "hold"
+DEFAULT_STALE_TIMEOUT = 120            # 60–600 s
+FRESHNESS_CHECK_INTERVAL_SECONDS = 5
+
+# Reconnection / energy
+RECONNECT_TIMEOUT = 60
+RECONNECT_DELAY = 5
+RECONNECT_RETRIES = 0             # 0 = infinite
+ENERGY_GAP_THRESHOLD_SECONDS = 120
+ENERGY_LOW_POWER_THRESHOLD_W = 1.0
 ```
-
-These constants are imported by every other module in the integration.
 
 ---
 
@@ -137,487 +135,277 @@ These constants are imported by every other module in the integration.
 {
   "domain": "pytap",
   "name": "PyTap",
+  "after_dependencies": ["esphome"],
   "codeowners": ["@azebro"],
   "config_flow": true,
+  "dependencies": ["usb"],
   "documentation": "https://github.com/azebro/pytap",
   "integration_type": "hub",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/azebro/pytap/issues",
-  "requirements": [],
+  "requirements": ["serialx>=1.15.1"],
   "version": "1.2.0"
 }
 ```
 
-Key choices:
-- **`integration_type: "hub"`** — One gateway entry manages multiple downstream optimizer devices.
-- **`iot_class: "local_push"`** — Data streams from the gateway in real time; no polling interval.
-- **`requirements: []`** — The pytap parser library is embedded, not installed from PyPI.
+`hacs.json` requires Home Assistant 2026.11.0.
 
 ---
 
 ### `config_flow.py` — Configuration Flow
 
-**467 lines** implementing a menu-driven config flow and a full options flow.
-
 #### Config Flow Steps
 
 ```
-┌─────────────┐     ┌──────────────────┐     ┌──────────────┐
-│  Step: user │────►│ Step: modules_   │────►│ Step: add_   │
-│  (host/port)│     │ menu (menu)      │◄────│ module (form)│
-└─────────────┘     │                  │     └──────────────┘
-                    │  ► Add module    │
-                    │  ► Finish setup  │──── CREATE_ENTRY
-                    └──────────────────┘
+┌─────────────┐   ┌──────────────┐   ┌──────────────────┐   ┌──────────────┐
+│ Step: user  │──►│ tcp / serial │──►│ Step: modules_   │──►│ add_module / │
+│ (menu)      │   │ (form)       │   │ menu (menu)      │◄──│ discovery    │
+└─────────────┘   └──────────────┘   │  ► Add module    │   └──────────────┘
+                                     │  ► Discovery     │
+                                     │  ► Finish setup  │── CREATE_ENTRY
+                                     └──────────────────┘
 ```
 
-1. **`async_step_user`** — Collects `host` (required) and `port` (default 502). Sets a unique ID of `host:port` and aborts if already configured. Performs a non-blocking TCP connection test — warns on failure but always proceeds to the modules menu.
-
-2. **`async_step_modules_menu`** — Shows a menu with two options: "Add a module" and "Finish setup". Displays the current module list via `_modules_description()`. If the user selects "Finish" with no modules added, the menu re-displays (guard against empty config).
-
-3. **`async_step_add_module`** — Form with three fields:
-   - **String group** (`string`) — Optional grouping label (e.g., "A", "East").
-   - **Name** (`name`) — Required user-friendly label (e.g., "Panel_01").
-   - **Barcode** (`barcode`) — Required Tigo hardware barcode.
-   - **Peak power** (`peak_power`) — Optional peak panel power in Wp (default: 455). Used to calculate performance percentage.
-
-   Validation:
-   - Name must be non-empty → `missing_name` error on the name field.
-   - Barcode must be non-empty → `missing_barcode` error on the barcode field.
-   - Barcode must match pattern `^[0-9A-Fa-f]-[0-9A-Fa-f]{1,7}[A-Za-z]$` → `invalid_barcode` error.
-   - Barcode must not duplicate an already-added module → `duplicate_barcode` error.
-   - On success, appends the module dict and returns to the modules menu.
-
-4. **`async_step_finish`** — Creates the config entry with `{host, port, modules: [...]}`.
+1. **`async_step_user`** — Menu: TCP gateway or Serial / Home Assistant proxy.
+2. **`async_step_tcp` / `async_step_serial`** — `normalize_connection()` validates the form; `connection_errors()` then rejects a serial port used by another PyTap entry (`serial_port_in_use`, symlinks resolved) or a serial port / TCP host and port still held by a parked coordinator (`serial_port_in_use` / `connection_in_use`), and probes the endpoint in the executor (a path that doesn't resolve to a character device under `/dev/` gives `invalid_serial_port`). A failed probe shows `cannot_connect`; the same settings submitted again are accepted. Sets a random UUID as unique ID.
+3. **`async_step_modules_menu`** — Add a module, Module discovery settings, Finish setup; shows the module list and discovery mode.
+4. **`async_step_discovery`** — `auto_discovery` toggle (default on).
+5. **`async_step_add_module`** — `string`, `name`, `barcode` (required), `peak_power` (1–1000, default 455). Errors: `missing_string`, `missing_name`, `missing_barcode`, `invalid_barcode` (`^[0-9A-Fa-f]-[0-9A-Fa-f]{1,7}[A-Za-z]$`), `duplicate_barcode`.
+6. **`async_step_finish`** — In manual mode with no modules, shows the add-module form with `no_modules`. Re-checks the serial claim, then creates the entry with connection settings, `modules`, `auto_discovery` and `excluded_barcodes: []`.
 
 #### Options Flow Steps
 
-```
-┌──────────────┐     ┌──────────────┐
-│  Step: init  │────►│ add_module   │
-│  (menu)      │◄────│ (form)       │
-│              │     └──────────────┘
-│  ► Add       │     ┌──────────────┐
-│  ► Remove    │────►│ remove_module│
-│  ► Save      │◄────│ (dropdown)   │
-└──────────────┘     └──────────────┘
-       │
-       ▼ (done)
-  UPDATE_ENTRY
-```
-
-- **`async_step_init`** — Menu with "Change connection", "Change reporting settings", "Add a module", "Remove a module", "Save and close".
-- **`async_step_change_connection`** — Host/port form to update the gateway connection (advisory connection test, same as setup).
-- **`async_step_change_reporting`** — "Reporting Settings" form with a single **Live reporting** checkbox (default on). When left on, the integration clears any stored `write_interval` and returns to the menu. When turned **off**, the flow advances to `async_step_set_interval`. The interval field is deliberately *not* shown here because Home Assistant's static forms cannot grey out a field reactively.
-- **`async_step_set_interval`** — Reached only when live reporting is off. Shows the **Reporting interval** field (`vol.Range(min=MIN_WRITE_INTERVAL, max=MAX_WRITE_INTERVAL)` = 5–300, default 30 s), stores `live_reporting=False` + `write_interval`, and returns to the menu.
-- **`async_step_add_module`** — Same form and validation as the config flow version.
-- **`async_step_remove_module`** — Dropdown (`vol.In`) built dynamically from the current module list showing `"Name (Barcode)"` labels. Selecting one removes it and returns to the menu.
-- **"Save and close"** — Updates `ConfigEntry.data` with the modified module list, triggering an integration reload.
-
-#### Helper Functions
-
-- **`validate_barcode(barcode)`** — Regex validation against `_BARCODE_PATTERN`.
-- **`validate_connection(hass, data)`** — Runs `TcpSource.connect()` in the executor. Used for advisory connection testing only.
-- **`_modules_description(modules)`** — Builds a Markdown-formatted summary of the module list for display in menu descriptions.
+- **`async_step_init`** — Menu: change connection, change reporting, change stale reading behaviour, change discovery, add, edit, remove, Save and close. The module list is read from the running coordinator (including discovered modules).
+- **`async_step_change_connection`** → **`change_tcp` / `change_serial`** — Same validation as setup; the currently used serial port is not probed. Saved immediately (title updated), which reloads the entry; an entry in setup error/retry (e.g. after invalid saved settings) is reloaded explicitly, since its update listener was never registered.
+- **`async_step_change_reporting`** — Live reporting checkbox. On: clears `write_interval`, saves. Off: continues to **`async_step_set_interval`** (5–300 s).
+- **`async_step_change_stale`** — `stale_action` dropdown (translated selector) and `stale_timeout` (60–600 s). Saved immediately.
+- **`async_step_change_discovery`** — Toggle, applied on Save and close.
+- **`async_step_add_module`** — Same as setup.
+- **`async_step_edit_module`** → **`async_step_module_details`** — Name, string, `peak_power` (0–1000; 0 = unknown). The barcode can't change.
+- **`async_step_remove_module`** — Dropdown; adds the barcode to `excluded_barcodes`.
+- **`async_step_done`** — Merges modules discovered while the flow was open (unless removed/excluded), validates manual mode isn't empty, and writes `modules`, `auto_discovery`, `excluded_barcodes`.
 
 #### Error Classes
 
-Four custom `HomeAssistantError` subclasses: `CannotConnect`, `InvalidAuth`, `InvalidModuleFormat`, `InvalidBarcodeFormat`.
+`InvalidModuleFormat`, `InvalidBarcodeFormat` (`HomeAssistantError` subclasses). Connection errors use `connection.InvalidConnectionSettings(field, error)`.
+
+---
+
+### `connection.py` — Transports
+
+- **`normalize_connection(data)`** — TCP: non-empty host, port 1–65535. Serial: no control characters; local endpoints are normalised (`posixpath.normpath`, which is what gets saved) and must be under `/dev/` but not `/dev/fd`, `/dev/std*`, `/dev/shm` or `/dev/mqueue` (`is_device_path()`); URLs must be `esphome-hass://esphome/<port>?<filters>` using only known identity filters (no credentials or protocol overrides); baud 1–4000000.
+- **`check_device_node(endpoint)`** — Blocking; called by `open_source()` before opening a local path. Its `realpath` must pass `is_device_path()` and be a character device.
+- **`serial_endpoint_key()` / `resolved_endpoint_key()`** — Normalise endpoints for comparison; the latter resolves symlinks (blocking, run in the executor).
+- **`SerialProxySource`** — Wraps `serialx.async_serial_for_url` (8N1, no flow control, DTR/RTS left undefined). Its blocking `connect()/read()/close()` submit bounded coroutines to HA's loop; an idle read returns `b""` after `SERIAL_READ_TIMEOUT`, EOF raises `ConnectionResetError`.
+- **`open_source(loop, data)`** — Opens a `SerialProxySource` or `TcpSource`; closes it if `connect()` fails.
+- **`connection_title()`** — `PyTap (<host>)`, `PyTap (Home Assistant serial proxy)` or `PyTap (Serial)`.
 
 ---
 
 ### `coordinator.py` — Data Coordinator
 
-**~1187 lines** implementing `PyTapDataUpdateCoordinator`, the core runtime engine.
-
 #### Class: `PyTapDataUpdateCoordinator`
 
-Inherits from `DataUpdateCoordinator[dict[str, Any]]`. Despite using the coordinator pattern, this is a **push-based** integration — `_async_update_data()` simply returns the current data dict without polling.
-
-Persistence now includes both `energy_data` and `node_snapshots`:
-
-- `energy_data` preserves accumulator continuity for `daily_energy`, `total_energy`, and `readings_today`.
-- `node_snapshots` preserves the latest known measurement payload (power/voltage/current/temperature/duty/rssi/performance and `last_update`) for configured barcodes.
-
-At startup, the coordinator restores snapshot data first and overlays normalized energy accumulator values, so entities can publish their last known readings immediately while waiting for new live frames.
+Inherits from `DataUpdateCoordinator[dict[str, Any]]`. This is a **push-based** integration — `_async_update_data()` just returns the current data.
 
 #### Initialization
 
+Reads from `ConfigEntry.data`: connection settings (`normalize_connection`, may raise `InvalidConnectionSettings`), `modules`, `auto_discovery` (default `False` if missing), `excluded_barcodes`, `live_reporting`, `write_interval`, `stale_action` (missing or invalid values fall back to `hold`) and `stale_timeout` (clamped to 60–600). Builds the barcode allowlist and module lookup, and initialises:
+
 ```python
-def __init__(self, hass, entry):
-    # Extract config
-    self._host = entry.data[CONF_HOST]
-    self._port = entry.data.get(CONF_PORT, DEFAULT_PORT)
-    self._modules = entry.data.get(CONF_MODULES, [])
-
-    # Build barcode allowlist and lookup table
-    self._configured_barcodes = {m[CONF_MODULE_BARCODE] for m in self._modules ...}
-    self._module_lookup = {m[CONF_MODULE_BARCODE]: m for m in self._modules ...}
-
-    # Barcode ↔ node_id mapping (learned at runtime)
-    self._barcode_to_node = {}
-    self._node_to_barcode = {}
-
-    # Discovery tracking for unconfigured barcodes
-    self._discovered_barcodes = set()
-
-    # Initialize data structure
-    self.data = {
-        "gateways": {},
-        "nodes": {},        # barcode → {power, voltage_in, ...}
-        "counters": {},     # parser frame counters
-        "discovered_barcodes": [],
-    }
+self._state = {                # owned by the listener thread
+    "gateways": {},
+    "nodes": {},               # barcode → node dict
+    "counters": {},            # parser counters
+    "discovered_barcodes": [],
+}
+self.data = self._snapshot()   # what Home Assistant reads
 ```
+
+#### Worker State and Publishing
+
+`_state` and `_energy_state` are guarded by `_state_lock` (`threading.RLock`). `_snapshot()` copies every node dict and adds a `sequence` number; `_publish(snapshot)` schedules `async_set_updated_data(snapshot, changed)` with `call_soon_threadsafe`. `changed` holds the barcodes marked by `_mark_changed()` since the last publish, or `None` after `_mark_full_update()` (module admitted, gateways or node mappings changed). With a set, only the callbacks registered via `async_add_data_listener(barcodes, callback)` for those barcodes run; with `None`, every coordinator listener runs (the platforms add new entities from theirs). A snapshot older than the last applied one (taken before a midnight reset) is dropped and its changes are notified with the next one. HA-side code (entities, diagnostics, midnight reset) only reads or replaces `self.data`.
 
 #### Listener Lifecycle
 
 ```
 async_start_listener()
-    ├── creates background task → _async_listen()
-    │                                  └── executor job → _listen()
-    └── schedules midnight reset timer → _schedule_midnight_reset()
+    ├── _async_load_coordinator_state()     (Store → _state, then self.data = snapshot)
+    ├── background task → _async_listen()  └── executor job → _listen()
+    ├── _schedule_midnight_reset()          (async_track_time_change 00:00:00)
+    └── freshness timer                     (async_track_time_interval, 5 s)
 
-async_stop_listener()
-    └── sets _stop_event (threading.Event)
-    └── cancels midnight reset timer
-    └── acquires _source_lock, closes _source (unblocks socket.read)
-    └── awaits task with asyncio.timeout(5)
+async_stop_listener(*, discard_state=False) → bool   (bounded by LISTENER_STOP_TIMEOUT)
+    ├── set _stop_event, _interrupt_source()
+    ├── cancel midnight, freshness and save timers (even if the stop then times out)
+    └── _async_stop_listener_locked()
+          ├── await listener task and worker future (shielded)
+          └── flush unsaved Store changes (shielded; skipped once saves are blocked)
 ```
 
-- **`_stop_event`** — A `threading.Event` (not `asyncio.Event`) so it can be set from the main thread and checked from the executor thread without cross-loop issues.
-
-- **`_source_lock`** — A `threading.Lock` protecting `_source` access. Both `_listen()` (executor) and `async_stop_listener()` (main loop via executor) need to touch `_source`; the lock prevents races.
-
-- **`_async_listen()`** — Async wrapper that calls `hass.async_add_executor_job(self._listen)`. This is necessary because `async_create_background_task` expects a coroutine, not a Future.
-
-- **`_listen()`** — Blocking loop running in the executor thread:
-  1. Creates a `Parser` and connects a `TcpSource` (under `_source_lock`).
-  2. Checks `_stop_event` immediately after connect — if set during connect, exits cleanly.
-  3. Reads 4096-byte chunks in a loop.
-  4. Feeds bytes to the parser, getting back a list of `Event` objects.
-  5. For **each event individually**, calls `_process_event()`. When data changes, the update is delivered to HA according to the configured reporting mode (see [Reporting Modes](#reporting-modes) below): in **live** mode each change is pushed immediately via `hass.loop.call_soon_threadsafe(self.async_set_updated_data, ...)`; in **averaged interval** mode changes are buffered and flushed once per `write_interval`.
-  6. Monitors for silence timeouts (`RECONNECT_TIMEOUT`).
-  7. On error/timeout, closes the source (under `_source_lock`), waits `RECONNECT_DELAY` seconds, and retries.
-  8. Sleep during reconnect delay uses 0.1s increments checking `_stop_event` for fast shutdown.
+- **`_listen()`** — For each connection: new parser via `create_parser(persistent_state=...)`, `open_source()`, then read 4096-byte chunks. Each chunk is fed to the parser, and the resulting events processed under `_state_lock`. Live mode publishes at once (`_push_live_update`); averaged mode calls `_maybe_flush_interval` on data and on idle reads. After `RECONNECT_TIMEOUT` of silence it reconnects. Errors and silence reconnects are logged once per outage (type + errno, at WARNING), later attempts at DEBUG; the outage ends only when data is received again. A read interrupted by stop isn't logged as a connection error. The `finally` block flushes pending data and closes the source. The reconnect delay uses `_stop_event.wait()`.
+- **`_interrupt_source()`** — Calls the source's `interrupt()` if present (`TcpSource` shuts the socket down to wake `recv`).
+- A stop that times out returns `False`; `__init__.py` parks the coordinator so the next setup waits for it, and `async_on_listener_exit()` lets it finish its own stop once the worker exits. `discard_state=True` (entry removal) blocks every later Store write.
 
 #### Event Processing
 
-```python
-def _process_event(self, event) -> bool:
-    """Returns True if data was changed."""
-    if isinstance(event, PowerReportEvent):
-        return self._handle_power_report(event)
-    elif isinstance(event, InfrastructureEvent):
-        return self._handle_infrastructure(event)
-    elif isinstance(event, TopologyEvent):
-        return self._handle_topology(event)
-    elif isinstance(event, StringEvent):
-        # Logged at DEBUG, not stored
-    return False
-```
+`_process_event()` dispatches `PowerReportEvent`, `InfrastructureEvent`, `TopologyEvent` (attached to known nodes) and `StringEvent` (DEBUG log) and returns whether data changed.
 
 **`_handle_power_report(event) → bool`:**
-1. Resolves `barcode` — directly from event, or via `_node_to_barcode` mapping.
-2. If barcode is unknown, logs at DEBUG and returns `False`.
-3. If barcode is not in `_configured_barcodes` (allowlist), logs discovery at INFO and returns `False`.
-4. Upserts into `self.data["nodes"][barcode]` with all power fields plus `last_update` timestamp. Returns `True`.
-
-The data dict stored per node:
+1. Resolves the barcode from the event, or from `_node_to_barcode` once this session has received a node table; otherwise counts a pending report and returns `False`.
+2. Unconfigured barcode: recorded in `discovered_barcodes` (logged once) and passed to `_add_discovered_module()`; if not admitted, returns.
+3. Performance (0 W floor, `None` while `peak_power` is 0), `accumulate_energy()`, then replace the node:
 
 ```python
 {
-    "gateway_id": int,
-    "node_id": int,
-    "barcode": str,
-    "name": str,           # from user config
-    "string": str,         # from user config
-    "voltage_in": float,
-    "voltage_out": float,
-    "current_in": float,
-    "current_out": float,
-    "power": float,
-    "peak_power": int,
-    "performance": float,     # (power / peak_power) × 100
-    "temperature": float,
-    "dc_dc_duty_cycle": float,  # 0.0–1.0
+    "gateway_id": int, "node_id": int, "barcode": str,
+    "name": str, "string": str, "peak_power": int,
+    "voltage_in": float, "voltage_out": float,
+    "current_in": float, "current_out": float,
+    "power": float, "performance": float | None,
+    "temperature": float, "dc_dc_duty_cycle": float,  # 0.0–1.0
     "rssi": int,
-    "daily_energy_wh": float,   # accumulated daily Wh (trapezoidal)
-    "total_energy_wh": float,   # lifetime accumulated Wh
-    "readings_today": int,      # power-report count since midnight
-    "daily_reset_date": str,    # ISO date of last daily reset
-    "last_update": str,         # ISO 8601
+    "daily_energy_wh": float, "total_energy_wh": float,
+    "readings_today": int, "daily_reset_date": str,
+    "last_update": str,          # ISO 8601
+    "report_monotonic": float,   # session-only
+    # "topology": {...}          # kept from the previous node if present
 }
 ```
 
-**`_handle_infrastructure(event) → bool`:**
-- Replaces `self.data["gateways"]` with the event's gateway dict.
-- Rebuilds the `barcode ↔ node_id` bidirectional mapping from scratch.
-- Logs newly discovered unconfigured barcodes at INFO level.
-- Differentiates the first infrastructure event in a session:
-  - If the event has no barcodes (node table not yet received), logs an INFO explaining that resolution will activate once the gateway sends the full node table.
-  - If the event has barcodes, logs a WARNING with the match count.
-- On subsequent events with changed mappings, logs updated match counts and lists any configured barcodes still missing from the node table.
-- Triggers a persist (via `_schedule_save`) when mappings change **or** when new unconfigured barcodes are discovered.
-- Returns `True` if gateway data changed.
+In averaged mode the `_AVERAGED_FIELDS` are appended to `_reading_buffers[barcode]`.
 
-**`_handle_topology(event) → bool`:**
-- Attaches topology data to the matching node (by resolving `node_id` → barcode).
-- Returns `True` if data was attached to a configured node.
+**`_handle_infrastructure(event) → bool`:** replaces `gateways`; with a node table, rebuilds `barcode ↔ node_id` from scratch, logs/admits unconfigured barcodes, resets the pending counter, logs configured barcodes missing from the table, and saves on change. Gateway-only events keep existing mappings.
+
+#### Module Discovery
+
+`_add_discovered_module(barcode, node_id, restored)` returns `False` for configured or excluded barcodes, when discovery is off (unless restoring), or when `BarcodeClaims.claim()` fails because another PyTap entry claimed the barcode (logged once). Claims live in `hass.data` (`barcode_claims()`), are atomic across worker threads, are taken for configured barcodes when the coordinator is created (a duplicate logs a warning) and are released by `release_barcode_claims()` once the listener has stopped or the entry is removed. Otherwise it adds `{"name": "Optimizer <barcode>", "string": "Discovered", "peak_power": 0}` (restored metadata overrides), a baseline node, marks a full update and schedules a save. Entities are created by the platform listeners on the next update.
 
 #### Reporting Modes
 
-The coordinator reads `live_reporting` (default `True`) and `write_interval` (default 30 s) from `ConfigEntry.data` at init and chooses how processed events reach Home Assistant:
+- **Live (`live_reporting = True`)** — `_push_live_update()` publishes a snapshot whenever events changed data.
+- **Averaged (`live_reporting = False`)** — `_build_averaged_snapshot(flush_ts)` computes a time-weighted average per field from the buffer, recomputes `performance`, and keeps previously published averages for nodes without new readings (taking energy fields from the worker). The buffer is cleared after each flush.
 
-- **Live mode (`live_reporting = True`)** — Each event that changes node data triggers an immediate `async_set_updated_data` push. Sub-second latency; best for most installations.
-- **Averaged interval mode (`live_reporting = False`)** — `_handle_power_report` records each reading into `_reading_buffers[barcode]` as a `(monotonic_ts, fields)` tuple. Once per `write_interval` seconds the listener calls `_build_averaged_snapshot(flush_ts)`, which computes a **time-weighted average** of each field in `_AVERAGED_FIELDS` (weighting each reading by the time until the next reading, or until the flush for the last one), recomputes `performance` from the averaged power, pushes the snapshot, and clears the buffer.
+#### Stale Readings
 
-`_build_averaged_snapshot()` copies node dicts instead of mutating `self.data["nodes"]`, so the raw latest values are preserved for persistence while HA receives the averaged values. Energy accumulation (`accumulate_energy`) always runs on the raw reading, independent of reporting mode.
+- `seconds_since_report(barcode)` — from the published node's `report_monotonic`.
+- `is_reporting(barcode)` — `age < stale_timeout` (+ `write_interval` in averaged mode).
+- `_async_check_freshness()` — every 5 s; computes the barcodes whose reporting state changed since the last publish or check and calls only the callbacks registered for them via `async_add_freshness_listener(barcodes, callback)` (each registration at most once). Live per-optimizer sensors register their own barcode; aggregates register their members and re-register in `set_barcodes()` when membership changes. Energy-only per-optimizer sensors don't register. (Data listeners, see above, are registered by every per-optimizer entity and aggregate.)
+- `stale_action` / `stale_timeout` properties are read by the entity platforms.
 
-#### Discovery Logging
+#### Midnight Reset
 
-When an unconfigured barcode is seen for the first time, the coordinator logs:
-
-```
-INFO: Discovered unconfigured Tigo optimizer barcode: A-9999999Z
-      (gateway=1, node=55). Add it to your PyTap module list to start tracking.
-```
-
-The `_discovered_barcodes` set ensures each barcode is logged only once. The sorted list is also exposed in `self.data["discovered_barcodes"]` for potential diagnostics use.
-
-#### Live Reconfiguration
-
-```python
-def reload_modules(self, modules):
-    """Rebuild allowlist and lookup from updated module config."""
-    self._configured_barcodes = {m[CONF_MODULE_BARCODE] for m in modules ...}
-    self._module_lookup = {m[CONF_MODULE_BARCODE]: m for m in modules ...}
-```
-
-Called when the options flow updates the module list. After updating the allowlist, checks whether any newly-configured barcodes already have a known node mapping from previous infrastructure events. If so, creates a placeholder entry in `self.data["nodes"]` with module metadata (name, string group) so sensor entities can bind immediately without waiting for the next power report. Logs which barcodes were resolved from saved state and which are still pending.
+`_perform_midnight_reset()` zeroes `daily_energy_wh` / `readings_today` in the accumulators and worker nodes (skipping those already reset today), saves, and publishes a copy of `self.data` with only those daily fields reset, so averaged values aren't replaced by raw ones.
 
 #### Persistence
 
-All persistent state is consolidated into a single HA Store, written via `homeassistant.helpers.storage.Store` (version 2) as `<config>/.storage/pytap_<entry_id>_coordinator`. The store contains:
+One HA Store (`pytap_<entry_id>_coordinator`, version 2; `_MigratingStore` accepts v1 data as-is) containing `auto_modules`, `barcode_to_node`, `discovered_barcodes`, `parser_state`, `energy_data` and `node_snapshots` (`_SNAPSHOT_FIELDS`: measurements, energy, `last_update`, `topology`). On load, discovered modules are restored before snapshots; energy accumulators from a previous day are reset; performance is recomputed from the current rating. `_schedule_save()` (thread-safe; posts to the loop only for the first change of each save cycle) writes at most once per 10 s; stop flushes pending changes. Serialisation happens under `_state_lock`. If `async_load()` raises, `_save_blocked` is set (WARNING), so nothing is written for the coordinator's lifetime and setup skips orphan cleanup; `store_loaded` is then `False`. `store_restored` is `True` only when saved data was actually present (a corrupt file renamed by HA loads as `None`).
 
-- **`barcode_to_node`** — Barcode↔node_id mappings learned from infrastructure events.
-- **`discovered_barcodes`** — Set of unconfigured barcodes seen on the bus.
-- **`parser_state`** — Serialised parser infrastructure state (gateway identities, versions, node tables) via `PersistentState.to_dict()`.
-- **`energy_data`** — Per-barcode accumulator state (`daily_energy_wh`, `daily_reset_date`, `total_energy_wh`, `readings_today`, `last_power_w`, `last_reading_ts`).
-
-On startup, coordinator state is loaded from the HA Store (via `_async_load_coordinator_state`), including the parser's `PersistentState` which is deserialized via `PersistentState.from_dict()`. The parser receives a shared `PersistentState` object and mutates it in memory — the parser never performs file I/O. The coordinator schedules debounced saves (10-second delay) when mappings or infrastructure change, and flushes immediately on shutdown.
-
-The `_init_mappings_from_parser` method pre-populates barcode↔node mappings from the parser's infrastructure on reconnect. Parser mappings take precedence when non-empty; when the parser state has no node table (first run), the coordinator-saved mappings are preserved as fallback.
+`_init_mappings_from_parser()` pre-populates mappings from the parser's node tables on each (re)connect; saved coordinator mappings are kept when the parser has none.
 
 ---
 
 ### `energy.py` — Energy Accumulation
 
-Pure-logic module implementing trapezoidal energy integration. Intentionally HA-independent so it can be unit-tested without coordinator or event-loop setup.
+Pure-logic module implementing trapezoidal energy integration, HA-independent.
 
-**`EnergyAccumulator` dataclass** — Per-barcode mutable state: `daily_energy_wh`, `total_energy_wh`, `daily_reset_date`, `last_power_w`, `last_reading_ts`, `readings_today`.
-
-**`EnergyUpdateResult` dataclass** — Immutable result metadata per accumulation step: `increment_wh`, `discarded_gap_during_production`.
+**`EnergyAccumulator`** — `daily_energy_wh`, `total_energy_wh`, `daily_reset_date`, `last_power_w`, `last_reading_ts`, `readings_today`.
 
 **`accumulate_energy(acc, power, now, …) → EnergyUpdateResult`:**
 1. Clamps power to non-negative.
-2. Resets `daily_energy_wh` and `readings_today` to zero on date change.
-3. If a previous reading exists and the interval is within the gap threshold, applies trapezoidal integration: `((prev_power + power) / 2) × (Δt / 3600)`.
-4. Flags intervals exceeding the gap threshold during production as discarded.
-5. Unconditionally increments `readings_today` and updates `last_power_w` / `last_reading_ts`.
+2. Resets daily values on date change.
+3. Integrates `((prev + power) / 2) × (Δt / 3600)` when `0 < Δt ≤ gap_threshold`.
+4. Flags longer gaps during production as discarded.
+5. Increments `readings_today` and updates `last_power_w` / `last_reading_ts`.
 
-The coordinator calls `accumulate_energy()` from `_handle_power_report` and merges the result into the node data dict.
-
-#### Proactive midnight reset
-
-In addition to the lazy date-check inside `accumulate_energy()`, the coordinator runs a **proactive midnight reset timer** (`_schedule_midnight_reset` / `_perform_midnight_reset`). This ensures daily sensors (`daily_energy`, `readings_today`) zero at exactly midnight local time, even when no power reports arrive overnight (typical for solar installations). The timer uses `hass.loop.call_later()` and reschedules itself after each reset.
+The coordinator calls it for every tracked report. Daily values are also reset proactively at local midnight (see above).
 
 ---
 
 ### `sensor.py` — Sensor Platform
 
-Implements per-optimizer sensors and aggregate sensors using the `CoordinatorEntity` pattern.
-
 #### Sensor Descriptions
 
-```python
-SENSOR_DESCRIPTIONS = (
-    PyTapSensorEntityDescription(key="performance",       value_key="performance",
-        unit="%",                          state_class=MEASUREMENT),
-    PyTapSensorEntityDescription(key="power",             value_key="power",
-        unit=UnitOfPower.WATT,            device_class=POWER),
-    PyTapSensorEntityDescription(key="voltage_in",        value_key="voltage_in",
-        unit=UnitOfElectricPotential.VOLT, device_class=VOLTAGE),
-    PyTapSensorEntityDescription(key="voltage_out",       value_key="voltage_out",
-        unit=UnitOfElectricPotential.VOLT, device_class=VOLTAGE),
-    PyTapSensorEntityDescription(key="current_in",        value_key="current_in",
-        unit=UnitOfElectricCurrent.AMPERE, device_class=CURRENT),
-    PyTapSensorEntityDescription(key="current_out",       value_key="current_out",
-        unit=UnitOfElectricCurrent.AMPERE, device_class=CURRENT),
-    PyTapSensorEntityDescription(key="temperature",       value_key="temperature",
-        unit=UnitOfTemperature.CELSIUS,    device_class=TEMPERATURE),
-    PyTapSensorEntityDescription(key="dc_dc_duty_cycle",  value_key="dc_dc_duty_cycle",
-        unit="%",                          state_class=MEASUREMENT),
-    PyTapSensorEntityDescription(key="rssi",              value_key="rssi",
-        unit=SIGNAL_STRENGTH_DECIBELS_MILLIWATT, device_class=SIGNAL_STRENGTH),
-    PyTapSensorEntityDescription(key="daily_energy",      value_key="daily_energy_wh",
-        unit=UnitOfEnergy.WATT_HOUR,       device_class=ENERGY, state_class=TOTAL),
-    PyTapSensorEntityDescription(key="total_energy",      value_key="total_energy_wh",
-        unit=UnitOfEnergy.WATT_HOUR,       device_class=ENERGY, state_class=TOTAL_INCREASING),
-    PyTapSensorEntityDescription(key="readings_today",    value_key="readings_today",
-        state_class=TOTAL, entity_category=DIAGNOSTIC),
-)
-```
-
-Power/electrical sensors use `SensorStateClass.MEASUREMENT`; energy sensors use `TOTAL`/`TOTAL_INCREASING` for HA long-term statistics and energy dashboard compatibility.
+`PyTapSensorEntityDescription` adds `value_key` and `live` (follows the stale action; `False` for energy and readings today). Keys: `performance`, `power`, `voltage_in`, `voltage_out`, `current_in`, `current_out`, `temperature`, `dc_dc_duty_cycle`, `rssi`, `daily_energy` (`TOTAL`), `total_energy` (`TOTAL_INCREASING`), `readings_today` (diagnostic, `TOTAL`). Aggregate descriptions: `performance`, `power`, `daily_energy`, `total_energy` for strings and the installation.
 
 #### Entity Creation
 
-`async_setup_entry()` creates entities **deterministically** from the config:
+`async_setup_entry()` registers `add_discovered_entities` as a coordinator listener and calls it once. It adds the 12 sensors for each barcode not yet known, creates string aggregates for new strings and installation aggregates once any barcode exists, and updates aggregate membership (`set_barcodes`) on every change. `PyTapDiscoverySensor` (`module_discovery`) is added when `auto_discovery` is on. For two modules on two strings: 24 optimizer sensors + 8 string + 4 installation sensors (+1 discovery sensor).
 
-```python
-for module_config in modules:
-    barcode = module_config.get(CONF_MODULE_BARCODE, "")
-    if not barcode:
-        continue  # Skip modules without barcode
-    for description in SENSOR_DESCRIPTIONS:
-        entities.append(PyTapSensor(coordinator, description, module_config, entry))
-```
+#### `PyTapSensor`
 
-For two modules on two strings, entity creation is:
+- `unique_id`: `pytap_<barcode>_<key>`; device identified by `(pytap, <barcode>)`.
+- **Restore:** coordinator value if present, else `RestoreSensor` data or last state; performance stays `None` when the rating is 0.
+- **Availability:** see the table in [architecture.md](architecture.md#entity-availability). `ZERO_WHEN_STALE` = power, voltage in/out, current in/out, performance.
+- **Values:** duty cycle × 100; zero substituted when stale in `zero` mode.
+- **Attributes:** `string_group`, `last_update`, `gateway_id`.
+- **`last_reset`:** daily energy and readings today use `daily_reset_date`.
 
-- Per-optimizer: `2 × 12 = 24`
-- Per-string aggregate: `2 × 4 = 8`
-- Installation aggregate: `4`
-- Total: `36`
+#### `PyTapAggregateSensor`
 
-#### `PyTapSensor` Class
-
-Inherits `CoordinatorEntity[PyTapDataUpdateCoordinator]` and `SensorEntity`.
-
-**Identity:**
-- `unique_id`: `"{DOMAIN}_{barcode}_{sensor_key}"` (e.g., `pytap_A-1234567B_power`)
-- `has_entity_name = True`
-
-**Device grouping:**
-
-```python
-DeviceInfo(
-    identifiers={(DOMAIN, barcode)},
-    name=f"Tigo TS4 {module_name}",
-    manufacturer="Tigo Energy",
-    model="TS4",
-    serial_number=barcode,
-)
-```
-
-All 12 sensors for the same barcode are grouped under one device.
-
-**Availability:**
-Returns `True` only when `coordinator.data["nodes"][barcode]` exists (i.e., at least one `PowerReportEvent` has been received for this optimizer). There is no unavailable timeout — sensors hold their last received value indefinitely.
-
-**Value updates** (`_handle_coordinator_update`):
-- Reads from `coordinator.data["nodes"][barcode][value_key]`.
-- Special case: `dc_dc_duty_cycle` is converted from 0.0–1.0 to percentage (`* 100`).
-- Calls `self.async_write_ha_state()` to push the update.
-
-**Extra state attributes:**
-- `string_group` — from user config (if set).
-- `last_update` — ISO timestamp from coordinator data.
-- `gateway_id` — the gateway this optimizer communicates through.
+- Live values (power, performance) use `_members()`: all members with data in `hold`, or only reporting ones otherwise; `zero` mode reports 0 when none report. In `zero` mode performance divides by the rating of every member with data, counting stale members as 0 W. Performance is `None` if any member is unrated.
+- Energy values accumulate member increases against `baselines`, stored with the own total and `cycle_date` as `_AggregateEnergyData` extra restore data. Legacy restored totals (no baselines) continue as the starting value.
+- Attributes: `optimizer_count`, `reporting_count`. `last_reset` (daily) = start of `cycle_date`.
 
 ---
 
 ### `diagnostics.py` — Diagnostics Platform
 
-Implements the HA diagnostics download endpoint via `async_get_config_entry_diagnostics()`. HA auto-discovers this module — no `PLATFORMS` entry is needed.
+`async_get_config_entry_diagnostics()` returns:
 
-**Redaction:** Uses `async_redact_data` with `TO_REDACT = {CONF_HOST}` to strip the host IP from the config entry snapshot. Port and all other data remain visible.
-
-**Payload structure:**
-- `config_entry` — Redacted config entry dict.
-- `counters` — Internal event counters from coordinator data.
-- `gateways` — Gateway identity data.
-- `discovered_barcodes` — Unconfigured barcodes seen on the bus.
-- `nodes` — Per-barcode summary (last_update, gateway_id, node_id, daily_energy_wh, total_energy_wh, readings_today).
-- Plus all keys from `coordinator.get_diagnostics_data()` (node_mappings, connection_state, energy_state), also redacted.
-
-The node summaries intentionally omit raw power/voltage fields to keep the diagnostics download focused on integration health rather than instantaneous electrical data.
+- `config_entry` — with `host`, `serial_port` and `title` redacted.
+- `modules`, `counters` (parser counters, including `invalid_slots`, `invalid_slot_frames_kept`, `invalid_slot_frames_dropped` and `no_slot_clock_drops`), `gateways`, `discovered_barcodes`.
+- `nodes` — per barcode: `last_update`, `gateway_id`, `node_id`, `reporting`, `seconds_since_report`, daily/total energy, `readings_today`.
+- From `get_diagnostics_data()` (also redacted): `node_mappings`, `connection_state` (incl. transport type, baud rate, `connected`, `retries`), `module_discovery`, `energy_state`.
 
 ---
 
 ### `__init__.py` — Integration Lifecycle
 
-Handles integration lifecycle, config entry migration, and legacy entity cleanup.
-
 #### Config Entry Version
 
-`CONFIG_ENTRY_VERSION = 5`:
+`CONFIG_ENTRY_VERSION = 7` (matches `PyTapConfigFlow.VERSION`):
 
 - `v1 → v2`: voltage/current split to `_in`/`_out`
-- `v2 → v3`: module string labels became mandatory (defaulted to `"Default"` during migration)
-- `v3 → v4`: peak power added to module config (defaulted to 455 Wp during migration)
-- `v4 → v5`: `live_reporting` toggle added (defaulted to `True` during migration)
+- `v2 → v3`: module string labels mandatory (missing → `"Default"`)
+- `v3 → v4`: `peak_power` added (455 Wp)
+- `v4 → v5`: `live_reporting` added (`True`); `write_interval` clamped to 5–300
+- `v5 → v6`: `connection_type = "tcp"`
+- `v6 → v7`: `auto_discovery` (`False` if missing) and `excluded_barcodes` (`[]`)
 
-#### `async_migrate_entry(hass, entry) → bool`
-
-Handles config entry version migration:
-- **v1 → v2:** Updates `entry.version` to 2.
-- **v2 → v3:** Ensures each module has a non-empty string label, defaulting missing/empty values to `"Default"`.
-- **v3 → v4:** Adds `peak_power` to each module, defaulting to `DEFAULT_PEAK_POWER` (455 Wp) for modules that don't have it.
-- **v4 → v5:** Adds `live_reporting` to the entry data (defaulting to `True`) when not already present.
+Entries newer than v7 fail migration.
 
 #### `async_setup_entry(hass, entry) → bool`
 
-1. Cleans up legacy entity unique IDs from pre-v0.2.0 via `_async_cleanup_legacy_entities()`.
-2. Creates `PyTapDataUpdateCoordinator(hass, entry)`.
-3. Calls `coordinator.async_config_entry_first_refresh()` — validates initialization (does not block on data since this is push-based).
-4. Calls `coordinator.async_start_listener()` — launches the background streaming task.
-5. Registers `coordinator.async_stop_listener` via `entry.async_on_unload()` — ensures the listener is stopped on HA shutdown or entry unload.
-6. Stores coordinator in `hass.data[DOMAIN][entry.entry_id]`.
-7. Forwards platform setup (`Platform.SENSOR`).
-8. Registers `_async_update_options` as an update listener.
+1. Waits for a previous coordinator of this entry found among the parked coordinators (`parked_coordinators()`, i.e. `hass.data[DOMAIN]`, which only holds coordinators whose stop timed out) and releases its barcode claims; raises `ConfigEntryNotReady` (`previous_listener_stopping`) if it still hasn't stopped.
+2. `_async_cleanup_legacy_entities()`.
+3. Creates the coordinator; `InvalidConnectionSettings` → `ConfigEntryError` (`invalid_connection_settings`, naming the setting).
+4. `async_config_entry_first_refresh()`, `async_start_listener()`.
+5. Stores the coordinator in `entry.runtime_data` (`PyTapConfigEntry = ConfigEntry[PyTapDataUpdateCoordinator]`, defined in `coordinator.py`). Platforms, diagnostics, the options flow and device removal read it from there (the latter two only while the entry is loaded).
+6. Listens once for `EVENT_HOMEASSISTANT_STOP` to stop the listener (the listener is removed again on unload).
+7. If the Store was read without error, `_async_remove_orphaned_devices()` removes (`async_remove_device`) devices whose barcodes are all in `excluded_barcodes` and no longer tracked, and string-only devices of strings without modules (unless discovery is on and no saved state was restored). Other unknown optimizer devices are kept.
+8. Forwards `Platform.SENSOR` and registers `_async_update_options` (reload).
 
-#### `_async_cleanup_legacy_entities(hass, entry)`
-
-Removes orphaned entity registry entries left over from the voltage/current → voltage_in/out, current_in/out rename:
-- Iterates configured modules and checks for entities with old unique IDs (`pytap_BARCODE_voltage`, `pytap_BARCODE_current`).
-- Removes matching entries from the entity registry.
-- Logs the count of cleaned-up entities.
-
-#### `_async_update_options(hass, entry)`
-
-Reloads the entire integration when options change, causing a full teardown/setup cycle that picks up the modified module list.
+If steps 4–8 raise, `_async_stop_or_park()` stops the listener (or parks it) before re-raising.
 
 #### `async_unload_entry(hass, entry) → bool`
 
-1. Unloads platforms.
-2. Stops the coordinator's background listener (also covered by `async_on_unload` but called explicitly for the non-shutdown unload path).
-3. Removes the coordinator from `hass.data`.
+`_async_stop_or_park()` stops the listener and releases its barcode claims, or, if it didn't stop in time, parks the coordinator (with a warning) so the next setup waits for it and config flows treat its endpoint as in use; once its worker exits it finishes its stop and removes itself. Then unloads platforms.
+
+#### `async_remove_entry` / `async_remove_config_entry_device`
+
+Removing the entry first gives a parked coordinator a bounded stop with `discard_state=True` (a still-stuck one stays parked, so its port stays claimed), then deletes its Store. Deleting an optimizer device (any identifier not prefixed with the entry ID, so discovered optimizers too, even while not loaded) removes the module if configured and excludes its barcode; empty string devices may be deleted; the installation device and strings still in use may not.
 
 ---
 
 ### `strings.json` / Translations — UI Strings
 
-Defines all user-facing text for the config flow and options flow in structured JSON.
-
-**Config flow steps:**
-- `user` — "Connect to Tigo Gateway" with host/port fields and descriptions.
-- `modules_menu` — "Configure Modules" menu with `{modules_list}` and `{error}` placeholders.
-- `add_module` — "Add Module" form with string/name/barcode fields and detailed descriptions.
-- `finish` — "Finish Setup" (terminal step).
-
-**Options flow steps:**
-- `init` — "PyTap Options" menu with change-connection, change-reporting, add-module, remove-module, and save options.
-- `change_connection` — Host/port form to update the gateway connection.
-- `change_reporting` — "Reporting Settings" form: `live_reporting` checkbox only.
-- `set_interval` — "Reporting Interval" form: `write_interval` field (shown only when live reporting is off).
-- `add_module` — Same fields as config flow.
-- `remove_module` — Dropdown with `remove_barcode` selector.
-
-**Error strings:** `cannot_connect`, `invalid_barcode`, `missing_string`, `missing_name`, `missing_barcode`, `duplicate_barcode`, `no_modules`, `unknown`.
-
-**Abort reasons:** `already_configured`.
+- **Config steps:** `user` (menu), `tcp`, `serial`, `modules_menu`, `discovery`, `add_module`, `finish`.
+- **Options steps:** `init`, `change_discovery`, `edit_module`, `module_details`, `change_connection` (menu), `change_tcp`, `change_serial`, `add_module`, `remove_module`, `change_reporting`, `set_interval`, `change_stale`.
+- **Errors:** `cannot_connect`, `invalid_barcode`, `missing_string`, `missing_name`, `missing_barcode`, `duplicate_barcode`, `no_modules`, `invalid_host`, `invalid_port`, `invalid_serial_port`, `invalid_baud_rate`, `invalid_connection_type`, `serial_port_in_use`, `connection_in_use`, `unsupported_serial_settings`.
+- **Entity names:** all sensors, plus `module_discovery` states.
+- **Selector:** `stale_action` options (Unavailable, Zero, Hold last value).
+- **Exceptions:** setup errors (`previous_listener_stopping`, `invalid_connection_settings`).
 
 `translations/en.json` mirrors `strings.json` exactly.
 
@@ -625,11 +413,9 @@ Defines all user-facing text for the config flow and options flow in structured 
 
 ## Config Flow UX Design
 
-The config flow uses a **menu-driven approach** where users add optimizer modules one at a time through individual form fields.
+The config flow uses a **menu-driven approach**: choose a transport, enter connection details, then either finish (automatic discovery) or add modules one at a time.
 
 ### Rationale
-
-The menu-driven form is used because it improves usability and validation:
 
 1. **Lower error rate** — Each field is validated directly.
 2. **Per-field errors** — Validation issues are shown on the relevant field.
@@ -639,71 +425,45 @@ The menu-driven form is used because it improves usability and validation:
 ### Current UX Flow
 
 ```
-1. User enters host and port
-   → Non-blocking connection test (warns but proceeds if unreachable)
-
-2. Modules menu appears:
-   "Modules (0): No modules added yet."
-   [Add a module]  [Finish setup]
-
-3. User clicks "Add a module" → form appears:
-    String group: [___________]  (required)
-   Name:         [___________]  (required)
-   Barcode:      [___________]  (required)
-
-4. On submit, if valid:
-   → Returns to menu with updated list
-   "Modules (1):
-     1. string=A / Panel_01 / A-1234567B"
-   [Add a module]  [Finish setup]
-
-5. User repeats step 3-4 as needed, then clicks "Finish setup"
-   → Config entry created
+1. Choose TCP gateway or Serial / Home Assistant proxy
+2. Enter host/port, or pick the serial port and baud rate
+   → Bounded probe; on failure "Could not connect" — submit again to save anyway
+3. Modules menu (discovery mode: Automatic by default)
+   [Add a module]  [Module discovery settings]  [Finish setup]
+4. Optionally add modules (string group, name, barcode, peak power)
+5. Finish setup → entry created; with discovery on, optimizers appear as they are seen
 ```
 
 ### Connection Validation
 
-The TCP connection test in step 1 is **non-blocking**: if the gateway is unreachable (common during initial setup when the gateway may not be powered on), the flow logs a warning and proceeds to the modules menu. This prevents the common frustration of being unable to complete configuration when the gateway is temporarily offline.
+An unreachable endpoint (common at night) shows `cannot_connect` once. Submitting the identical settings again saves them, and the listener keeps retrying in the background.
 
 ---
 
 ## Data Flow
 
 ```
-Tigo Gateway (TCP port 502)
+Tigo Gateway (TCP / serial / ESPHome proxy)
     │
-    │  Raw bytes (RS-485 protocol frames)
     ▼
-TcpSource.read(4096)                       [executor thread]
+source.read(4096)                          [executor thread]
     │
     ▼
 Parser.feed(bytes) → list[Event]           [executor thread]
     │
-    ├── PowerReportEvent
-    ├── InfrastructureEvent
-    ├── TopologyEvent
-    └── StringEvent
-    │
     ▼
-FOR EACH event:                            [executor thread]
+FOR EACH event (under _state_lock):        [executor thread]
     coordinator._process_event(event) → bool
-    │
-    ├── data changed (True)?
-    │   ├── Barcode in allowlist? YES → merge into data["nodes"][barcode]
-    │   │                         NO  → log discovery, discard
-    │   │
-    │   ▼
-    │   hass.loop.call_soon_threadsafe(    [→ main event loop]
-    │       coordinator.async_set_updated_data, data
-    │   )
-    │
-    └── no change (False) → skip push
+    │   ├── configured/discovered → update _state["nodes"]
+    │   └── unconfigured          → log, remember, maybe admit
+    ▼
+publish copy (live: immediately; averaged: once per write_interval)
+    hass.loop.call_soon_threadsafe(async_set_updated_data, snapshot)
     │
     ▼
 CoordinatorEntity._handle_coordinator_update()  [main event loop]
-    │
-    ├── Read from data["nodes"][barcode][value_key]
-    ├── Convert duty cycle → percentage (if applicable)
+    ├── read data["nodes"][barcode][value_key]
+    ├── apply stale action (is_reporting), convert duty cycle
     └── async_write_ha_state()
     │
     ▼
@@ -716,98 +476,36 @@ Home Assistant frontend / automations / history
 
 ### Test Configuration
 
-- **Framework:** pytest with `pytest-homeassistant-custom-component`
-- **Async mode:** `asyncio_mode = auto` (in `pytest.ini`)
-- **Fixture:** `auto_enable_custom_integrations` (in `conftest.py`) enables loading from `custom_components/`.
+- **Framework:** pytest with `pytest-homeassistant-custom-component` (pinned in `requirements-test.txt`; currently targets HA 2026.10.4).
+- **Async mode:** `asyncio_mode = auto` (in `pytest.ini`).
+- **Smoke tests:** `tests/core_smoke.py` runs with `unittest` against HA 2026.11.0 in a separate CI job.
 
-### Config Flow Tests
+### Integration Tests (`tests/`)
 
-Representative tests:
-
-| Test | What it verifies |
+| File                              | What it covers                                                                                                                                                            |
 | --- | --- |
-| `test_step_user_shows_form` | Initial step renders host/port form with no errors |
-| `test_user_step_proceeds_to_menu` | Submitting host/port advances to modules_menu |
-| `test_user_step_proceeds_even_without_connection` | Failed TCP test still proceeds (non-blocking) |
-| `test_full_flow_add_one_module` | Complete flow: user → menu → add → menu → finish = CREATE_ENTRY |
-| `test_full_flow_add_two_modules` | Two add_module cycles produce entry with 2 modules |
-| `test_add_module_invalid_barcode` | Invalid barcode format shows error on barcode field |
-| `test_add_module_missing_name` | Empty name shows error on name field |
-| `test_add_module_duplicate_barcode` | Duplicate barcode shows error on barcode field |
-
-
-All tests mock `validate_connection` to avoid real TCP connections.
-
-### Sensor Platform Tests
-
-| Test | What it verifies |
-| --- | --- |
-| `test_sensor_entities_created` | 2 modules, 2 strings create 36 entities including aggregate sensors |
-| `test_sensor_unique_ids` | IDs include per-optimizer and aggregate unique ID formats |
-| `test_sensor_available_with_data` | Sensor available when node data exists |
-| `test_sensor_unavailable_without_data` | Sensor unavailable when data dict is empty |
-| `test_sensor_skips_modules_without_barcode` | Modules with empty barcode don't create entities |
-| `test_sensor_device_info` | Device identifiers, manufacturer, model, serial_number |
-| `test_sensor_descriptions_count` | Exactly 12 sensor descriptions defined |
-| `test_energy_sensor_descriptions` | Daily/total energy sensor metadata and state classes |
-| `test_daily_energy_last_reset` | Daily energy exposes `last_reset` from `daily_reset_date` |
-| `test_string_daily_energy_sums` | String daily aggregate sums constituent `daily_energy_wh` |
-| `test_installation_total_energy_sums_all` | Installation total aggregate sums constituent `total_energy_wh` |
-| `test_string_aggregate_device_info` | String aggregate uses virtual string device metadata |
-| `test_installation_aggregate_device_info` | Installation aggregate uses installation virtual device metadata |
-| `test_performance_sensor_value` | Per-optimizer performance sensor exposes stored percentage |
-| `test_string_performance_weighted` | String aggregate uses capacity-weighted formula |
-| `test_installation_performance_partial_data` | Aggregate performance includes only reporting nodes |
-| `test_installation_performance_unavailable_without_data` | Aggregate performance unavailable when no nodes report power |
-| `test_performance_sensor_zero_power` | Power=0W produces performance=0.0% |
-| `test_readings_today_sensor_metadata` | `readings_today` has `TOTAL` state class and `DIAGNOSTIC` category |
-| `test_readings_today_value_and_last_reset` | Value read from node data, `last_reset` from `daily_reset_date` |
-| `test_performance_sensor_above_100` | Power > peak produces >100% (no clamping) |
-
-Tests use `MagicMock(spec=PyTapDataUpdateCoordinator)` to avoid real coordinator initialization.
-
-### Coordinator Persistence Tests (36 tests)
-
-Coverage includes coordinator initialization, barcode mapping restoration and purging, deferred power-report handling before infrastructure, save/load behavior, parser-state restore/fallback, stop-flush behavior, energy-data persistence (`energy_data` save/load with daily reset on new day), and proactive midnight reset behavior (zeroing daily accumulators, skip-if-already-reset, timer rescheduling, and cancellation on stop).
-
-### Diagnostics Platform Tests (4 tests)
-
-`tests/test_diagnostics.py` validates the diagnostics download endpoint:
-
-| Test | What it verifies |
-| --- | --- |
-| `test_config_entry_diagnostics_redacts_host` | Host is redacted, port and barcodes are visible |
-| `test_config_entry_diagnostics_includes_unredacted_barcodes` | Discovered barcodes pass through unredacted |
-| `test_config_entry_diagnostics_fresh_install` | Empty coordinator (no data) doesn't raise |
-| `test_config_entry_diagnostics_all_keys_present` | All expected top-level keys present, `energy_state`/`discovered_barcodes` pass-through |
-
-### Energy Accumulation Unit Tests (13 tests)
-
-`tests/test_energy.py` validates trapezoidal integration in isolation across baseline behavior, nominal interval integration, gap handling during production, overnight gaps, daily resets with preserved total accumulation, `readings_today` incrementing and daily-reset behaviour, and related edge cases.
-
-### Entity Migration Tests
-
-| Test | What it verifies |
-| --- | --- |
-| `test_removes_old_voltage_and_current_entities` | Legacy voltage/current entity registry entries removed on setup |
-| `test_does_not_touch_new_entities` | New _in/_out entities are not affected by cleanup |
-| `test_no_op_when_no_legacy_entities` | No errors when no legacy entities exist |
-| `test_migrates_v1_to_v2` | Config entry version migrates forward to current version |
-| `test_migrate_v2_to_v3_empty_strings` | Empty/missing module strings are defaulted during migration |
-| `test_migrate_v2_to_v3_existing_strings` | Existing string labels preserved during migration |
-| `test_migrate_v2_to_v3_mixed` | Only missing string labels defaulted in mixed lists |
-| `test_migrate_v3_to_v4_adds_peak_power` | Modules without peak_power get DEFAULT_PEAK_POWER |
-| `test_migrate_v3_to_v4_preserves_peak_power` | Existing peak_power values not overwritten |
-| `test_migrate_v3_to_v4_mixed` | Mixed modules: missing gets default, existing preserved |
-| `test_already_current_version` | Current-version entries pass through migration unchanged |
+| `test_config_flow.py`             | Menu-driven config and options flows, module validation                                                                                                                   |
+| `test_serial_config_flow.py`      | Serial picker, offline setup, transport changes                                                                                                                           |
+| `test_connection.py`              | Transport validation, passive reads, bounded cleanup                                                                                                                      |
+| `test_coordinator_persistence.py` | Store load/save, mappings, deferred reports, midnight reset                                                                                                               |
+| `test_write_interval.py`          | Live vs. averaged reporting and time-weighted averaging                                                                                                                   |
+| `test_panel_status.py`            | Stale-reading actions, aggregate energy                                                                                                                                   |
+| `test_freshness_listeners.py`     | Freshness transitions re-render only the affected panels and aggregates; listener registration, membership changes and unload                                             |
+| `test_review2_data.py`            | Default stale action, domain-wide barcode claims, selective re-rendering on publish, midnight-reset ordering, save scheduling, aggregate performance and restore          |
+| `test_review2_lifecycle.py`       | Orphan-device cleanup, unreadable Store, device deletion, serial path normalisation/character-device checks, parked listeners, entry removal, setup recovery, outage logs |
+| `test_module_discovery.py`        | Passive admission, persistence, live entities, metadata edits                                                                                                             |
+| `test_listener_lifecycle.py`      | Worker finishes and releases the port before unload/reload                                                                                                                |
+| `test_review_fixes.py`            | TCP interrupt, slow stop, invalid saved port, cross-entry discovery, device removal, `/dev/` paths, symlinks, one-time connection-loss log                                |
+| `test_sensor.py`                  | Sensor platform entities, values, aggregates                                                                                                                              |
+| `test_diagnostics.py`             | Diagnostics payload and redaction                                                                                                                                         |
+| `test_energy.py`                  | Pure energy accumulation                                                                                                                                                  |
+| `test_migration.py`               | Config entry migrations and legacy entity cleanup                                                                                                                         |
 
 ### Parser Library Tests (in `custom_components/pytap/pytap/tests/`)
 
-The embedded parser library has its own test suite:
-
 | Test File | Coverage |
 | --- | --- |
-| `test_parser.py` | Byte-level protocol parsing with captured data |
+| `test_parser.py` | Byte-level protocol parsing with captured data, including invalid slot counters |
 | `test_types.py` | Protocol type construction and field validation |
 | `test_crc.py` | CRC-16 calculation against known vectors |
 | `test_barcode.py` | Barcode encode/decode round-trips |
@@ -816,14 +514,16 @@ The embedded parser library has its own test suite:
 ### Running Tests
 
 ```bash
-# Run all integration tests
+pip install -r requirements-test.txt
+
+# Integration tests
 python3 -m pytest tests/ -vv --tb=short
 
-# Run parser library tests
-python3 -m pytest custom_components/pytap/pytap/tests/ -vv
+# Parser library tests
+PYTHONPATH=custom_components/pytap python3 -c 'import pytap, pytest; raise SystemExit(pytest.main(["custom_components/pytap/pytap/tests/", "--import-mode=importlib", "-vv"]))'
 
 # Lint
-python3 -m ruff check custom_components/pytap/
+python3 -m ruff check custom_components/pytap/ tests/
 ```
 
 ---
@@ -832,75 +532,51 @@ python3 -m ruff check custom_components/pytap/
 
 ### 1. Menu-Driven Module Input
 
-**Chosen:** Individual form-per-module with a menu loop.
+**Chosen:** Individual form-per-module with a menu loop, with automatic discovery so most users don't need to enter modules at all.
 
-**Trade-off:** More config flow steps for users with many modules, but significantly better UX:
-- Per-field validation with targeted error messages.
-- Required field (string group) is clearly labeled.
-- Guided field-by-field entry for string, name, and barcode.
-- Matches HA's native form conventions.
+**Trade-off:** More steps for manual entry, but per-field validation and HA-native forms.
 
-### 2. Non-Blocking Connection Test
+### 2. Probe Once, Save on Resubmit
 
-**Chosen:** TCP connection test warns on failure but does not block the flow.
+**Chosen:** A failed connection probe shows `cannot_connect`; resubmitting the same settings saves them.
 
-**Rationale:** Users often configure integrations when the target device is offline (e.g., solar gateway powered off at night). Blocking on connection would prevent saving a valid configuration. The integration will connect when the gateway becomes available.
+**Rationale:** Users often configure the integration while the gateway is offline (e.g. at night). Typos are caught, but an offline device doesn't prevent saving.
 
 ### 3. Push-Based Coordinator (Not Poll-Based)
 
-**Chosen:** Background streaming task with `call_soon_threadsafe` dispatch.
+**Chosen:** Background streaming task with `call_soon_threadsafe` dispatch. Sub-second latency, no redundant requests, matches the bus protocol.
 
-**Trade-off:** More complex than a simple `update_interval`-based coordinator, but:
-- Sub-second latency vs. polling interval latency.
-- No redundant requests — only new data is processed.
-- Matches the bus protocol's inherent push nature.
+### 4. Executor Thread Bridging With Private Worker State
 
-### 4. Executor Thread Bridging
+**Chosen:** Run blocking `_listen()` in HA's executor; the worker owns `_state` and publishes copies.
 
-**Chosen:** Run blocking `_listen()` in HA's executor via `async_add_executor_job`, wrapped in an `_async_listen()` coroutine.
-
-**Rationale:** The pytap library uses blocking `socket.recv()`. Rewriting the library for asyncio would add complexity without benefit. The executor bridge is clean: the library remains portable and testable outside HA.
+**Rationale:** The library stays portable; copies avoid races and keep averaged values intact.
 
 ### 5. Barcode as Primary Key (Not node_id)
 
-**Chosen:** All entity IDs, device identifiers, and data dict keys use the Tigo barcode.
+`node_id` is a transient 16-bit integer; barcodes are stable hardware identifiers, so all unique IDs, device identifiers and data keys use the barcode.
 
-**Rationale:** `node_id` is a transient 16-bit integer that can change across gateway restarts. Barcodes are hardware-burned identifiers that never change, making them suitable as stable unique IDs.
+### 6. Passive Discovery With Exclusions
 
-### 6. Deterministic Entity Creation (No Auto-Discovery)
+**Chosen:** New setups admit optimizers seen on the bus (no bus commands); explicit removals/deletions are excluded; barcodes owned by another entry are skipped; a manual mode remains for shared buses. Discovered metadata lives in the Store so admission doesn't reload the entry.
 
-**Chosen:** Entities are created at setup from the configured module list. No dynamic entity creation from bus events.
+### 7. Configurable Stale Readings
 
-**Rationale:**
-- Prevents phantom entities from neighboring installations on the same RS-485 bus.
-- Enables dashboard/automation setup before first data arrives.
-- User-defined names instead of opaque IDs.
-- Consistent with the taptap HA add-on approach.
+**Chosen:** Default `hold` (the original behaviour, for new and existing entries), with opt-in `unavailable` and `zero` after a timeout (default 120 s). Energy is never affected.
 
-### 7. Integration Reload on Options Change
+### 8. Integration Reload on Options Change
 
-**Chosen:** `_async_update_options` triggers a full `async_reload` rather than incremental entity updates.
-
-**Trade-off:** Brief disruption during reload, but guarantees entities match the new config exactly. Adding/removing modules changes the entity set, which is simplest to handle via full reload.
+**Chosen:** `_async_update_options` triggers a full `async_reload`. Brief disruption, but entities always match the configuration.
 
 ---
 
 ## Known Deviations from Architecture
 
-The architecture document (`architecture.md`) was written during initial design and has not been fully updated for the menu-driven config flow. Notable differences:
-
-| Aspect | Architecture Doc | Actual Implementation |
-| --- | --- | --- |
-| Config flow modules step | Legacy flow variants | Menu-driven: host/port → modules_menu → add_module loop → finish |
-| Module input format | Legacy text input formats | Individual form fields per module |
-| Options flow | Described as text-based reconfiguration | Menu with add/remove/done actions |
-| Gateway device registration | Described as separate DeviceInfo | Not yet implemented (sensors have device info per optimizer only) |
-| `via_device` on nodes | Linked to gateway device | Not implemented (no gateway device yet) |
-| Unavailable timeout | Described as configurable via options | Removed — sensors hold last value indefinitely |
-| Sensor count | Historical counts | 12 per optimizer, plus string/installation aggregate sensors |
-| Config entry version | Not mentioned | v5 with v1→v2 through v4→v5 migration steps |
-| Threading primitives | Not specified | threading.Event + threading.Lock (not asyncio.Event) |
-| Diagnostics platform | Mentioned for discovered barcodes | Implemented via `diagnostics.py` config-entry download |
+| Aspect                                         | Status                                                                                           |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| Gateway device registration / `via_device`     | Not implemented (optimizer, string and installation devices only)                                |
+| Connectivity binary sensors                    | Not implemented                                                                                  |
+| SerialSource (pyserial) in `pytap.core.source` | Unused by the integration; serial access goes through `connection.SerialProxySource` (`serialx`) |
 
 ---
 
@@ -1055,6 +731,36 @@ Created this implementation document capturing all development work to date.
 - **Migration clamp** — the v4→v5 migration now clamps any stale `write_interval` into `[MIN_WRITE_INTERVAL, MAX_WRITE_INTERVAL]` (5–300) so the reporting form stays submittable after upgrade. Added `MIN_WRITE_INTERVAL`/`MAX_WRITE_INTERVAL` constants shared by the migration and the config-flow schema.
 - Added regression tests (`TestLivePushAndIdleFlush`, migration clamp tests) and corrected the previously misnamed live-mode buffer test. Full suite: 162 tests passing, ruff clean.
 
+### Phase 19 — Serial and ESPHome Proxy Transports
+
+- Added `connection.py` with `normalize_connection()`, `SerialProxySource` (`serialx`) and `open_source()`; the config and options flows gained a TCP/serial menu with the native serial-port picker.
+- Config entry version 6 (`connection_type = "tcp"` for existing entries); HA 2026.11+ required.
+
+### Phase 20 — Passive Module Discovery
+
+- Automatic discovery (default for new setups), discovered-module metadata in the Store, module editing, and `excluded_barcodes` for explicit removals.
+- Dynamic entity creation in the sensor platform; `module_discovery` status sensor.
+- Config entry version 7 keeps manual mode on existing entries.
+
+### Phase 21 — Stale Readings and Review Fixes
+
+- Configurable stale-reading action/timeout (`change_stale` options step) replacing a fixed report timeout; freshness check every 5 s that re-renders only the entities of panels whose reporting state changed (per-barcode freshness listeners).
+- Coordinator stored in `entry.runtime_data`; `hass.data[DOMAIN]` kept only as a registry of coordinators still stopping after a timed-out unload.
+- Worker-owned `_state` with published copies; DST-safe midnight reset via `async_track_time_change`.
+- Aggregate energy accumulates member increases with restored baselines.
+- Lifecycle: bounded stop with `ConfigEntryNotReady` retry, `TcpSource.interrupt()`, listener stopped on `EVENT_HOMEASSISTANT_STOP`, saved state deleted with the entry.
+- Devices: UI deletion of optimizer and empty string devices; orphaned devices removed at setup; discovery skips barcodes owned by another entry.
+- Connection: `/dev/` paths only, symlink-aware port comparison, probe-then-resubmit, one-time connection-loss log, `ConfigEntryError` for invalid saved settings.
+- Parser: an invalid header slot counter never updates the slot clock; power reports with invalid slot counters are dropped; both increment `invalid_slots` (refined in Phase 22).
+
+### Phase 22 — Second Review Fixes
+
+- Stale readings: default `hold` for all entries (`unavailable` / `zero` opt-in); in `zero` mode aggregate performance divides by every present member's rating.
+- Publishing: per-barcode data listeners, so a publish re-renders only changed panels and their aggregates; snapshot sequence numbers protect the midnight reset.
+- Discovery: domain-wide atomic `BarcodeClaims`; configured barcodes claimed at coordinator creation.
+- Lifecycle: timed-out stops still cancel timers/saves; parked coordinators claim their endpoint in config flows and clean up when their worker exits; entry removal waits (bounded) for them and blocks their saves; setup failures stop or park the listener; corrected connection settings recover a failed setup; unreadable Store blocks saves and orphan cleanup; orphan cleanup only removes excluded optimizers and empty strings; device deletion always excludes the barcode; normalised serial paths and character-device checks; outage logged once until data flows.
+- Parser: invalid-header-slot frames kept only when the strict packet walk succeeds (`invalid_slot_frames_kept` / `invalid_slot_frames_dropped`); `no_slot_clock_drops`, with the warning logged once per gateway per parser.
+
 ---
 
 ## Future Work
@@ -1062,5 +768,4 @@ Created this implementation document capturing all development work to date.
 Items identified but not yet implemented:
 
 1. **Gateway device registration** — Create a device per gateway for the `via_device` hierarchy.
-2. **Binary sensors** — Node connectivity and gateway online status.
-3. **HACS distribution** — Package with `hacs.json` for one-click installation.
+2. **Connectivity binary sensors** — Node connectivity and gateway online status.

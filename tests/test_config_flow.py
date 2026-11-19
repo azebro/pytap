@@ -24,21 +24,32 @@ MOCK_HOST = "192.168.1.100"
 MOCK_PORT = 502
 
 
+@pytest.fixture(autouse=True)
+def mock_entry_setup():
+    """Flow tests create entries without starting a real network listener."""
+    with patch("custom_components.pytap.async_setup_entry", return_value=True):
+        yield
+
+
+async def _init_tcp_flow(hass):
+    """Choose TCP from the new transport menu."""
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": config_entries.SOURCE_USER})
+    return await hass.config_entries.flow.async_configure(result["flow_id"], {"next_step_id": "tcp"})
+
+
 async def test_step_user_shows_form(hass: HomeAssistant) -> None:
     """Test the initial user step shows the connection form."""
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
-    assert result["type"] is FlowResultType.FORM
+    assert result["type"] is FlowResultType.MENU
     assert result["step_id"] == "user"
-    assert result["errors"] == {}
+    assert result["menu_options"] == ["tcp", "serial"]
 
 
 async def test_user_step_proceeds_to_menu(hass: HomeAssistant) -> None:
     """Test that submitting host/port goes to the modules menu."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    result = await _init_tcp_flow(hass)
 
     with patch(
         "custom_components.pytap.config_flow.validate_connection",
@@ -56,10 +67,8 @@ async def test_user_step_proceeds_to_menu(hass: HomeAssistant) -> None:
 async def test_user_step_proceeds_even_without_connection(
     hass: HomeAssistant,
 ) -> None:
-    """Test that a failed connection test still proceeds to modules menu."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    """An unreachable gateway is reported once; submitting again proceeds."""
+    result = await _init_tcp_flow(hass)
 
     with patch(
         "custom_components.pytap.config_flow.validate_connection",
@@ -69,17 +78,20 @@ async def test_user_step_proceeds_even_without_connection(
             result["flow_id"],
             {"host": MOCK_HOST, "port": MOCK_PORT},
         )
+        assert result["type"] is FlowResultType.FORM
+        assert result["errors"] == {"base": "cannot_connect"}
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {"host": MOCK_HOST, "port": MOCK_PORT},
+        )
 
-    # Should still proceed to modules menu (connection test is non-blocking)
     assert result["type"] is FlowResultType.MENU
     assert result["step_id"] == "modules_menu"
 
 
 async def test_full_flow_add_one_module(hass: HomeAssistant) -> None:
     """Test complete flow: user → menu → add_module → finish."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    result = await _init_tcp_flow(hass)
 
     with patch(
         "custom_components.pytap.config_flow.validate_connection",
@@ -134,9 +146,7 @@ async def test_full_flow_add_one_module(hass: HomeAssistant) -> None:
 
 async def test_full_flow_add_two_modules(hass: HomeAssistant) -> None:
     """Test adding multiple modules via the menu loop."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    result = await _init_tcp_flow(hass)
     with patch(
         "custom_components.pytap.config_flow.validate_connection",
         return_value={"title": f"PyTap ({MOCK_HOST})"},
@@ -185,9 +195,7 @@ async def test_full_flow_add_two_modules(hass: HomeAssistant) -> None:
 
 async def test_add_module_invalid_barcode(hass: HomeAssistant) -> None:
     """Test that an invalid barcode shows an error on the add_module step."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    result = await _init_tcp_flow(hass)
     with patch(
         "custom_components.pytap.config_flow.validate_connection",
         return_value={"title": f"PyTap ({MOCK_HOST})"},
@@ -218,9 +226,7 @@ async def test_add_module_invalid_barcode(hass: HomeAssistant) -> None:
 
 async def test_add_module_missing_name(hass: HomeAssistant) -> None:
     """Test that a missing name shows an error on the add_module step."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    result = await _init_tcp_flow(hass)
     with patch(
         "custom_components.pytap.config_flow.validate_connection",
         return_value={"title": f"PyTap ({MOCK_HOST})"},
@@ -250,9 +256,7 @@ async def test_add_module_missing_name(hass: HomeAssistant) -> None:
 
 async def test_add_module_missing_string(hass: HomeAssistant) -> None:
     """Test that a missing string shows an error on the add_module step."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    result = await _init_tcp_flow(hass)
     with patch(
         "custom_components.pytap.config_flow.validate_connection",
         return_value={"title": f"PyTap ({MOCK_HOST})"},
@@ -282,9 +286,7 @@ async def test_add_module_missing_string(hass: HomeAssistant) -> None:
 
 async def test_add_module_duplicate_barcode(hass: HomeAssistant) -> None:
     """Test that adding a duplicate barcode shows an error."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    result = await _init_tcp_flow(hass)
     with patch(
         "custom_components.pytap.config_flow.validate_connection",
         return_value={"title": f"PyTap ({MOCK_HOST})"},
@@ -374,9 +376,13 @@ async def test_options_change_connection_shows_prefilled_form(
         result["flow_id"],
         {"next_step_id": "change_connection"},
     )
+    assert result["type"] is FlowResultType.MENU
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "change_tcp"}
+    )
 
     assert result["type"] is FlowResultType.FORM
-    assert result["step_id"] == "change_connection"
+    assert result["step_id"] == "change_tcp"
     # Schema defaults should carry the current values
     schema = result["data_schema"]
     schema_dict = {str(k): k for k in schema.schema}
@@ -401,6 +407,9 @@ async def test_options_change_connection_updates_entry(
         {"next_step_id": "change_connection"},
     )
     assert result["step_id"] == "change_connection"
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "change_tcp"}
+    )
 
     with patch(
         "custom_components.pytap.config_flow.validate_connection",
@@ -434,6 +443,9 @@ async def test_options_change_connection_warn_only_on_failure(
         result["flow_id"],
         {"next_step_id": "change_connection"},
     )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "change_tcp"}
+    )
 
     with patch(
         "custom_components.pytap.config_flow.validate_connection",
@@ -443,8 +455,14 @@ async def test_options_change_connection_warn_only_on_failure(
             result["flow_id"],
             {"host": new_host, "port": MOCK_PORT},
         )
+        assert result["errors"] == {"base": "cannot_connect"}
+        assert entry.data["host"] != new_host
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            {"host": new_host, "port": MOCK_PORT},
+        )
 
-    # Should still return to menu despite connection failure
+    # Submitting the same values again saves them despite the failure
     assert result["type"] is FlowResultType.MENU
     assert result["step_id"] == "init"
 
@@ -464,6 +482,9 @@ async def test_options_change_connection_preserves_modules(
         result["flow_id"],
         {"next_step_id": "change_connection"},
     )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "change_tcp"}
+    )
 
     with patch(
         "custom_components.pytap.config_flow.validate_connection",
@@ -479,9 +500,7 @@ async def test_options_change_connection_preserves_modules(
 
 async def test_add_module_with_custom_peak_power(hass: HomeAssistant) -> None:
     """Custom peak power should be persisted in module config."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    result = await _init_tcp_flow(hass)
 
     with patch(
         "custom_components.pytap.config_flow.validate_connection",
@@ -517,9 +536,7 @@ async def test_add_module_with_custom_peak_power(hass: HomeAssistant) -> None:
 
 async def test_add_module_peak_power_validation(hass: HomeAssistant) -> None:
     """Peak power must satisfy schema range constraints."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    result = await _init_tcp_flow(hass)
 
     with patch(
         "custom_components.pytap.config_flow.validate_connection",
@@ -695,10 +712,8 @@ async def test_initial_setup_does_not_expose_reporting(
     hass: HomeAssistant,
 ) -> None:
     """The initial user step schema must NOT contain reporting settings."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
-    assert result["step_id"] == "user"
+    result = await _init_tcp_flow(hass)
+    assert result["step_id"] == "tcp"
     schema_keys = {str(k) for k in result["data_schema"].schema}
     assert "live_reporting" not in schema_keys
     assert "write_interval" not in schema_keys

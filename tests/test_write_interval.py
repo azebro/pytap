@@ -265,7 +265,7 @@ class TestTimeWeightedAveraging:
     ) -> None:
         """Plant a node entry and buffer timestamped readings directly."""
         _, last_fields = timestamped_readings[-1]
-        coordinator.data["nodes"][barcode] = {
+        coordinator._state["nodes"][barcode] = {
             "name": barcode,
             "peak_power": self.PEAK_POWER,
             **last_fields,
@@ -419,7 +419,7 @@ class TestTimeWeightedAveraging:
             hass, _make_entry(hass, live_reporting=False)
         )
         coordinator._schedule_save = MagicMock()
-        coordinator.data["nodes"][self.BARCODE_A] = {
+        coordinator._state["nodes"][self.BARCODE_A] = {
             "name": self.BARCODE_A,
             "peak_power": self.PEAK_POWER,
             **{f: None for f in _AVERAGED_FIELDS},
@@ -483,7 +483,7 @@ class TestTimeWeightedAveraging:
         coordinator._build_averaged_snapshot(flush_ts=110.0)
 
         # Latest raw value (200) must be preserved for persistence
-        assert coordinator.data["nodes"][self.BARCODE_A]["power"] == pytest.approx(
+        assert coordinator._state["nodes"][self.BARCODE_A]["power"] == pytest.approx(
             200.0, rel=1e-3
         )
 
@@ -535,7 +535,7 @@ class TestBufferPopulation:
         coordinator._process_event(_make_power_event(power=100.0))
         coordinator._process_event(_make_power_event(power=200.0))
 
-        assert coordinator.data["nodes"]["A-1234567B"]["power"] == pytest.approx(
+        assert coordinator._state["nodes"]["A-1234567B"]["power"] == pytest.approx(
             200.0, rel=0.01
         )
 
@@ -591,10 +591,10 @@ class TestLivePushAndIdleFlush:
             coordinator._push_live_update(parser)
 
         assert mock_cstf.called
-        _, payload = mock_cstf.call_args.args
-        assert payload["nodes"] == coordinator.data["nodes"]
+        _, payload, _ = mock_cstf.call_args.args
+        assert payload["nodes"] == coordinator._state["nodes"]
         # Must be a distinct object so listener-thread mutation cannot alias it.
-        assert payload["nodes"] is not coordinator.data["nodes"]
+        assert payload["nodes"] is not coordinator._state["nodes"]
         assert coordinator._ha_update_pending is False
 
     def test_live_push_noop_when_not_pending(self, hass: HomeAssistant) -> None:

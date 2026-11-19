@@ -45,6 +45,15 @@ class TcpSource:
         except TimeoutError:
             return b""
 
+    def interrupt(self):
+        """Wake a blocked read from another thread; the reader still owns close()."""
+        sock = self._socket
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
     def close(self):
         """Close the socket connection."""
         if self._socket:
