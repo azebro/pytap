@@ -2,7 +2,7 @@
 
 ## Overview
 
-PyTap is a Home Assistant custom component that passively monitors Tigo TAP solar energy systems via the RS-485 bus. It receives the bus byte stream from the Tigo gateway over TCP, parses the proprietary protocol in real time, and exposes per-optimizer sensor entities — power, voltage, current, temperature, and more — directly in Home Assistant. It never writes to the bus.
+PyTap is a Home Assistant custom component that passively monitors Tigo TAP solar energy systems via the RS-485 bus. It receives the bus byte stream over TCP, a local serial adapter, or a Home Assistant ESPHome serial proxy, parses the proprietary protocol in real time, and exposes per-optimizer sensor entities — power, voltage, current, temperature, and more — directly in Home Assistant. It never writes to the bus.
 
 The integration embeds the `pytap` protocol parser library and bridges its event-driven output into Home Assistant's entity/device model using an async coordinator pattern.
 
@@ -23,7 +23,7 @@ The integration embeds the `pytap` protocol parser library and bridges its event
 │   │               pytap library                               │     │
 │   │           (embedded protocol parser)                      │     │
 │   └──────────────────────┬────────────────────────────────────┘     │
-│                          │ TCP                                      │
+│                          │ TCP / Serial / ESPHome serial proxy      │
 └──────────────────────────┼──────────────────────────────────────────┘
                            │
                            ▼
@@ -55,7 +55,7 @@ pytap/                              # Repository root
 │   └── pytap/                      # HA custom component
 │       ├── __init__.py             # Setup / teardown, migrations
 │       ├── config_flow.py          # UI-based configuration
-│       ├── connection.py           # Connection validation, opening the TCP source
+│       ├── connection.py           # Connection validation, serial/proxy source
 │       ├── const.py                # Domain, defaults, config keys
 │       ├── coordinator.py          # DataUpdateCoordinator (async bridge)
 │       ├── diagnostics.py          # HA diagnostics platform download
@@ -138,7 +138,7 @@ Entry point for Home Assistant:
 | `async_setup_entry(hass, entry)` | Create coordinator, start data streaming, forward platform setup |
 | `async_unload_entry(hass, entry)` | Stop the listener (bounded), unload platforms |
 | `async_remove_entry(hass, entry)` | Delete the entry's saved state |
-| `async_migrate_entry(hass, entry)` | Migrate config entries v1 → v5 |
+| `async_migrate_entry(hass, entry)` | Migrate config entries v1 → v6 |
 
 Platforms: `sensor`.
 
@@ -150,27 +150,29 @@ Platforms: `sensor`.
 5. Store the coordinator in `entry.runtime_data` (typed `PyTapConfigEntry = ConfigEntry[PyTapDataUpdateCoordinator]`) and listen for `EVENT_HOMEASSISTANT_STOP` to stop the listener (HA does not unload entries on shutdown).
 6. Forward platform setup and register the options update listener (reloads the entry).
 
-If a later step fails, the listener is stopped, or parked if it won't stop, so a retry can't open a second connection before it is released.
+If a later step fails, the listener is stopped, or parked if it won't stop, so a retry can't open the port before it is released.
 
 **Teardown flow:**
 1. `async_stop_listener()` — bounded by `LISTENER_STOP_TIMEOUT` (20 s). Timers and the pending save are cancelled even if the worker can't be joined in time.
-2. If it didn't stop, park the coordinator (`hass.data[DOMAIN][entry_id]`) so the next setup waits for it and config flows treat its TCP host/port as in use. Once its worker exits, a parked coordinator finishes its own stop (final save).
+2. If it didn't stop, park the coordinator (`hass.data[DOMAIN][entry_id]`) so the next setup waits for it and config flows treat its serial port or TCP host/port as in use. Once its worker exits, a parked coordinator finishes its own stop (final save).
 3. Unload platforms.
 
 **Entry removal:** a parked coordinator gets a bounded stop with all later Store writes blocked; then its Store is deleted.
 
 ### 2. `config_flow.py` — Configuration UI
 
-`PyTapConfigFlow` (`VERSION = 5`) collects connection parameters and modules:
+`PyTapConfigFlow` (`VERSION = 6`) collects connection parameters and modules:
 
 | Step | Fields | Validation |
 | --- | --- | --- |
-| `user` | `host` (required), `port` (default: 502) | Non-empty host, port 1–65535, bounded probe |
+| `user` | Menu (`tcp` / `serial`) | — |
+| `tcp` | `host` (required), `port` (default: 502) | Non-empty host, port 1–65535, bounded probe |
+| `serial` | `serial_port` (native `SerialPortSelector`), `baud_rate` (default: 38400) | `/dev/…` path or `esphome-hass://` proxy URL, baud 1–4000000, not used by another PyTap entry (symlinks resolved), bounded probe |
 | `modules_menu` | Menu (`add_module` / `finish`) | — |
 | `add_module` | `string`, `name`, `barcode` (required), `peak_power` (default: 455 Wp) | Non-empty fields, barcode format, duplicate prevention, peak power 1–1000 |
-| `finish` | — | At least one module (`no_modules`) |
+| `finish` | — | At least one module (`no_modules`); serial port re-checked |
 
-**Connection probe:** opened and closed in the executor without consuming bytes. If it fails, the form shows `cannot_connect`; submitting identical settings again saves them anyway (the listener keeps retrying). A TCP host/port still held by a parked coordinator shows `connection_in_use`.
+**Connection probe:** opened and closed in the executor without consuming bytes. If it fails, the form shows `cannot_connect`; submitting identical settings again saves them anyway (the listener keeps retrying). Unsupported serial settings show `unsupported_serial_settings`; a path that doesn't resolve to a character device under `/dev/` shows `invalid_serial_port`. A serial port or TCP host/port still held by a parked coordinator shows `serial_port_in_use` / `connection_in_use`.
 
 **Modules:** stored in `ConfigEntry.data["modules"]` as:
 
@@ -181,15 +183,16 @@ If a later step fails, the listener is stopped, or parked if it won't stop, so a
 ]
 ```
 
-**Unique ID:** a random UUID per entry, not tied to the mutable connection settings.
+**Unique ID:** a random UUID per entry; duplicate serial ports are prevented by the port check instead.
 
-**Options Flow:** menu with _Change connection settings_ (host/port; saved immediately), _Change reporting settings_ (+ _Reporting Interval_ step when live reporting is off), _Change stale reading behaviour_, _Add / Remove a module_, and _Save and close_. Connection, reporting and stale-reading changes are written immediately; module edits are written on _Save and close_.
+**Options Flow:** menu with _Change connection settings_ (TCP/serial; saved immediately, current serial port not probed while the listener owns it), _Change reporting settings_ (+ _Reporting Interval_ step when live reporting is off), _Change stale reading behaviour_, _Add / Remove a module_, and _Save and close_. Connection, reporting and stale-reading changes are written immediately; module edits are written on _Save and close_.
 
 ### 3. `const.py` — Constants
 
 ```python
 DOMAIN = "pytap"
 DEFAULT_PORT = 502           # Tigo TAP default TCP port
+DEFAULT_BAUD_RATE = 38400    # Serial; framing fixed at 8N1
 DEFAULT_PEAK_POWER = 455     # Wp (watts peak) — STC rating
 DEFAULT_LIVE_REPORTING = True  # Push every reading as it arrives
 DEFAULT_WRITE_INTERVAL = 30   # Seconds between averaged pushes (5–300)
@@ -216,7 +219,7 @@ The coordinator is the central bridge between the blocking `pytap` parser and Ho
 │    • Midnight reset, lifecycle                  │
 │                                                 │
 │  Executor thread (blocking I/O):                │
-│    • open_source() → TCP source                 │
+│    • open_source() → TCP or serial source       │
 │    • parser.feed(bytes) → Events                │
 │    • Updates private self._state                │
 │    • Publishes a copy via call_soon_threadsafe  │
@@ -272,7 +275,7 @@ The listener thread owns `self._state` and the energy accumulators (guarded by a
 2. **Publishing** — The worker publishes snapshots back to the event loop with `call_soon_threadsafe` (immediately in live mode, once per interval in averaged mode).
 3. **Midnight reset** — `async_track_time_change(hour=0, minute=0, second=0)` resets daily accumulators at every local midnight (DST-safe), even when no reports arrive overnight.
 4. **Freshness check** — `async_track_time_interval` every 5 s recomputes which panels are reporting. Entities register per-barcode callbacks with `async_add_freshness_listener(barcodes, callback)`: live per-optimizer sensors for their own barcode, every aggregate for its members. Only the callbacks of panels that started or stopped reporting run (once per registration), not every entity.
-5. **Stopping** — `async_stop_listener()` sets a `threading.Event`, calls the TCP source's `interrupt()` (socket `shutdown`, waking a blocked `recv` immediately), cancels the midnight, freshness and save timers, then awaits the worker. The worker owns `close()`. The whole stop is bounded by `LISTENER_STOP_TIMEOUT`; on timeout it returns `False`, the coordinator is parked and reload is blocked until the worker exits. Once the worker has exited, the final Store save is shielded from cancellation.
+5. **Stopping** — `async_stop_listener()` sets a `threading.Event`, calls the TCP source's `interrupt()` (socket `shutdown`, waking a blocked `recv` immediately; serial reads are bounded to 1 s), cancels the midnight, freshness and save timers, then awaits the worker. The worker owns `close()`. The whole stop is bounded by `LISTENER_STOP_TIMEOUT`; on timeout it returns `False`, the coordinator is parked and reload is blocked until the worker exits. Once the worker has exited, the final Store save is shielded from cancellation.
 
 ```
  HA Event Loop (main thread)          Executor Thread
@@ -420,10 +423,14 @@ String/installation energy sensors store their own total plus each member's last
 
 The Tigo protocol identifies nodes by `node_id` (transient) and `barcode` (stable). The parser resolves barcodes from its node table (`PersistentState`) when it emits `PowerReportEvent`; when the barcode is `None`, the coordinator uses its own `node_id → barcode` map, but only after the current session's first node table (node IDs may have been reassigned overnight).
 
-### 6. `connection.py` — Connection Settings
+### 6. `connection.py` — Transports
 
-- `normalize_connection()` validates the TCP settings (non-empty host, port 1–65535), raising `InvalidConnectionSettings(field, error)`.
-- `open_source()` opens a `pytap` `TcpSource`, closing it again if `connect()` fails.
+- `normalize_connection()` validates TCP (host, port 1–65535) or serial settings (local paths are normalised with `posixpath.normpath` and must stay under `/dev/`, excluding `/dev/fd`, `/dev/std*`, `/dev/shm` and `/dev/mqueue`; proxy URLs must be `esphome-hass://esphome/<port>?…` with only known identity filters; baud 1–4000000), raising `InvalidConnectionSettings(field, error)`.
+- `check_device_node()` (blocking, called by `open_source()` before any serial open, including the flow probe) requires a local path's symlink target to be a character device that passes the same `/dev/` checks.
+- `resolved_endpoint_key()` resolves symlinks (e.g. `/dev/serial/by-id/…`) so the same port can't be claimed twice.
+- `SerialProxySource` runs `serialx`'s async transport on HA's loop (8N1, no flow control, DTR/RTS untouched) behind a blocking `read()`/`close()` used by the worker; idle reads return `b""` after 1 s.
+- `open_source()` opens a `SerialProxySource` or `pytap` `TcpSource`, closing it again if `connect()` fails.
+- `connection_title()` never includes proxy URLs or serial identities.
 
 ### 7. `manifest.json` — Integration Metadata
 
@@ -431,13 +438,15 @@ The Tigo protocol identifies nodes by `node_id` (transient) and `barcode` (stabl
 {
   "domain": "pytap",
   "name": "PyTap",
+  "after_dependencies": ["esphome"],
   "codeowners": ["@azebro"],
   "config_flow": true,
+  "dependencies": ["usb"],
   "documentation": "https://github.com/azebro/pytap",
   "integration_type": "hub",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/azebro/pytap/issues",
-  "requirements": [],
+  "requirements": ["serialx>=1.15.1"],
   "version": "1.2.0"
 }
 ```
@@ -445,7 +454,7 @@ The Tigo protocol identifies nodes by `node_id` (transient) and `barcode` (stabl
 Key choices:
 - **`integration_type: "hub"`** — A single entry manages multiple downstream devices (optimizers).
 - **`iot_class: "local_push"`** — Data is pushed from the bus in real time.
-- **`requirements: []`** — The `pytap` parser library is embedded, not installed from PyPI. No external dependencies beyond stdlib.
+- **`requirements`** — Only `serialx` (serial/proxy access); the `pytap` parser is embedded.
 
 ---
 
@@ -454,9 +463,9 @@ Key choices:
 ```
  Tigo Gateway (RS-485 bus master)
      │
-     │  TCP stream (port 502)
+     │  TCP stream / local serial / ESPHome serial proxy
      ▼
- TcpSource.read(4096)   [executor thread]
+ TcpSource / SerialProxySource .read(4096)   [executor thread]
      │
      │  raw bytes
      ▼
@@ -490,7 +499,7 @@ The `pytap` parser library is bundled inside the custom component at `custom_com
 
 - **Shipped together** — Each integration release bundles its parser; the parser's own `pytap.__version__` (currently 1.1.1) is not kept in step with the integration version (`manifest.json`, currently 1.2.0).
 - **No PyPI publishing required** — Reduces release complexity for a niche integration.
-- **Zero external dependencies** — Easier to install (just copy the folder into `custom_components/`).
+- The only runtime requirement is `serialx`, for serial and proxy access.
 
 The library has **no Home Assistant imports** and can be used standalone (scripts, other platforms). Persistence is handled externally — the parser accepts a `PersistentState` object and mutates it in memory; the caller owns serialization.
 
@@ -517,6 +526,8 @@ self._listener_task = self.config_entry.async_create_background_task(
 )
 ```
 
+Serial/proxy I/O stays on HA's loop (`serialx`), bridged to the worker with `run_coroutine_threadsafe` and bounded timeouts.
+
 ### 4. Worker-Owned State, Published Copies
 
 The worker mutates only `_state`; Home Assistant receives copies. This removes data races between the worker and entities/diagnostics and keeps averaged values from being overwritten by raw ones.
@@ -541,8 +552,11 @@ Node data is keyed by `barcode` (not `node_id`), since barcodes are stable while
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| `host` | string | (required) | IP address or hostname of the gateway/converter |
+| `connection_type` | string | — | `tcp` or `serial` |
+| `host` | string | (required for TCP) | IP address or hostname of the gateway/converter |
 | `port` | int | 502 | TCP port |
+| `serial_port` | string | (required for serial) | `/dev/…` path or `esphome-hass://` proxy URL |
+| `baud_rate` | int | 38400 | Serial speed (8N1 fixed) |
 | `modules` | list | `[]` | Configured modules (`string`, `name`, `barcode`, `peak_power`) |
 | `live_reporting` | bool | `True` | Push every reading immediately vs. averaged interval |
 | `write_interval` | int | 30 | Seconds between averaged pushes (5–300) |
@@ -558,6 +572,8 @@ Node data is keyed by `barcode` (not `node_id`), since barcodes are stable while
 | `RECONNECT_TIMEOUT` | 60 s | Seconds of silence before reconnecting |
 | `RECONNECT_DELAY` | 5 s | Delay between reconnection attempts |
 | `RECONNECT_RETRIES` | 0 | Max retries (0 = infinite) |
+| `CONNECTION_TIMEOUT` | 10 s | Open/connect bound |
+| `SERIAL_READ_TIMEOUT` | 1 s | Idle serial read bound |
 | `LISTENER_STOP_TIMEOUT` | 20 s | Bound for stopping the listener |
 | `FRESHNESS_CHECK_INTERVAL_SECONDS` | 5 s | Stale-panel check period |
 | `ENERGY_GAP_THRESHOLD_SECONDS` | 120 s | Longer gaps are not integrated |
@@ -599,19 +615,21 @@ Configurable at runtime without removing the integration: connection, reporting 
 | Test File | Scope |
 | --- | --- |
 | `test_config_flow.py` | Config/options flow forms, validation, module menu |
-| `test_connection.py` | Connection validation, bounded cleanup |
+| `test_serial_config_flow.py` | Serial picker, offline setup, transport changes |
+| `test_connection.py` | Transport validation, passive reads, bounded cleanup |
 | `test_coordinator_persistence.py` | Event processing, Store save/load, barcode mapping lifecycle |
 | `test_write_interval.py` | Live vs. averaged reporting, time-weighted averaging |
 | `test_panel_status.py` | Stale-reading actions, aggregate energy |
 | `test_freshness_listeners.py` | Freshness changes re-render only affected panels and aggregates |
 | `test_review2_data.py` | Stale default, selective updates, aggregates |
-| `test_review2_lifecycle.py` | Unreadable Store, parked listeners, removal |
-| `test_listener_lifecycle.py` | Worker stop/connection release before unload/reload |
+| `test_review2_lifecycle.py` | Unreadable Store, serial path checks, parked listeners, removal |
+| `test_listener_lifecycle.py` | Worker stop/port release before unload/reload |
 | `test_review_fixes.py` | Lifecycle and connection-safety regressions |
 | `test_sensor.py` | Entity creation, state updates, aggregates |
 | `test_diagnostics.py` | Diagnostics payload and redaction |
 | `test_energy.py` | Trapezoidal energy accumulation |
 | `test_migration.py` | Config entry migration and legacy entity cleanup |
+| `core_smoke.py` | Smoke tests against HA 2026.11 without the test harness |
 
 ### Parser Tests (`custom_components/pytap/pytap/tests/`)
 

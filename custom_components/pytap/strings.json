@@ -2,6 +2,14 @@
   "config": {
     "step": {
       "user": {
+        "title": "Choose Connection",
+        "description": "Choose how PyTap receives the passive Tigo byte stream.",
+        "menu_options": {
+          "tcp": "TCP gateway",
+          "serial": "Serial / Home Assistant proxy"
+        }
+      },
+      "tcp": {
         "title": "Connect to Tigo Gateway",
         "description": "Provide the connection details for your Tigo gateway.",
         "data": {
@@ -11,6 +19,18 @@
         "data_description": {
           "host": "The hostname or IP address of your Tigo gateway.",
           "port": "The port number (default: 502)."
+        }
+      },
+      "serial": {
+        "title": "Serial / Home Assistant Proxy",
+        "description": "Select a local serial adapter or a proxy port. For a proxy, add an ESPHome device with serial_proxy to Home Assistant first. Offline ports can be entered manually. PyTap only listens; it never writes to the bus.",
+        "data": {
+          "serial_port": "Serial port or proxy",
+          "baud_rate": "Baud rate"
+        },
+        "data_description": {
+          "serial_port": "Choose the actual port, including when a device exposes multiple proxies.",
+          "baud_rate": "UART speed (default: 38400). Framing is fixed to 8N1 with no flow control."
         }
       },
       "modules_menu": {
@@ -42,7 +62,7 @@
       }
     },
     "error": {
-      "cannot_connect": "Failed to connect to the Tigo gateway. Check host and port, or submit again to save them anyway and keep retrying in the background.",
+      "cannot_connect": "Could not connect to this endpoint. Check the settings, or submit again to save them anyway and keep retrying in the background.",
       "invalid_barcode": "Invalid barcode format. Expected format like A-1234567B.",
       "missing_string": "String group is required.",
       "missing_name": "Module name is required.",
@@ -51,7 +71,12 @@
       "no_modules": "At least one module must be added.",
       "invalid_host": "Enter a hostname or IP address.",
       "invalid_port": "Enter a port between 1 and 65535.",
-      "connection_in_use": "A PyTap entry that is still shutting down holds this connection. Wait a moment and try again."
+      "invalid_serial_port": "Choose a serial device under /dev (for example /dev/serial/by-id/…) or a valid Home Assistant serial-proxy URL.",
+      "invalid_baud_rate": "Enter a baud rate between 1 and 4000000.",
+      "invalid_connection_type": "Choose TCP or serial.",
+      "serial_port_in_use": "Another PyTap entry already uses this serial port, or is still releasing it.",
+      "connection_in_use": "A PyTap entry that is still shutting down holds this connection. Wait a moment and try again.",
+      "unsupported_serial_settings": "The serial backend does not support these settings. Check the selected port and baud rate."
     }
   },
   "entity": {
@@ -134,6 +159,14 @@
       },
       "change_connection": {
         "title": "Change Connection Settings",
+        "description": "Choose the connection type. Your modules, entity IDs, reporting settings, and energy history are preserved.",
+        "menu_options": {
+          "change_tcp": "TCP gateway",
+          "change_serial": "Serial / Home Assistant proxy"
+        }
+      },
+      "change_tcp": {
+        "title": "Change Connection Settings",
         "description": "Update the IP address and port of your Tigo gateway.",
         "data": {
           "host": "Host",
@@ -142,6 +175,18 @@
         "data_description": {
           "host": "The hostname or IP address of your Tigo gateway.",
           "port": "The port number (default: 502)."
+        }
+      },
+      "change_serial": {
+        "title": "Serial / Home Assistant Proxy",
+        "description": "Select a local adapter or an ESPHome serial-proxy port already added to Home Assistant. You can retain or manually enter an offline endpoint. Connection changes are saved immediately and reload PyTap.",
+        "data": {
+          "serial_port": "Serial port or proxy",
+          "baud_rate": "Baud rate"
+        },
+        "data_description": {
+          "serial_port": "Select the actual port; the current port is not probed while PyTap is using it.",
+          "baud_rate": "UART speed (default: 38400). Framing is fixed to 8N1 with no flow control."
         }
       },
       "add_module": {
@@ -204,8 +249,13 @@
       "missing_name": "Module name is required.",
       "missing_string": "String group is required.",
       "invalid_port": "Enter a port between 1 and 65535.",
+      "invalid_serial_port": "Choose a serial device under /dev (for example /dev/serial/by-id/…) or a valid Home Assistant serial-proxy URL.",
+      "invalid_baud_rate": "Enter a baud rate between 1 and 4000000.",
+      "invalid_connection_type": "Choose TCP or serial.",
+      "serial_port_in_use": "Another PyTap entry already uses this serial port, or is still releasing it.",
       "connection_in_use": "A PyTap entry that is still shutting down holds this connection. Wait a moment and try again.",
-      "cannot_connect": "Failed to connect to the Tigo gateway. Check host and port, or submit again to save them anyway and keep retrying in the background.",
+      "unsupported_serial_settings": "The serial backend does not support these settings. Check the selected port and baud rate.",
+      "cannot_connect": "Could not connect to this endpoint. Check the settings, or submit again to save them anyway and keep retrying in the background.",
       "invalid_barcode": "Invalid barcode format. Expected format like A-1234567B.",
       "duplicate_barcode": "This barcode has already been added.",
       "missing_barcode": "Barcode is required."

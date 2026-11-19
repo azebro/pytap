@@ -574,7 +574,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Await the worker and its port cleanup, without blocking HA's loop.
 
         The worker owns close; reads/open attempts are bounded. Never race a
-        read with close, or cancel an executor future as a substitute for
+        serial read with close, or cancel an executor future as a substitute for
         joining its worker. A failed stop prevents reload from taking the port.
         """
         async with self._stop_lock:
@@ -676,7 +676,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._source = None
 
             try:
-                source = open_source(self._connection)
+                source = open_source(self.hass.loop, self._connection)
                 with self._source_lock:
                     if self._stop_event.is_set():
                         return
@@ -775,7 +775,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 retries,
                 str(RECONNECT_RETRIES) if RECONNECT_RETRIES else "∞",
             )
-            # Wake immediately on unload.
+            # Wake immediately on unload, including while a proxy is offline.
             if self._stop_event.wait(RECONNECT_DELAY):
                 return
 

@@ -17,6 +17,8 @@ from homeassistant.helpers import entity_registry as er
 
 from .connection import InvalidConnectionSettings
 from .const import (
+    CONF_BAUD_RATE,
+    CONF_CONNECTION_TYPE,
     CONF_HOST,
     CONF_LIVE_REPORTING,
     CONF_MODULE_BARCODE,
@@ -24,7 +26,9 @@ from .const import (
     CONF_MODULE_STRING,
     CONF_MODULES,
     CONF_PORT,
+    CONF_SERIAL_PORT,
     CONF_WRITE_INTERVAL,
+    CONNECTION_TCP,
     DEFAULT_LIVE_REPORTING,
     DEFAULT_PEAK_POWER,
     DEFAULT_STRING_NAME,
@@ -46,15 +50,19 @@ PLATFORMS: list[Platform] = [Platform.SENSOR]
 
 # Readable names for the setting named in an invalid_connection_settings error.
 _SETTING_NAMES: dict[str, str] = {
+    "base": "connection type",
     CONF_HOST: "host",
     CONF_PORT: "port",
+    CONF_SERIAL_PORT: "serial port",
+    CONF_BAUD_RATE: "baud rate",
 }
 
 # Bumped from 1 → 2 when voltage/current were split into in/out variants.
 # Bumped from 2 → 3 when module string labels became mandatory.
 # Bumped from 3 → 4 when module peak_power became mandatory in config.
 # Bumped from 4 → 5 when live_reporting toggle was added.
-CONFIG_ENTRY_VERSION = 5
+# Bumped from 5 → 6 when serial/proxy connections were added.
+CONFIG_ENTRY_VERSION = 6
 
 # Old unique IDs that were replaced by the _in/_out split.
 _LEGACY_UNIQUE_ID_RENAMES: dict[str, str] = {
@@ -223,6 +231,7 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     v2 → v3: module string labels are mandatory.
     v3 → v4: module peak power is added with default value.
     v4 → v5: live_reporting toggle added (default True).
+    v5 → v6: existing connections explicitly marked as TCP.
     """
     if entry.version > CONFIG_ENTRY_VERSION:
         return False
@@ -293,6 +302,13 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 MIN_WRITE_INTERVAL, min(MAX_WRITE_INTERVAL, interval)
             )
         hass.config_entries.async_update_entry(entry, data=new_data, version=5)
+
+    if entry.version == 5:
+        hass.config_entries.async_update_entry(
+            entry,
+            data={**entry.data, CONF_CONNECTION_TYPE: CONNECTION_TCP},
+            version=6,
+        )
 
     return True
 

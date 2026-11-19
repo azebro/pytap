@@ -45,11 +45,12 @@ async def _setup(
 ) -> tuple[MockConfigEntry, PyTapDataUpdateCoordinator]:
     entry = MockConfigEntry(
         domain=DOMAIN,
-        version=5,
+        version=6,
         unique_id="status-entry",
         data={
             "host": "gateway",
             "port": 502,
+            "connection_type": "tcp",
             "modules": modules or [MODULE],
             **data,
         },

@@ -6,6 +6,11 @@ DEFAULT_NAME = "PyTap"
 # Configuration keys
 CONF_HOST = "host"
 CONF_PORT = "port"
+CONF_CONNECTION_TYPE = "connection_type"
+CONF_SERIAL_PORT = "serial_port"
+CONF_BAUD_RATE = "baud_rate"
+CONNECTION_TCP = "tcp"
+CONNECTION_SERIAL = "serial"
 CONF_MODULES = "modules"
 CONF_LIVE_REPORTING = "live_reporting"
 CONF_WRITE_INTERVAL = "write_interval"
@@ -18,6 +23,9 @@ CONF_MODULE_PEAK_POWER = "peak_power"
 
 # Defaults
 DEFAULT_PORT = 502
+DEFAULT_BAUD_RATE = 38400
+CONNECTION_TIMEOUT = 10
+SERIAL_READ_TIMEOUT = 1
 LISTENER_STOP_TIMEOUT = 20
 DEFAULT_STRING_NAME = "Default"
 DEFAULT_PEAK_POWER = 455

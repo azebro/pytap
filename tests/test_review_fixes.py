@@ -2,14 +2,21 @@
 
 import asyncio
 import logging
+import os
 import socket
 import threading
 import time
 from unittest.mock import MagicMock, patch
 
 from homeassistant.config_entries import ConfigEntryState
+import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.pytap.connection import (
+    InvalidConnectionSettings,
+    normalize_connection,
+    resolved_endpoint_key,
+)
 from custom_components.pytap.const import DOMAIN
 from custom_components.pytap.pytap.core.source import TcpSource
 
@@ -20,8 +27,9 @@ MODULE = {"barcode": BARCODE, "name": "East", "string": "East", "peak_power": 40
 def _entry(hass, *, modules=None, **data):
     entry = MockConfigEntry(
         domain=DOMAIN,
-        version=5,
+        version=6,
         data={
+            "connection_type": "tcp",
             "host": "gateway",
             "port": 502,
             "modules": [MODULE] if modules is None else modules,
@@ -115,6 +123,23 @@ async def test_invalid_saved_port_is_a_clear_setup_error(hass):
     assert entry.state is ConfigEntryState.SETUP_ERROR
     assert entry.error_reason_translation_key == "invalid_connection_settings"
     assert entry.error_reason_translation_placeholders == {"field": "port"}
+
+
+@pytest.mark.parametrize("path", ["/config/secrets.yaml", "/tmp/port", "relative/tty"])
+def test_serial_paths_must_be_device_nodes(path):
+    """Review #14: never open arbitrary files as a serial port."""
+    with pytest.raises(InvalidConnectionSettings):
+        normalize_connection({"connection_type": "serial", "serial_port": path})
+    assert normalize_connection({"connection_type": "serial", "serial_port": "/dev/ttyUSB0"})
+
+
+def test_symlinked_ports_compare_equal(tmp_path):
+    """Review #15: /dev/serial/by-id links and their targets are the same port."""
+    target = tmp_path / "ttyUSB0"
+    target.touch()
+    link = tmp_path / "by-id-tigo"
+    os.symlink(target, link)
+    assert resolved_endpoint_key(str(link)) == resolved_endpoint_key(str(target))
 
 
 async def test_connection_loss_logged_once(hass, caplog):
