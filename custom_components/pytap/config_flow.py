@@ -6,7 +6,7 @@ rather than a comma-separated text blob.
 
 Flow: user (host/port) → modules_menu → add_module (repeat) → finish
 Options: init (menu) → add_module / remove_module / change_connection /
-         change_reporting → done
+         change_reporting / change_stale → done
 """
 
 from __future__ import annotations
@@ -27,6 +27,14 @@ from homeassistant.config_entries import (
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.selector import (
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
+)
 import voluptuous as vol
 
 from .connection import InvalidConnectionSettings, normalize_connection, open_source
@@ -37,14 +45,21 @@ from .const import (
     CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
     CONF_MODULES,
+    CONF_STALE_ACTION,
+    CONF_STALE_TIMEOUT,
     CONF_WRITE_INTERVAL,
     DEFAULT_LIVE_REPORTING,
     DEFAULT_PEAK_POWER,
     DEFAULT_PORT,
+    DEFAULT_STALE_ACTION,
+    DEFAULT_STALE_TIMEOUT,
     DEFAULT_WRITE_INTERVAL,
     DOMAIN,
+    MAX_STALE_TIMEOUT,
     MAX_WRITE_INTERVAL,
+    MIN_STALE_TIMEOUT,
     MIN_WRITE_INTERVAL,
+    STALE_ACTIONS,
 )
 from .coordinator import parked_coordinators
 
@@ -305,6 +320,7 @@ class PyTapOptionsFlow(OptionsFlow):
             menu_options=[
                 "change_connection",
                 "change_reporting",
+                "change_stale",
                 "add_module",
                 "remove_module",
                 "done",
@@ -443,6 +459,48 @@ class PyTapOptionsFlow(OptionsFlow):
             step_id="set_interval",
             data_schema=schema,
         )
+
+    async def async_step_change_stale(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """Choose what live panel readings do once a panel stops reporting."""
+        if user_input is not None:
+            new_data = {
+                **self._config_entry.data,
+                CONF_STALE_ACTION: user_input[CONF_STALE_ACTION],
+                CONF_STALE_TIMEOUT: int(user_input[CONF_STALE_TIMEOUT]),
+            }
+            self.hass.config_entries.async_update_entry(self._config_entry, data=new_data)
+            return await self.async_step_init()
+
+        data = self._config_entry.data
+        schema = vol.Schema(
+            {
+                vol.Required(
+                    CONF_STALE_ACTION, default=data.get(CONF_STALE_ACTION, DEFAULT_STALE_ACTION)
+                ): SelectSelector(
+                    SelectSelectorConfig(
+                        options=list(STALE_ACTIONS),
+                        mode=SelectSelectorMode.DROPDOWN,
+                        translation_key=CONF_STALE_ACTION,
+                    )
+                ),
+                vol.Required(
+                    CONF_STALE_TIMEOUT, default=data.get(CONF_STALE_TIMEOUT, DEFAULT_STALE_TIMEOUT)
+                ): vol.All(
+                    NumberSelector(
+                        NumberSelectorConfig(
+                            min=MIN_STALE_TIMEOUT,
+                            max=MAX_STALE_TIMEOUT,
+                            step=1,
+                            unit_of_measurement="s",
+                            mode=NumberSelectorMode.BOX,
+                        )
+                    ),
+                    vol.Coerce(int),
+                    vol.Range(min=MIN_STALE_TIMEOUT, max=MAX_STALE_TIMEOUT),
+                ),
+            }
+        )
+        return self.async_show_form(step_id="change_stale", data_schema=schema)
 
     async def async_step_add_module(
         self, user_input: dict[str, Any] | None = None

@@ -4,11 +4,12 @@
 
 ### Added
 
+- **Stale reading behaviour** option (**Configure → Change stale reading behaviour**): choose what live panel readings do once a panel stops sending valid reports — **Hold last value** (default for new and existing entries, restored after a restart, so behaviour is unchanged for upgrading users unless they opt in), **Unavailable**, or **Zero** (power, voltage, current and performance report 0; other live readings become unavailable) — and the timeout (60–600 s, default 120 s; in averaged reporting mode the reporting interval is added). With **Unavailable** or **Zero**, string and installation power counts only reporting panels; with **Zero**, their performance still divides by every panel's rating, counting stale panels as 0 W. After a restart, those two modes don't show saved live readings as current until the first new report. Energy totals are never affected.
 - **Configurable reporting mode** — New "Live reporting" toggle (default on) under **Configure → Change reporting settings**. When disabled, readings are cached and delivered as a time-weighted average every *reporting interval* (5–300 s, default 30), reducing CPU and recorder load on installations with many panels. Energy totals are always integrated from raw readings, so only the instantaneous values are averaged.
 
 ### Changed
 
-- Entities are re-rendered only when their data changes: each publish updates just the entities of panels whose data changed and the string/installation aggregates containing them. Global changes (gateway or node-table changes) still update every entity.
+- Entities are re-rendered only when their data changes: each publish updates just the entities of panels whose data changed and the string/installation aggregates containing them, and a panel starting or stopping reporting updates only that panel's entities and aggregates. Global changes (gateway or node-table changes) still update every entity.
 - An unreachable gateway in the setup or connection-change form now shows "cannot connect"; submitting the same settings again saves them and PyTap keeps retrying in the background.
 - Connection loss is logged once (with the error type and errno) instead of on every retry, until data flows again; reconnecting after a silent link is likewise warned about once per outage.
 - Home Assistant 2025.3+ is now required.

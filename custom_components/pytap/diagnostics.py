@@ -27,6 +27,10 @@ async def async_get_config_entry_diagnostics(
             "last_update": node_data.get("last_update"),
             "gateway_id": node_data.get("gateway_id"),
             "node_id": node_data.get("node_id"),
+            "reporting": coordinator.is_reporting(barcode),
+            "seconds_since_report": (
+                round(age, 1) if (age := coordinator.seconds_since_report(barcode)) is not None else None
+            ),
             "daily_energy_wh": node_data.get("daily_energy_wh"),
             "total_energy_wh": node_data.get("total_energy_wh"),
             "readings_today": node_data.get("readings_today"),

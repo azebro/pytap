@@ -45,10 +45,19 @@ from .const import (
     CONF_MODULES,
     DEFAULT_PEAK_POWER,
     DOMAIN,
+    STALE_ACTION_HOLD,
+    STALE_ACTION_ZERO,
 )
 from .coordinator import PyTapConfigEntry, PyTapDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
+
+# Electrical readings that report 0 when the stale action is "zero". Others
+# (temperature, duty cycle, RSSI) have no meaningful zero and go
+# unavailable instead.
+ZERO_WHEN_STALE = frozenset(
+    {"power", "voltage_in", "voltage_out", "current_in", "current_out", "performance"}
+)
 
 
 def _coerce_restored_state_value(raw_state: str, sensor_key: str) -> int | float | None:
@@ -72,6 +81,9 @@ class PyTapSensorEntityDescription(SensorEntityDescription):
     """Describes a PyTap sensor entity."""
 
     value_key: str
+    # Live readings follow the stale-reading action once a panel stops
+    # reporting; energy totals stay available so history is preserved.
+    live: bool = True
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -79,6 +91,7 @@ class PyTapAggregateSensorDescription(SensorEntityDescription):
     """Describes a PyTap aggregate sensor entity."""
 
     value_key: str
+    live: bool = True
 
 
 SENSOR_DESCRIPTIONS: tuple[PyTapSensorEntityDescription, ...] = (
@@ -161,6 +174,7 @@ SENSOR_DESCRIPTIONS: tuple[PyTapSensorEntityDescription, ...] = (
         state_class=SensorStateClass.TOTAL,
         suggested_display_precision=1,
         value_key="daily_energy_wh",
+        live=False,
     ),
     PyTapSensorEntityDescription(
         key="total_energy",
@@ -170,6 +184,7 @@ SENSOR_DESCRIPTIONS: tuple[PyTapSensorEntityDescription, ...] = (
         state_class=SensorStateClass.TOTAL_INCREASING,
         suggested_display_precision=0,
         value_key="total_energy_wh",
+        live=False,
     ),
     PyTapSensorEntityDescription(
         key="readings_today",
@@ -178,6 +193,7 @@ SENSOR_DESCRIPTIONS: tuple[PyTapSensorEntityDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
         suggested_display_precision=0,
         value_key="readings_today",
+        live=False,
     ),
 )
 
@@ -207,6 +223,7 @@ STRING_SENSOR_DESCRIPTIONS: tuple[PyTapAggregateSensorDescription, ...] = (
         state_class=SensorStateClass.TOTAL,
         suggested_display_precision=1,
         value_key="daily_energy_wh",
+        live=False,
     ),
     PyTapAggregateSensorDescription(
         key="total_energy",
@@ -216,6 +233,7 @@ STRING_SENSOR_DESCRIPTIONS: tuple[PyTapAggregateSensorDescription, ...] = (
         state_class=SensorStateClass.TOTAL_INCREASING,
         suggested_display_precision=0,
         value_key="total_energy_wh",
+        live=False,
     ),
 )
 
@@ -245,6 +263,7 @@ INSTALLATION_SENSOR_DESCRIPTIONS: tuple[PyTapAggregateSensorDescription, ...] = 
         state_class=SensorStateClass.TOTAL,
         suggested_display_precision=1,
         value_key="daily_energy_wh",
+        live=False,
     ),
     PyTapAggregateSensorDescription(
         key="total_energy",
@@ -254,6 +273,7 @@ INSTALLATION_SENSOR_DESCRIPTIONS: tuple[PyTapAggregateSensorDescription, ...] = 
         state_class=SensorStateClass.TOTAL_INCREASING,
         suggested_display_precision=0,
         value_key="total_energy_wh",
+        live=False,
     ),
 )
 
@@ -383,6 +403,13 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
         self.async_on_remove(
             self.coordinator.async_add_data_listener([self._barcode], self._handle_coordinator_update)
         )
+        if self.entity_description.live:
+            # Energy totals don't depend on whether the panel is reporting.
+            self.async_on_remove(
+                self.coordinator.async_add_freshness_listener(
+                    [self._barcode], self._handle_coordinator_update
+                )
+            )
         nodes = self.coordinator.data.get("nodes", {})
         node = nodes.get(self._barcode)
         # Only short-circuit to coordinator data if this sensor has a non-None value.
@@ -410,22 +437,42 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
             self._attr_native_value = native_value
             self._restored_native_value = True
 
+    def _stale(self) -> bool:
+        """A live reading whose panel has stopped sending valid reports."""
+        return self.entity_description.live and not self.coordinator.is_reporting(self._barcode)
+
     @property
     def available(self) -> bool:
-        """Return True if the sensor has received data."""
+        """Live readings follow the stale-reading action; energy totals need any data."""
         if not self.coordinator.data:
             return False
         node_data = self.coordinator.data.get("nodes", {}).get(self._barcode)
-        return node_data is not None or self._restored_native_value
+        if not self.entity_description.live:
+            return node_data is not None or self._restored_native_value
+        action = self.coordinator.stale_action
+        if node_data is None:
+            return action == STALE_ACTION_HOLD and self._restored_native_value
+        if not self._stale():
+            return True
+        if action == STALE_ACTION_HOLD:
+            return True
+        return action == STALE_ACTION_ZERO and self.entity_description.key in ZERO_WHEN_STALE
 
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
         node_data = self.coordinator.data.get("nodes", {}).get(self._barcode)
+        key = self.entity_description.key
         if node_data:
             value = node_data.get(self.entity_description.value_key)
-            # Convert duty cycle from 0.0-1.0 to percentage
-            if self.entity_description.key == "dc_dc_duty_cycle" and value is not None:
+            if (
+                key in ZERO_WHEN_STALE
+                and self.coordinator.stale_action == STALE_ACTION_ZERO
+                and self._stale()
+            ):
+                value = 0.0
+            elif key == "dc_dc_duty_cycle" and value is not None:
+                # Convert duty cycle from 0.0-1.0 to percentage
                 value = round(value * 100, 2)
             self._attr_native_value = value
             self._restored_native_value = False
@@ -505,9 +552,12 @@ class PyTapAggregateSensor(
     async def async_added_to_hass(self) -> None:
         """Restore last known aggregate value from Home Assistant state cache."""
         await super().async_added_to_hass()
-        # Re-render when any member's data changes.
+        # Re-render on members' data and (every aggregate reports reporting_count) freshness.
         self.async_on_remove(
             self.coordinator.async_add_data_listener(self._barcodes, self._handle_coordinator_update)
+        )
+        self.async_on_remove(
+            self.coordinator.async_add_freshness_listener(self._barcodes, self._handle_coordinator_update)
         )
 
         nodes = self.coordinator.data.get("nodes", {})
@@ -552,27 +602,38 @@ class PyTapAggregateSensor(
             self._attr_native_value = native_value
             self._restored_native_value = True
 
+    def _members(self) -> list[str]:
+        """Members whose data counts; live values may exclude stale panels."""
+        nodes = self.coordinator.data.get("nodes", {})
+        present = [b for b in self._barcodes if nodes.get(b) is not None]
+        if not self.entity_description.live or self.coordinator.stale_action == STALE_ACTION_HOLD:
+            return present
+        return [b for b in present if self.coordinator.is_reporting(b)]
+
     @property
     def available(self) -> bool:
-        """Return True when at least one constituent has data."""
+        """Return True when at least one constituent has (current) data."""
         if not self.coordinator.data:
             return False
-        nodes = self.coordinator.data.get("nodes", {})
-        return (
-            any(nodes.get(barcode) is not None for barcode in self._barcodes)
-            or self._restored_native_value
-        )
+        if not self.entity_description.live or self.coordinator.stale_action == STALE_ACTION_HOLD:
+            return bool(self._members()) or self._restored_native_value
+        if self.coordinator.stale_action == STALE_ACTION_ZERO:
+            nodes = self.coordinator.data.get("nodes", {})
+            return any(nodes.get(b) is not None for b in self._barcodes)
+        return bool(self._members())
 
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
         nodes = self.coordinator.data.get("nodes", {})
-        has_live_nodes = any(
-            nodes.get(barcode) is not None for barcode in self._barcodes
-        )
 
-        if not has_live_nodes:
-            if not self._restored_native_value:
+        members = self._members()
+        if not members:
+            if self.entity_description.live and self.coordinator.stale_action == STALE_ACTION_ZERO:
+                # Connected but nothing reporting (e.g. night): zero output.
+                self._attr_native_value = 0.0
+                self._restored_native_value = False
+            elif not self._restored_native_value:
                 self._attr_native_value = None
             self.async_write_ha_state()
             return
@@ -580,19 +641,19 @@ class PyTapAggregateSensor(
         if self.entity_description.key == "performance":
             total_power = 0.0
             total_peak_power = 0.0
-
-            for barcode in self._barcodes:
-                node_data = nodes.get(barcode)
-                if node_data is None:
-                    continue
-
-                power = node_data.get("power")
-                peak_power = node_data.get(CONF_MODULE_PEAK_POWER, DEFAULT_PEAK_POWER)
+            # Zero mode counts stale panels as 0 W of their full rating, so
+            # performance covers the whole group, not just the reporting subset.
+            zero_stale = self.coordinator.stale_action == STALE_ACTION_ZERO
+            rated = [b for b in self._barcodes if nodes.get(b) is not None] if zero_stale else members
+            reporting = set(members)
+            for barcode in rated:
+                node_data = nodes[barcode]
+                power = node_data.get("power") if barcode in reporting else 0.0
                 if power is None:
                     continue
 
                 try:
-                    peak_power_value = float(peak_power)
+                    peak_power_value = float(node_data.get(CONF_MODULE_PEAK_POWER, DEFAULT_PEAK_POWER))
                 except (TypeError, ValueError):
                     peak_power_value = float(DEFAULT_PEAK_POWER)
 
@@ -614,12 +675,8 @@ class PyTapAggregateSensor(
             return
 
         total: float | None = None
-
-        for barcode in self._barcodes:
-            node_data = nodes.get(barcode)
-            if node_data is None:
-                continue
-            value = node_data.get(self.entity_description.value_key)
+        for barcode in members:
+            value = nodes[barcode].get(self.entity_description.value_key)
             if value is not None:
                 total = (total or 0.0) + value
 
@@ -644,7 +701,9 @@ class PyTapAggregateSensor(
         """Return additional aggregate state attributes."""
         nodes = self.coordinator.data.get("nodes", {})
         reporting = [
-            barcode for barcode in self._barcodes if nodes.get(barcode) is not None
+            barcode
+            for barcode in self._barcodes
+            if nodes.get(barcode) is not None and self.coordinator.is_reporting(barcode)
         ]
         return {
             "optimizer_count": len(self._barcodes),

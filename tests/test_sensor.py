@@ -131,6 +131,7 @@ def _make_mock_coordinator(hass, entry, node_data=None):
     coordinator.hass = hass
     coordinator.config_entry = entry
     coordinator.last_update_success = True
+    coordinator.is_reporting.return_value = True
     coordinator.async_request_refresh = AsyncMock()
     return coordinator
 
@@ -873,13 +874,14 @@ def test_coerce_restored_state_value_ignores_unavailable() -> None:
 async def test_restart_restores_snapshot_before_live_stream(
     hass: HomeAssistant,
 ) -> None:
-    """After restart, sensors should be available from restored snapshot data."""
+    """After restart, energy restores from snapshot but live readings wait for a report."""
     entry = MockConfigEntry(
         domain=DOMAIN,
         data={
             CONF_HOST: "192.168.1.100",
             CONF_PORT: DEFAULT_PORT,
             CONF_MODULES: [MOCK_MODULES[0]],
+            "stale_action": "unavailable",  # Opt-in; the default holds values.
         },
         entry_id="restart_restore_entry",
         title="PyTap (192.168.1.100)",
@@ -940,8 +942,8 @@ async def test_restart_restores_snapshot_before_live_stream(
     assert power_entity_id is not None
     power_state = hass.states.get(power_entity_id)
     assert power_state is not None
-    assert power_state.state != STATE_UNAVAILABLE
-    assert float(power_state.state) == 299.2
+    # A restored reading is not current: it must not masquerade as live data.
+    assert power_state.state == STATE_UNAVAILABLE
 
     # Verify energy sensors restore from coordinator snapshot (not zeroed)
     daily_energy_entity_id = ent_reg.async_get_entity_id(
@@ -968,8 +970,12 @@ async def test_restart_restores_snapshot_before_live_stream(
     assert installation_power_entity_id is not None
     installation_power_state = hass.states.get(installation_power_entity_id)
     assert installation_power_state is not None
-    assert installation_power_state.state != STATE_UNAVAILABLE
-    assert float(installation_power_state.state) == 299.2
+    assert installation_power_state.state == STATE_UNAVAILABLE
+
+    installation_energy_id = ent_reg.async_get_entity_id(
+        "sensor", DOMAIN, f"{DOMAIN}_{entry.entry_id}_installation_total_energy"
+    )
+    assert float(hass.states.get(installation_energy_id).state) == 2000.0
 
 
 async def test_restart_uses_restore_entity_fallback_without_snapshot(
@@ -982,6 +988,7 @@ async def test_restart_uses_restore_entity_fallback_without_snapshot(
             CONF_HOST: "192.168.1.100",
             CONF_PORT: DEFAULT_PORT,
             CONF_MODULES: [MOCK_MODULES[0]],
+            "stale_action": "unavailable",  # Opt-in; the default holds values.
         },
         entry_id="restart_restore_fallback_entry",
         title="PyTap (192.168.1.100)",
@@ -1031,8 +1038,12 @@ async def test_restart_uses_restore_entity_fallback_without_snapshot(
     assert power_entity_id is not None
     power_state = hass.states.get(power_entity_id)
     assert power_state is not None
-    assert power_state.state != STATE_UNAVAILABLE
-    assert float(power_state.state) == 123.4
+    assert power_state.state == STATE_UNAVAILABLE
+
+    energy_entity_id = ent_reg.async_get_entity_id("sensor", DOMAIN, f"{DOMAIN}_A-1234567B_total_energy")
+    energy_state = hass.states.get(energy_entity_id)
+    assert energy_state is not None
+    assert float(energy_state.state) == 123.4
 
     installation_power_entity_id = ent_reg.async_get_entity_id(
         "sensor", DOMAIN, f"{DOMAIN}_{entry.entry_id}_installation_power"
@@ -1040,5 +1051,9 @@ async def test_restart_uses_restore_entity_fallback_without_snapshot(
     assert installation_power_entity_id is not None
     installation_power_state = hass.states.get(installation_power_entity_id)
     assert installation_power_state is not None
-    assert installation_power_state.state != STATE_UNAVAILABLE
-    assert float(installation_power_state.state) == 456.7
+    assert installation_power_state.state == STATE_UNAVAILABLE
+
+    installation_energy_id = ent_reg.async_get_entity_id(
+        "sensor", DOMAIN, f"{DOMAIN}_{entry.entry_id}_installation_total_energy"
+    )
+    assert float(hass.states.get(installation_energy_id).state) == 456.7
