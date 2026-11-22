@@ -65,15 +65,15 @@ for e in events:
 ### `connect`
 
 ```python
-pytap.connect(source_config: dict) -> Source
+pytap.connect(source_config: dict) -> TcpSource | SerialSource
 ```
 
 Open a byte source for manual use with a `Parser`.
 
 **Parameters:**
-- `source_config` — Same format as `observe()`.
+- `source_config` — `{"tcp": "192.168.1.100", "port": 502}` (port defaults to 502) or `{"serial": "/dev/ttyUSB0"}`. Serial sources require `pyserial`. Raises `ValueError` if neither key is present.
 
-**Returns:** A `Source` object with a `read(size: int) -> bytes` method.
+**Returns:** A source with `read(size: int) -> bytes` (empty bytes on a read timeout) and `close()`. `TcpSource` also has `interrupt()`, which wakes a read blocked in another thread; the reading thread still owns `close()`.
 
 **Example:**
 ```python
@@ -134,7 +134,7 @@ Read-only view of the current infrastructure state:
         ...
     },
     "nodes": {
-        1: {"address": "04:C0:5B:...", "barcode": "S-1234567A"},
+        1: {"address": "04:C0:5B:...", "barcode": "S-1234567A", "gateway_id": 1},
         ...
     }
 }
@@ -168,7 +168,7 @@ Parse statistics:
 
 ## Event Types
 
-All events are `dataclass` instances with a `to_dict() -> dict` method for JSON serialization.
+All events are `dataclass` instances with a `to_dict() -> dict` method for JSON serialization (`timestamp` as ISO 8601).
 
 ### `Event` (base)
 
@@ -176,7 +176,7 @@ All events are `dataclass` instances with a `to_dict() -> dict` method for JSON 
 @dataclass
 class Event:
     event_type: str       # Discriminator: "power_report", "infrastructure", etc.
-    timestamp: datetime   # When the event was generated
+    timestamp: datetime   # From the slot clock (power reports), otherwise wall time
 ```
 
 ### `PowerReportEvent`
@@ -185,32 +185,34 @@ class Event:
 @dataclass
 class PowerReportEvent(Event):
     gateway_id: int          # Gateway link-layer ID (0–32767)
-    node_id: int             # PV node ID (1–65535)
+    node_id: int             # PV node ID
     barcode: str | None      # Tigo barcode e.g. "S-1234567A", if known
     voltage_in: float        # Input voltage (V), panel side
     voltage_out: float       # Output voltage (V), string side
-    current: float           # Current (A)
-    power: float             # Computed: voltage_out × current (W)
+    current_in: float        # Input current (A)
+    power: float             # current_out × voltage_out (W)
+    current_out: float       # (voltage_in × current_in) / voltage_out (A); 0 if voltage_out is 0
     temperature: float       # Module temperature (°C)
     dc_dc_duty_cycle: float  # DC-DC converter duty cycle (0.0–1.0)
-    rssi: int                # Received signal strength indicator
+    rssi: int                # Raw received signal strength byte (0–255)
 ```
 
 **JSON example:**
 ```json
 {
     "event_type": "power_report",
-    "timestamp": "2026-02-16T12:34:56.789+01:00",
+    "timestamp": "2026-02-16T12:34:56.789000",
     "gateway_id": 1,
     "node_id": 42,
     "barcode": "S-1234567A",
-    "voltage_in": 38.5,
-    "voltage_out": 39.2,
-    "current": 8.75,
-    "power": 343.0,
+    "voltage_in": 40.0,
+    "voltage_out": 40.0,
+    "current_in": 8.0,
+    "power": 320.0,
+    "current_out": 8.0,
     "temperature": 45.2,
     "dc_dc_duty_cycle": 0.78,
-    "rssi": -65
+    "rssi": 120
 }
 ```
 
@@ -219,11 +221,11 @@ class PowerReportEvent(Event):
 ```python
 @dataclass
 class InfrastructureEvent(Event):
-    gateways: dict[int, GatewayInfo]  # gateway_id → info
-    nodes: dict[int, NodeInfo]        # node_id → info
+    gateways: dict  # gateway_id → {"address": str | None, "version": str | None}
+    nodes: dict     # node_id → {"address": str, "barcode": str | None, "gateway_id": int}
 ```
 
-Emitted when infrastructure state changes (gateway enumeration, node table updates).
+Emitted when infrastructure state changes (gateway enumeration/identity/version, completed node tables). Each event carries the complete current state.
 
 ### `TopologyEvent`
 
@@ -232,8 +234,7 @@ Emitted when infrastructure state changes (gateway enumeration, node table updat
 class TopologyEvent(Event):
     gateway_id: int
     node_id: int
-    parent_address: int
-    neighbors: list[int]
+    data: bytes     # Raw topology report (hex string in to_dict())
 ```
 
 Emitted when a PV optimizer reports its mesh network topology.
@@ -260,12 +261,17 @@ These are available from `pytap.core.types` (and re-exported from `pytap`).
 | Type | Description | Size |
 |------|-------------|------|
 | `GatewayID` | Gateway link-layer identifier | 15-bit int (0–32767) |
-| `NodeID` | PV network node identifier | 16-bit int (1–65535) |
+| `Address` | Link-layer address (gateway ID + direction bit) | 2 bytes |
+| `NodeID` | PV network node identifier | 16-bit int |
 | `NodeAddress` | PV network address (0=broadcast); bit 15 is a protocol flag masked to 15 bits in node table parsing | 16-bit int |
 | `LongAddress` | IEEE 802.15.4 hardware address | 8 bytes |
-| `SlotCounter` | Time synchronization counter | 16-bit (2-bit epoch + 14-bit slot) |
-| `PacketType` | PV application packet type | `IntEnum` |
+| `RSSI` | Signal strength | 8-bit |
+| `SlotCounter` | Time synchronization counter (slot numbers 0–11999 are valid) | 16-bit (2-bit epoch + 14-bit slot) |
+| `PacketType` / `FrameType` | PV packet / gateway frame types | `IntEnum` |
 | `Frame` | Decoded gateway link-layer frame | dataclass |
-| `Barcode` | Tigo device barcode (`X-NNNNNNNC`) | string |
+| `ReceivedPacketHeader` | Header of a packet inside a receive response | dataclass |
+| `PowerReport` | Raw 13-byte power report with decoded properties | dataclass |
 | `GatewayInfo` | Gateway address + version | dataclass |
 | `NodeInfo` | Node address + barcode | dataclass |
+
+Barcodes (`X-NNNNNNNC`) are plain strings; see `encode_barcode`, `decode_barcode` and `barcode_from_address`.

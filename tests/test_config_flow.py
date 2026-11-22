@@ -24,6 +24,13 @@ MOCK_HOST = "192.168.1.100"
 MOCK_PORT = 502
 
 
+@pytest.fixture(autouse=True)
+def mock_entry_setup():
+    """Flow tests create entries without starting a real network listener."""
+    with patch("custom_components.pytap.async_setup_entry", return_value=True):
+        yield
+
+
 async def test_step_user_shows_form(hass: HomeAssistant) -> None:
     """Test the initial user step shows the connection form."""
     result = await hass.config_entries.flow.async_init(
@@ -56,7 +63,7 @@ async def test_user_step_proceeds_to_menu(hass: HomeAssistant) -> None:
 async def test_user_step_proceeds_even_without_connection(
     hass: HomeAssistant,
 ) -> None:
-    """Test that a failed connection test still proceeds to modules menu."""
+    """An unreachable gateway is reported once; submitting again proceeds."""
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
@@ -69,8 +76,13 @@ async def test_user_step_proceeds_even_without_connection(
             result["flow_id"],
             {"host": MOCK_HOST, "port": MOCK_PORT},
         )
+        assert result["type"] is FlowResultType.FORM
+        assert result["errors"] == {"base": "cannot_connect"}
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {"host": MOCK_HOST, "port": MOCK_PORT},
+        )
 
-    # Should still proceed to modules menu (connection test is non-blocking)
     assert result["type"] is FlowResultType.MENU
     assert result["step_id"] == "modules_menu"
 
@@ -325,6 +337,29 @@ async def test_add_module_duplicate_barcode(hass: HomeAssistant) -> None:
     assert result["errors"] == {CONF_MODULE_BARCODE: "duplicate_barcode"}
 
 
+async def test_finish_without_modules_shows_error(hass: HomeAssistant) -> None:
+    """Finishing with no modules shows a visible error instead of the same menu."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    with patch(
+        "custom_components.pytap.config_flow.validate_connection",
+        return_value={"title": f"PyTap ({MOCK_HOST})"},
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {"host": MOCK_HOST, "port": MOCK_PORT},
+        )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "finish"}
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "add_module"
+    assert result["errors"] == {"base": "no_modules"}
+
+
 # ──────────────────────────────────────────────────────────
 # Options flow: change connection settings
 # ──────────────────────────────────────────────────────────
@@ -443,8 +478,14 @@ async def test_options_change_connection_warn_only_on_failure(
             result["flow_id"],
             {"host": new_host, "port": MOCK_PORT},
         )
+        assert result["errors"] == {"base": "cannot_connect"}
+        assert entry.data["host"] != new_host
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            {"host": new_host, "port": MOCK_PORT},
+        )
 
-    # Should still return to menu despite connection failure
+    # Submitting the same values again saves them despite the failure
     assert result["type"] is FlowResultType.MENU
     assert result["step_id"] == "init"
 

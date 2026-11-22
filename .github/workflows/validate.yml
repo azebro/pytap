@@ -36,7 +36,7 @@ jobs:
         with:
           python-version: "3.13"
       - run: pip install ruff
-      - run: ruff check custom_components/pytap/
+      - run: ruff check custom_components/pytap/ tests/
 
   tests:
     name: Tests
