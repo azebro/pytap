@@ -131,6 +131,19 @@ def _make_mock_coordinator(hass, entry, node_data=None):
     coordinator.hass = hass
     coordinator.config_entry = entry
     coordinator.last_update_success = True
+    coordinator.modules = entry.data.get(CONF_MODULES, [])
+    coordinator.module_count = len(
+        {m.get(CONF_MODULE_BARCODE) for m in coordinator.modules if m.get(CONF_MODULE_BARCODE)}
+    )
+    coordinator.auto_discovery = False
+    coordinator.module_peak_power.side_effect = lambda barcode: next(
+        (
+            m.get(CONF_MODULE_PEAK_POWER, 455)
+            for m in coordinator.modules
+            if m.get(CONF_MODULE_BARCODE) == barcode
+        ),
+        455,
+    )
     coordinator.is_reporting.return_value = True
     coordinator.async_request_refresh = AsyncMock()
     return coordinator

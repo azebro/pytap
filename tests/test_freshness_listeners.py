@@ -10,7 +10,7 @@ from homeassistant.helpers.entity import Entity
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.pytap.const import DEFAULT_STALE_TIMEOUT, DOMAIN
+from custom_components.pytap.const import CONF_AUTO_DISCOVERY, DEFAULT_STALE_TIMEOUT, DOMAIN
 from custom_components.pytap.coordinator import PyTapDataUpdateCoordinator
 from custom_components.pytap.pytap.core.events import PowerReportEvent
 
@@ -38,12 +38,14 @@ def _event(barcode: str) -> PowerReportEvent:
 async def _setup(hass: HomeAssistant) -> tuple[MockConfigEntry, PyTapDataUpdateCoordinator]:
     entry = MockConfigEntry(
         domain=DOMAIN,
-        version=5,
+        version=7,
         unique_id="freshness-entry",
         data={
             "host": "gateway",
             "port": 502,
+            "connection_type": "tcp",
             "modules": [MODULE, MODULE_B],
+            CONF_AUTO_DISCOVERY: False,
             "stale_action": "unavailable",  # Opt-in; makes freshness visible.
         },
     )
@@ -148,6 +150,34 @@ async def test_one_call_per_registration_and_unsubscribe(hass: HomeAssistant) ->
 
     unsub()
     assert all(unsub not in listeners for listeners in coordinator._freshness_listeners.values())
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_aggregate_follows_membership_changes(hass: HomeAssistant) -> None:
+    entry, coordinator = await _setup(hass)
+    await _feed(hass, coordinator, BARCODE)
+    await _feed(hass, coordinator, OTHER)
+    east_id = _entity_id(hass, "sensor", f"{DOMAIN}_{entry.entry_id}_string_East_power")
+    east = hass.data["sensor"].get_entity(east_id)
+
+    east.set_barcodes([BARCODE, OTHER])  # The West panel moved into East.
+    written: list[str] = []
+    with _record_writes(written):
+        _set_age(coordinator, OTHER, DEFAULT_STALE_TIMEOUT + 1)
+        coordinator._async_check_freshness()
+        await hass.async_block_till_done()
+    assert east_id in written
+    assert hass.states.get(east_id).attributes["reporting_count"] == 1
+
+    east.set_barcodes([BARCODE])  # And back out again.
+    await _feed(hass, coordinator, OTHER)
+    written.clear()
+    with _record_writes(written):
+        _set_age(coordinator, OTHER, DEFAULT_STALE_TIMEOUT + 1)
+        coordinator._async_check_freshness()
+        await hass.async_block_till_done()
+    assert written and east_id not in written
+
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 

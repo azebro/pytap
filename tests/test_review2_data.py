@@ -1,4 +1,4 @@
-"""Second review: stale default, partial publishes, sequencing and saves."""
+"""Second review: stale default, barcode claims, partial publishes, sequencing and saves."""
 
 from datetime import date, datetime, timedelta
 from datetime import time as dt_time
@@ -17,13 +17,18 @@ from pytest_homeassistant_custom_component.common import (
 )
 
 from custom_components.pytap.const import (
+    CONF_AUTO_DISCOVERY,
     CONF_STALE_ACTION,
     DEFAULT_STALE_ACTION,
     DEFAULT_STALE_TIMEOUT,
     DOMAIN,
     STALE_ACTION_HOLD,
 )
-from custom_components.pytap.coordinator import PyTapDataUpdateCoordinator
+from custom_components.pytap.coordinator import (
+    BarcodeClaims,
+    PyTapDataUpdateCoordinator,
+    barcode_claims,
+)
 from custom_components.pytap.pytap.core.events import InfrastructureEvent, PowerReportEvent
 from custom_components.pytap.sensor import STRING_SENSOR_DESCRIPTIONS, PyTapAggregateSensor
 
@@ -63,13 +68,15 @@ def _entry(
 ) -> MockConfigEntry:
     entry = MockConfigEntry(
         domain=DOMAIN,
-        version=5,
+        version=7,
         unique_id=unique_id,
         entry_id=entry_id,
         data={
             "host": data.pop("host", "gateway"),
             "port": 502,
+            "connection_type": "tcp",
             "modules": [MODULE, MODULE_B] if modules is None else modules,
+            CONF_AUTO_DISCOVERY: data.pop("auto", False),
             **data,
         },
     )
@@ -128,6 +135,88 @@ async def test_default_stale_action_is_hold_for_existing_entries(hass: HomeAssis
     assert _bare(hass, unique_id="y", **{CONF_STALE_ACTION: "zero"}).stale_action == "zero"
 
 
+# --- 2. Barcode claims -------------------------------------------------------
+
+
+def test_claims_are_atomic_across_threads() -> None:
+    claims = BarcodeClaims()
+    barcodes = [f"B-{i:07d}" for i in range(2000)]
+    won: dict[str, set[str]] = {"a": set(), "b": set()}
+    barrier = threading.Barrier(2)
+
+    def worker(entry_id: str, order: list[str]) -> None:
+        barrier.wait()
+        for barcode in order:
+            if claims.claim(barcode, entry_id):
+                won[entry_id].add(barcode)
+
+    threads = [
+        threading.Thread(target=worker, args=("a", barcodes)),
+        threading.Thread(target=worker, args=("b", list(reversed(barcodes)))),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not won["a"] & won["b"]
+    assert won["a"] | won["b"] == set(barcodes)
+    # Same-entry re-claims succeed; releasing hands barcodes to others.
+    assert all(claims.claim(barcode, "a") for barcode in won["a"])
+    claims.release_entry("a")
+    assert all(claims.claim(barcode, "b") for barcode in barcodes)
+
+
+async def test_two_entries_discovering_concurrently_never_share_a_barcode(hass: HomeAssistant) -> None:
+    first = _bare(hass, [], auto=True, unique_id="first")
+    second = _bare(hass, [], auto=True, unique_id="second", host="other")
+    barcodes = [f"B-{i:07d}" for i in range(300)]
+    barrier = threading.Barrier(2)
+
+    def worker(coordinator: PyTapDataUpdateCoordinator, order: list[str]) -> None:
+        barrier.wait()
+        coordinator._process_event(_infra(*order))
+
+    # The worker must never touch loop-only config entry APIs.
+    with patch.object(hass.config_entries, "async_entries", side_effect=AssertionError("loop only")):
+        threads = [
+            threading.Thread(target=worker, args=(first, barcodes)),
+            threading.Thread(target=worker, args=(second, list(reversed(barcodes)))),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    tracked_first = {m["barcode"] for m in first.modules}
+    tracked_second = {m["barcode"] for m in second.modules}
+    assert not tracked_first & tracked_second
+    assert tracked_first | tracked_second == set(barcodes)
+
+
+async def test_manual_modules_are_claimed_at_init(hass: HomeAssistant) -> None:
+    manual = _bare(hass, [MODULE], unique_id="manual")
+    automatic = _bare(hass, [], auto=True, unique_id="auto", host="other")
+    assert barcode_claims(hass).claim(BARCODE, manual.config_entry.entry_id)
+    assert automatic._add_discovered_module(BARCODE, 1) is False
+    assert automatic._add_discovered_module(OTHER, 2) is True
+
+    # Released on unload/removal: the other entry may now track it.
+    manual.release_barcode_claims()
+    assert automatic._add_discovered_module(BARCODE, 1) is True
+
+
+async def test_same_entry_reclaims_after_reload(hass: HomeAssistant) -> None:
+    coordinator = _bare(hass, [], auto=True)
+    coordinator._process_event(_infra(BARCODE))
+    assert coordinator.module_count == 1
+    # A new (or parked) coordinator for the same entry restores its modules.
+    restored = PyTapDataUpdateCoordinator(hass, coordinator.config_entry)
+    restored._schedule_save = MagicMock()
+    restored._store.async_load = AsyncMock(return_value={"auto_modules": coordinator.modules})
+    await restored._async_load_coordinator_state()
+    assert restored.module_count == 1
+
+
 # --- 3. Partial publishes ----------------------------------------------------
 
 
@@ -167,6 +256,26 @@ async def test_gateway_change_is_a_global_update(hass: HomeAssistant) -> None:
     unique_ids = _unique_ids(hass, written)
     assert any(BARCODE in uid for uid in unique_ids) and any(OTHER in uid for uid in unique_ids)
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_discovery_still_adds_entities(hass: HomeAssistant) -> None:
+    entry, coordinator = await _setup(hass, [], auto=True)
+    await _feed(hass, coordinator, _power(OTHER, node_id=7))
+    registry = er.async_get(hass)
+    power_id = registry.async_get_entity_id("sensor", DOMAIN, f"{DOMAIN}_{OTHER}_power")
+    assert power_id is not None
+    assert float(hass.states.get(power_id).state) > 0
+    installation = registry.async_get_entity_id(
+        "sensor", DOMAIN, f"{DOMAIN}_{entry.entry_id}_installation_power"
+    )
+    assert float(hass.states.get(installation).state) > 0
+
+    # Later reports for the discovered panel update through its data listener.
+    before = float(hass.states.get(power_id).state)
+    await _feed(hass, coordinator, _power(OTHER, node_id=7, iin=3.0))
+    assert float(hass.states.get(power_id).state) > before
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    assert coordinator._data_listeners == {}
 
 
 async def test_interval_publish_notifies_only_changed_panels(hass: HomeAssistant) -> None:
@@ -311,6 +420,7 @@ def _aggregate(description, barcodes, nodes, *, action, reporting):
     coordinator.data = {"nodes": nodes}
     coordinator.stale_action = action
     coordinator.is_reporting.side_effect = lambda barcode: barcode in reporting
+    coordinator.module_peak_power.return_value = 500
     sensor = PyTapAggregateSensor(coordinator, description, barcodes, MagicMock(), "uid")
     sensor.async_write_ha_state = MagicMock()
     return coordinator, sensor

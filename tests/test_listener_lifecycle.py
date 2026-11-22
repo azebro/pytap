@@ -13,8 +13,11 @@ from custom_components.pytap.coordinator import PyTapDataUpdateCoordinator
 from custom_components.pytap.pytap.core.events import PowerReportEvent
 
 
-def _coordinator(hass):
-    entry = MockConfigEntry(domain=DOMAIN, version=5, data={"host": "gateway", "modules": []})
+def _coordinator(hass, serial=False):
+    connection = {"connection_type": "tcp", "host": "gateway"}
+    if serial:
+        connection = {"connection_type": "serial", "serial_port": "/dev/fake-tigo"}
+    entry = MockConfigEntry(domain=DOMAIN, version=6, data={**connection, "modules": []})
     entry.add_to_hass(hass)
     coordinator = PyTapDataUpdateCoordinator(hass, entry)
     coordinator._async_load_coordinator_state = AsyncMock()
@@ -22,8 +25,9 @@ def _coordinator(hass):
     return coordinator
 
 
-async def test_stop_waits_for_read_and_close_without_blocking_loop(hass):
-    coordinator = _coordinator(hass)
+@pytest.mark.parametrize("serial", [False, True])
+async def test_stop_waits_for_read_and_close_without_blocking_loop(hass, serial):
+    coordinator = _coordinator(hass, serial)
     reading = asyncio.Event()
     release = threading.Event()
     closed = asyncio.Event()
@@ -77,7 +81,7 @@ async def test_snapshot_failure_cannot_skip_port_release(hass):
 
 
 async def test_unload_during_open_closes_late_source(hass):
-    coordinator = _coordinator(hass)
+    coordinator = _coordinator(hass, serial=True)
     opening = asyncio.Event()
     release = threading.Event()
     source = MagicMock()
@@ -140,12 +144,12 @@ async def test_stop_timeout_blocks_replacement_until_worker_finishes(hass):
 
 
 async def test_stop_during_retry_is_interruptible_and_logs_safely(hass, caplog):
-    coordinator = _coordinator(hass)
+    coordinator = _coordinator(hass, serial=True)
     attempted = asyncio.Event()
 
     def fail(*args):
         hass.loop.call_soon_threadsafe(attempted.set)
-        raise OSError("private-id")
+        raise OSError("esphome-hass://esphome/private-id?port_name=private")
 
     with patch("custom_components.pytap.coordinator.open_source", side_effect=fail):
         await coordinator.async_start_listener()
@@ -155,10 +159,10 @@ async def test_stop_during_retry_is_interruptible_and_logs_safely(hass, caplog):
     assert "private-id" not in caplog.text
 
 
-async def test_reconnect_retains_endpoint(hass):
-    coordinator = _coordinator(hass)
+async def test_proxy_reconnect_retains_endpoint(hass):
+    coordinator = _coordinator(hass, serial=True)
     disconnected = MagicMock()
-    disconnected.read.side_effect = OSError("gateway restarted")
+    disconnected.read.side_effect = OSError("proxy restarted")
     reconnected = MagicMock()
 
     def stop_after_reconnect(size):
@@ -170,20 +174,21 @@ async def test_reconnect_retains_endpoint(hass):
         patch("custom_components.pytap.coordinator.RECONNECT_DELAY", 0.001),
         patch(
             "custom_components.pytap.coordinator.open_source",
-            side_effect=[OSError("gateway offline at startup"), disconnected, reconnected],
+            side_effect=[OSError("entry not loaded at startup"), disconnected, reconnected],
         ) as connect,
     ):
         async with asyncio.timeout(2):
             await coordinator._async_listen()
             assert await coordinator.async_stop_listener()
     assert connect.call_count == 3
-    assert all(call.args[0]["host"] == "gateway" for call in connect.call_args_list)
+    assert all(call.args[1]["serial_port"] == "/dev/fake-tigo" for call in connect.call_args_list)
     disconnected.close.assert_called_once()
     reconnected.close.assert_called_once()
 
 
-async def test_source_bytes_feed_parser_pipeline(hass):
-    coordinator = _coordinator(hass)
+@pytest.mark.parametrize("serial", [False, True])
+async def test_both_transports_feed_identical_parser_pipeline(hass, serial):
+    coordinator = _coordinator(hass, serial)
     coordinator._configured_barcodes = {"A-1234567B"}
     coordinator._schedule_save = MagicMock()
     parser = MagicMock()

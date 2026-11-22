@@ -8,9 +8,10 @@ from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.const import CONF_HOST
 from homeassistant.core import HomeAssistant
 
+from .const import CONF_SERIAL_PORT
 from .coordinator import PyTapConfigEntry
 
-TO_REDACT = {CONF_HOST, "title"}
+TO_REDACT = {CONF_HOST, CONF_SERIAL_PORT, "title"}
 
 
 async def async_get_config_entry_diagnostics(
@@ -40,6 +41,7 @@ async def async_get_config_entry_diagnostics(
 
     return {
         "config_entry": async_redact_data(entry.as_dict(), TO_REDACT),
+        "modules": coordinator.modules,
         "counters": coordinator.data.get("counters", {}),
         "gateways": coordinator.data.get("gateways", {}),
         "discovered_barcodes": coordinator.data.get("discovered_barcodes", []),
