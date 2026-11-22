@@ -1,4 +1,4 @@
-"""Stale-reading actions."""
+"""Stale-reading actions and aggregate energy."""
 
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -226,6 +226,51 @@ async def test_topology_survives_power_reports(hass: HomeAssistant) -> None:
     await _feed(hass, coordinator, _event())
     assert coordinator._state["nodes"][BARCODE]["topology"]["data"] == "01"
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+def _string_energy(barcodes: list[str], values: dict[str, float]):
+    """A string total_energy aggregate fed with member lifetime totals."""
+    from custom_components.pytap.sensor import STRING_SENSOR_DESCRIPTIONS, PyTapAggregateSensor
+
+    coordinator = MagicMock(spec=PyTapDataUpdateCoordinator)
+    coordinator.data = {"nodes": {b: {"total_energy_wh": v} for b, v in values.items()}}
+    coordinator.stale_action = "unavailable"
+    description = next(d for d in STRING_SENSOR_DESCRIPTIONS if d.key == "total_energy")
+    sensor = PyTapAggregateSensor(coordinator, description, barcodes, MagicMock(), "uid")
+    sensor.async_write_ha_state = MagicMock()
+    return coordinator, sensor
+
+
+def test_aggregate_energy_ignores_membership_changes() -> None:
+    """Review #3: moving a panel into a string must not add its lifetime energy."""
+    coordinator, sensor = _string_energy([BARCODE], {BARCODE: 1000.0, OTHER: 5000.0})
+    sensor._handle_coordinator_update()
+    assert sensor.native_value == 1000.0
+
+    sensor._barcodes = [BARCODE, OTHER]  # OTHER moved into this string.
+    sensor._handle_coordinator_update()
+    assert sensor.native_value == 1000.0
+
+    coordinator.data = {"nodes": {BARCODE: {"total_energy_wh": 1010.0}, OTHER: {"total_energy_wh": 5020.0}}}
+    sensor._handle_coordinator_update()
+    assert sensor.native_value == 1030.0
+
+    sensor._barcodes = [OTHER]  # BARCODE moved out: no decrease.
+    sensor._handle_coordinator_update()
+    assert sensor.native_value == 1030.0
+
+
+def test_aggregate_energy_restores_baselines() -> None:
+    coordinator, sensor = _string_energy([BARCODE], {BARCODE: 1000.0})
+    sensor._handle_coordinator_update()
+    restored = sensor.extra_restore_state_data.as_dict()
+    assert restored["baselines"] == {BARCODE: 1000.0}
+
+    _, again = _string_energy([BARCODE], {BARCODE: 1005.0})
+    again._energy_total = restored["native_value"]
+    again._baselines = restored["baselines"]
+    again._handle_coordinator_update()
+    assert again.native_value == 1005.0
 
 
 async def test_options_flow_stale_step(hass: HomeAssistant) -> None:

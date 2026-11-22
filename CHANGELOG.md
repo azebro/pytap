@@ -9,6 +9,7 @@
 
 ### Changed
 
+- String and installation energy totals now add up each member's increase since it was last seen (restored across restarts), so moving a panel between strings or adding a new panel no longer adds its lifetime energy. The daily aggregate resets at local midnight and reports the start of its own cycle as `last_reset`.
 - Entities are re-rendered only when their data changes: each publish updates just the entities of panels whose data changed and the string/installation aggregates containing them, and a panel starting or stopping reporting updates only that panel's entities and aggregates. Global changes (gateway or node-table changes) still update every entity.
 - An unreachable gateway in the setup or connection-change form now shows "cannot connect"; submitting the same settings again saves them and PyTap keeps retrying in the background.
 - Connection loss is logged once (with the error type and errno) instead of on every retry, until data flows again; reconnecting after a silent link is likewise warned about once per outage.

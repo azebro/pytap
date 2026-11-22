@@ -412,6 +412,10 @@ Sensors are `CoordinatorEntity` + `RestoreSensor`. On each update (a global coor
 
 In hold mode a sensor with no coordinator node but a restored HA state stays available with that value.
 
+#### Aggregate Energy
+
+String/installation energy sensors store their own total plus each member's last seen value (`baselines`) as extra restore data. On each update they add every member's increase since its baseline; new members and member decreases (e.g. midnight) only rebase. Membership changes therefore never add a panel's lifetime energy or look like a meter reset. Upgrading from an older version, the total aggregate continues from its restored plain sum. The daily aggregate starts a new cycle when the local date changes, and `last_reset` is the start of that cycle. Aggregate attributes: `optimizer_count`, `reporting_count`.
+
 #### Barcode-to-Node Matching
 
 The Tigo protocol identifies nodes by `node_id` (transient) and `barcode` (stable). The parser resolves barcodes from its node table (`PersistentState`) when it emits `PowerReportEvent`; when the barcode is `None`, the coordinator uses its own `node_id → barcode` map, but only after the current session's first node table (node IDs may have been reassigned overnight).
@@ -598,7 +602,7 @@ Configurable at runtime without removing the integration: connection, reporting 
 | `test_connection.py` | Connection validation, bounded cleanup |
 | `test_coordinator_persistence.py` | Event processing, Store save/load, barcode mapping lifecycle |
 | `test_write_interval.py` | Live vs. averaged reporting, time-weighted averaging |
-| `test_panel_status.py` | Stale-reading actions |
+| `test_panel_status.py` | Stale-reading actions, aggregate energy |
 | `test_freshness_listeners.py` | Freshness changes re-render only affected panels and aggregates |
 | `test_review2_data.py` | Stale default, selective updates, aggregates |
 | `test_review2_lifecycle.py` | Unreadable Store, parked listeners, removal |

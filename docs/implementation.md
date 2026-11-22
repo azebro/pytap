@@ -325,8 +325,8 @@ The coordinator calls it for every tracked report. Daily values are also reset p
 #### `PyTapAggregateSensor`
 
 - Live values (power, performance) use `_members()`: all members with data in `hold`, or only reporting ones otherwise; `zero` mode reports 0 when none report. In `zero` mode performance divides by the rating of every member with data, counting stale members as 0 W.
-- Energy values sum every member with data, regardless of the stale action.
-- Attributes: `optimizer_count`, `reporting_count`. `last_reset` (daily) = start of today.
+- Energy values accumulate member increases against `baselines`, stored with the own total and `cycle_date` as `_AggregateEnergyData` extra restore data. Legacy restored totals (no baselines) continue as the starting value.
+- Attributes: `optimizer_count`, `reporting_count`. `last_reset` (daily) = start of `cycle_date`.
 
 ---
 
@@ -464,9 +464,9 @@ Home Assistant frontend / automations / history
 | `test_connection.py`              | Connection validation, bounded cleanup                                                                                                                                    |
 | `test_coordinator_persistence.py` | Store load/save, mappings, deferred reports, midnight reset                                                                                                               |
 | `test_write_interval.py`          | Live vs. averaged reporting and time-weighted averaging                                                                                                                   |
-| `test_panel_status.py`            | Stale-reading actions                                                                                                                                                     |
+| `test_panel_status.py`            | Stale-reading actions, aggregate energy                                                                                                                                   |
 | `test_freshness_listeners.py`     | Freshness transitions re-render only the affected panels and aggregates; listener registration and unload                                                                 |
-| `test_review2_data.py`            | Default stale action, selective re-rendering on publish, midnight-reset ordering, save scheduling, aggregate performance                                                  |
+| `test_review2_data.py`            | Default stale action, selective re-rendering on publish, midnight-reset ordering, save scheduling, aggregate performance and restore                                      |
 | `test_review2_lifecycle.py`       | Unreadable Store, parked listeners, entry removal, setup recovery, outage logs                                                                                            |
 | `test_listener_lifecycle.py`      | Worker finishes and releases the connection before unload/reload                                                                                                          |
 | `test_review_fixes.py`            | TCP interrupt, slow stop, invalid saved port, one-time connection-loss log                                                                                                |
@@ -706,6 +706,7 @@ Created this implementation document capturing all development work to date.
 - Configurable stale-reading action/timeout (`change_stale` options step) replacing a fixed report timeout; freshness check every 5 s that re-renders only the entities of panels whose reporting state changed (per-barcode freshness listeners).
 - Coordinator stored in `entry.runtime_data`; `hass.data[DOMAIN]` kept only as a registry of coordinators still stopping after a timed-out unload.
 - Worker-owned `_state` with published copies; DST-safe midnight reset via `async_track_time_change`.
+- Aggregate energy accumulates member increases with restored baselines.
 - Lifecycle: bounded stop with `ConfigEntryNotReady` retry, `TcpSource.interrupt()`, listener stopped on `EVENT_HOMEASSISTANT_STOP`, saved state deleted with the entry.
 - Connection: `connection.py` with `normalize_connection()` and `open_source()`, probe-then-resubmit, one-time connection-loss log, `ConfigEntryError` for invalid saved settings.
 - Parser: an invalid header slot counter never updates the slot clock; power reports with invalid slot counters are dropped; both increment `invalid_slots` (refined in Phase 20).
