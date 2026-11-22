@@ -48,3 +48,7 @@ jobs:
           python-version: "3.13"
       - run: pip install -r requirements-test.txt
       - run: python -m pytest tests/ -vv --tb=short
+      - name: Parser library tests
+        env:
+          PYTHONPATH: custom_components/pytap
+        run: python -c 'import pytap, pytest; raise SystemExit(pytest.main(["custom_components/pytap/pytap/tests/", "--import-mode=importlib", "-vv"]))'
