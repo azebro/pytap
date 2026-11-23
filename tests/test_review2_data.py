@@ -63,12 +63,13 @@ def _entry(
 ) -> MockConfigEntry:
     entry = MockConfigEntry(
         domain=DOMAIN,
-        version=5,
+        version=6,
         unique_id=unique_id,
         entry_id=entry_id,
         data={
             "host": data.pop("host", "gateway"),
             "port": 502,
+            "connection_type": "tcp",
             "modules": [MODULE, MODULE_B] if modules is None else modules,
             **data,
         },

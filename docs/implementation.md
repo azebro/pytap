@@ -16,7 +16,7 @@ For the high-level architecture and design rationale, see [architecture.md](arch
    - [const.py — Constants](#constpy--constants)
    - [manifest.json — Integration Metadata](#manifestjson--integration-metadata)
    - [config_flow.py — Configuration Flow](#config_flowpy--configuration-flow)
-   - [connection.py — Connection Settings](#connectionpy--connection-settings)
+   - [connection.py — Transports](#connectionpy--transports)
    - [coordinator.py — Data Coordinator](#coordinatorpy--data-coordinator)
    - [energy.py — Energy Accumulation](#energypy--energy-accumulation)
    - [sensor.py — Sensor Platform](#sensorpy--sensor-platform)
@@ -35,7 +35,7 @@ For the high-level architecture and design rationale, see [architecture.md](arch
 
 ## Implementation Summary
 
-PyTap is a Home Assistant custom component that passively monitors Tigo TAP solar energy systems. It receives the RS-485 bus byte stream from the Tigo gateway over TCP, parses the protocol in real time using an embedded Python parser library, and exposes per-optimizer entities in Home Assistant.
+PyTap is a Home Assistant custom component that passively monitors Tigo TAP solar energy systems. It receives the RS-485 bus byte stream over TCP, a local serial adapter, or an ESPHome serial proxy, parses the protocol in real time using an embedded Python parser library, and exposes per-optimizer entities in Home Assistant.
 
 **Key characteristics of the current implementation:**
 
@@ -44,11 +44,11 @@ PyTap is a Home Assistant custom component that passively monitors Tigo TAP sola
 | Integration type | Hub (`integration_type: "hub"`) |
 | Data delivery | Push-based streaming (`iot_class: "local_push"`); selectable live or time-weighted averaged interval reporting |
 | Entity creation | Deterministic from the configured module list at setup |
-| Config flow | Host/port form, then menu-driven module list |
+| Config flow | Transport menu (TCP / serial), then menu-driven module list |
 | Threading model | Blocking parser in executor thread with private state; copies published to the async event loop |
 | Stale readings | Configurable action (`hold` default for all entries; opt-in `unavailable`, `zero`) after a 60–600 s timeout (default 120 s) |
 | Restart behavior | Store restores mappings, energy and node snapshots; live readings are shown before the first new report only with `hold` |
-| External dependencies | None; parser library embedded |
+| External dependencies | `serialx` (serial/proxy); parser library embedded |
 | Entity types | Per optimizer: 12 sensors; 4 aggregate sensors per string and per installation |
 
 ---
@@ -57,9 +57,9 @@ PyTap is a Home Assistant custom component that passively monitors Tigo TAP sola
 
 ```
 custom_components/pytap/
-├── __init__.py          # Lifecycle (setup, teardown, migration v1→v5)
+├── __init__.py          # Lifecycle (setup, teardown, migration v1→v6)
 ├── config_flow.py       # Config & options flows
-├── connection.py        # Connection validation, opening the TCP source
+├── connection.py        # Connection validation, serial/proxy source, endpoint comparison
 ├── const.py             # Domain, config keys, defaults, reporting/stale/energy constants
 ├── coordinator.py       # Push-based DataUpdateCoordinator
 ├── diagnostics.py       # Diagnostics download (config entry diagnostics)
@@ -99,6 +99,9 @@ DOMAIN = "pytap"
 
 # Connection
 DEFAULT_PORT = 502
+DEFAULT_BAUD_RATE = 38400
+CONNECTION_TIMEOUT = 10           # Open/connect bound (s)
+SERIAL_READ_TIMEOUT = 1           # Idle serial read bound (s)
 LISTENER_STOP_TIMEOUT = 20        # Bound for stopping the listener (s)
 
 # Modules
@@ -131,18 +134,20 @@ ENERGY_LOW_POWER_THRESHOLD_W = 1.0
 {
   "domain": "pytap",
   "name": "PyTap",
+  "after_dependencies": ["esphome"],
   "codeowners": ["@azebro"],
   "config_flow": true,
+  "dependencies": ["usb"],
   "documentation": "https://github.com/azebro/pytap",
   "integration_type": "hub",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/azebro/pytap/issues",
-  "requirements": [],
+  "requirements": ["serialx>=1.15.1"],
   "version": "1.2.0"
 }
 ```
 
-`hacs.json` requires Home Assistant 2025.3.0 (`AddConfigEntryEntitiesCallback`).
+`hacs.json` requires Home Assistant 2026.11.0.
 
 ---
 
@@ -151,23 +156,24 @@ ENERGY_LOW_POWER_THRESHOLD_W = 1.0
 #### Config Flow Steps
 
 ```
-┌─────────────┐   ┌──────────────────┐   ┌──────────────┐
-│ Step: user  │──►│ Step: modules_   │──►│ add_module   │
-│ (host/port) │   │ menu (menu)      │◄──│ (form)       │
-└─────────────┘   │  ► Add module    │   └──────────────┘
-                  │  ► Finish setup  │── CREATE_ENTRY
-                  └──────────────────┘
+┌─────────────┐   ┌──────────────┐   ┌──────────────────┐   ┌──────────────┐
+│ Step: user  │──►│ tcp / serial │──►│ Step: modules_   │──►│ add_module   │
+│ (menu)      │   │ (form)       │   │ menu (menu)      │◄──│ (form)       │
+└─────────────┘   └──────────────┘   │  ► Add module    │   └──────────────┘
+                                     │  ► Finish setup  │── CREATE_ENTRY
+                                     └──────────────────┘
 ```
 
-1. **`async_step_user`** — Host/port form. `normalize_connection()` validates it; `connection_errors()` then rejects a TCP host and port still held by a parked coordinator (`connection_in_use`) and probes the gateway in the executor. A failed probe shows `cannot_connect`; the same settings submitted again are accepted. Sets a random UUID as unique ID.
-2. **`async_step_modules_menu`** — Add a module, Finish setup; shows the module list.
-3. **`async_step_add_module`** — `string`, `name`, `barcode` (required), `peak_power` (1–1000, default 455). Errors: `missing_string`, `missing_name`, `missing_barcode`, `invalid_barcode` (`^[0-9A-Fa-f]-[0-9A-Fa-f]{1,7}[A-Za-z]$`), `duplicate_barcode`.
-4. **`async_step_finish`** — With no modules, shows the add-module form with `no_modules`; otherwise creates the entry with connection settings and `modules`.
+1. **`async_step_user`** — Menu: TCP gateway or Serial / Home Assistant proxy.
+2. **`async_step_tcp` / `async_step_serial`** — `normalize_connection()` validates the form; `connection_errors()` then rejects a serial port used by another PyTap entry (`serial_port_in_use`, symlinks resolved) or a serial port / TCP host and port still held by a parked coordinator (`serial_port_in_use` / `connection_in_use`), and probes the endpoint in the executor (a path that doesn't resolve to a character device under `/dev/` gives `invalid_serial_port`). A failed probe shows `cannot_connect`; the same settings submitted again are accepted. Sets a random UUID as unique ID.
+3. **`async_step_modules_menu`** — Add a module, Finish setup; shows the module list.
+4. **`async_step_add_module`** — `string`, `name`, `barcode` (required), `peak_power` (1–1000, default 455). Errors: `missing_string`, `missing_name`, `missing_barcode`, `invalid_barcode` (`^[0-9A-Fa-f]-[0-9A-Fa-f]{1,7}[A-Za-z]$`), `duplicate_barcode`.
+5. **`async_step_finish`** — With no modules, shows the add-module form with `no_modules`. Re-checks the serial claim, then creates the entry with connection settings and `modules`.
 
 #### Options Flow Steps
 
 - **`async_step_init`** — Menu: change connection, change reporting, change stale reading behaviour, add, remove, Save and close.
-- **`async_step_change_connection`** — Host/port form with the same validation as setup. Saved immediately (title updated), which reloads the entry; an entry in setup error/retry (e.g. after invalid saved settings) is reloaded explicitly, since its update listener was never registered.
+- **`async_step_change_connection`** → **`change_tcp` / `change_serial`** — Same validation as setup; the currently used serial port is not probed. Saved immediately (title updated), which reloads the entry; an entry in setup error/retry (e.g. after invalid saved settings) is reloaded explicitly, since its update listener was never registered.
 - **`async_step_change_reporting`** — Live reporting checkbox. On: clears `write_interval`, saves. Off: continues to **`async_step_set_interval`** (5–300 s).
 - **`async_step_change_stale`** — `stale_action` dropdown (translated selector) and `stale_timeout` (60–600 s). Saved immediately.
 - **`async_step_add_module`** — Same as setup.
@@ -180,10 +186,14 @@ ENERGY_LOW_POWER_THRESHOLD_W = 1.0
 
 ---
 
-### `connection.py` — Connection Settings
+### `connection.py` — Transports
 
-- **`normalize_connection(data)`** — Non-empty host (stripped), port 1–65535 (default 502); raises `InvalidConnectionSettings(field, error)`.
-- **`open_source(data)`** — Opens a `TcpSource`; closes it if `connect()` fails.
+- **`normalize_connection(data)`** — TCP: non-empty host, port 1–65535. Serial: no control characters; local endpoints are normalised (`posixpath.normpath`, which is what gets saved) and must be under `/dev/` but not `/dev/fd`, `/dev/std*`, `/dev/shm` or `/dev/mqueue` (`is_device_path()`); URLs must be `esphome-hass://esphome/<port>?<filters>` using only known identity filters (no credentials or protocol overrides); baud 1–4000000.
+- **`check_device_node(endpoint)`** — Blocking; called by `open_source()` before opening a local path. Its `realpath` must pass `is_device_path()` and be a character device.
+- **`serial_endpoint_key()` / `resolved_endpoint_key()`** — Normalise endpoints for comparison; the latter resolves symlinks (blocking, run in the executor).
+- **`SerialProxySource`** — Wraps `serialx.async_serial_for_url` (8N1, no flow control, DTR/RTS left undefined). Its blocking `connect()/read()/close()` submit bounded coroutines to HA's loop; an idle read returns `b""` after `SERIAL_READ_TIMEOUT`, EOF raises `ConnectionResetError`.
+- **`open_source(loop, data)`** — Opens a `SerialProxySource` or `TcpSource`; closes it if `connect()` fails.
+- **`connection_title()`** — `PyTap (<host>)`, `PyTap (Home Assistant serial proxy)` or `PyTap (Serial)`.
 
 ---
 
@@ -334,10 +344,10 @@ The coordinator calls it for every tracked report. Daily values are also reset p
 
 `async_get_config_entry_diagnostics()` returns:
 
-- `config_entry` — with `host` and `title` redacted.
+- `config_entry` — with `host`, `serial_port` and `title` redacted.
 - `counters` (parser counters, including `invalid_slots`, `invalid_slot_frames_kept`, `invalid_slot_frames_dropped` and `no_slot_clock_drops`), `gateways`, `discovered_barcodes`.
 - `nodes` — per barcode: `last_update`, `gateway_id`, `node_id`, `reporting`, `seconds_since_report`, daily/total energy, `readings_today`.
-- From `get_diagnostics_data()` (also redacted): `node_mappings`, `connection_state` (incl. `connected`, `retries`), `energy_state`.
+- From `get_diagnostics_data()` (also redacted): `node_mappings`, `connection_state` (incl. transport type, baud rate, `connected`, `retries`), `energy_state`.
 
 ---
 
@@ -345,14 +355,15 @@ The coordinator calls it for every tracked report. Daily values are also reset p
 
 #### Config Entry Version
 
-`CONFIG_ENTRY_VERSION = 5` (matches `PyTapConfigFlow.VERSION`):
+`CONFIG_ENTRY_VERSION = 6` (matches `PyTapConfigFlow.VERSION`):
 
 - `v1 → v2`: voltage/current split to `_in`/`_out`
 - `v2 → v3`: module string labels mandatory (missing → `"Default"`)
 - `v3 → v4`: `peak_power` added (455 Wp)
 - `v4 → v5`: `live_reporting` added (`True`); `write_interval` clamped to 5–300
+- `v5 → v6`: `connection_type = "tcp"`
 
-Entries newer than v5 fail migration.
+Entries newer than v6 fail migration.
 
 #### `async_setup_entry(hass, entry) → bool`
 
@@ -372,15 +383,15 @@ If steps 4–7 raise, `_async_stop_or_park()` stops the listener (or parks it) b
 
 #### `async_remove_entry`
 
-Removing the entry first gives a parked coordinator a bounded stop with `discard_state=True` (a still-stuck one stays parked, so its host/port stays claimed), then deletes its Store.
+Removing the entry first gives a parked coordinator a bounded stop with `discard_state=True` (a still-stuck one stays parked, so its port stays claimed), then deletes its Store.
 
 ---
 
 ### `strings.json` / Translations — UI Strings
 
-- **Config steps:** `user`, `modules_menu`, `add_module`, `finish`.
-- **Options steps:** `init`, `change_connection`, `add_module`, `remove_module`, `change_reporting`, `set_interval`, `change_stale`.
-- **Errors:** `cannot_connect`, `invalid_barcode`, `missing_string`, `missing_name`, `missing_barcode`, `duplicate_barcode`, `no_modules`, `invalid_host`, `invalid_port`, `connection_in_use`.
+- **Config steps:** `user` (menu), `tcp`, `serial`, `modules_menu`, `add_module`, `finish`.
+- **Options steps:** `init`, `change_connection` (menu), `change_tcp`, `change_serial`, `add_module`, `remove_module`, `change_reporting`, `set_interval`, `change_stale`.
+- **Errors:** `cannot_connect`, `invalid_barcode`, `missing_string`, `missing_name`, `missing_barcode`, `duplicate_barcode`, `no_modules`, `invalid_host`, `invalid_port`, `invalid_serial_port`, `invalid_baud_rate`, `invalid_connection_type`, `serial_port_in_use`, `connection_in_use`, `unsupported_serial_settings`.
 - **Entity names:** all sensors.
 - **Selector:** `stale_action` options (Unavailable, Zero, Hold last value).
 - **Exceptions:** setup errors (`previous_listener_stopping`, `invalid_connection_settings`).
@@ -391,7 +402,7 @@ Removing the entry first gives a parked coordinator a bounded stop with `discard
 
 ## Config Flow UX Design
 
-The config flow uses a **menu-driven approach**: enter connection details, then add modules one at a time.
+The config flow uses a **menu-driven approach**: choose a transport, enter connection details, then add modules one at a time.
 
 ### Rationale
 
@@ -403,24 +414,25 @@ The config flow uses a **menu-driven approach**: enter connection details, then 
 ### Current UX Flow
 
 ```
-1. Enter host/port
+1. Choose TCP gateway or Serial / Home Assistant proxy
+2. Enter host/port, or pick the serial port and baud rate
    → Bounded probe; on failure "Could not connect" — submit again to save anyway
-2. Modules menu
+3. Modules menu
    [Add a module]  [Finish setup]
-3. Add modules (string group, name, barcode, peak power)
-4. Finish setup → entry created (at least one module required)
+4. Add modules (string group, name, barcode, peak power)
+5. Finish setup → entry created (at least one module required)
 ```
 
 ### Connection Validation
 
-An unreachable gateway (common at night) shows `cannot_connect` once. Submitting the identical settings again saves them, and the listener keeps retrying in the background.
+An unreachable endpoint (common at night) shows `cannot_connect` once. Submitting the identical settings again saves them, and the listener keeps retrying in the background.
 
 ---
 
 ## Data Flow
 
 ```
-Tigo Gateway (TCP)
+Tigo Gateway (TCP / serial / ESPHome proxy)
     │
     ▼
 source.read(4096)                          [executor thread]
@@ -453,23 +465,25 @@ Home Assistant frontend / automations / history
 
 ### Test Configuration
 
-- **Framework:** pytest with `pytest-homeassistant-custom-component` (pinned in `requirements-test.txt`).
+- **Framework:** pytest with `pytest-homeassistant-custom-component` (pinned in `requirements-test.txt`; currently targets HA 2026.10.4).
 - **Async mode:** `asyncio_mode = auto` (in `pytest.ini`).
+- **Smoke tests:** `tests/core_smoke.py` runs with `unittest` against HA 2026.11.0 in a separate CI job.
 
 ### Integration Tests (`tests/`)
 
 | File                              | What it covers                                                                                                                                                            |
 | --- | --- |
 | `test_config_flow.py`             | Menu-driven config and options flows, module validation                                                                                                                   |
-| `test_connection.py`              | Connection validation, bounded cleanup                                                                                                                                    |
+| `test_serial_config_flow.py`      | Serial picker, offline setup, transport changes                                                                                                                           |
+| `test_connection.py`              | Transport validation, passive reads, bounded cleanup                                                                                                                      |
 | `test_coordinator_persistence.py` | Store load/save, mappings, deferred reports, midnight reset                                                                                                               |
 | `test_write_interval.py`          | Live vs. averaged reporting and time-weighted averaging                                                                                                                   |
 | `test_panel_status.py`            | Stale-reading actions, aggregate energy                                                                                                                                   |
 | `test_freshness_listeners.py`     | Freshness transitions re-render only the affected panels and aggregates; listener registration and unload                                                                 |
 | `test_review2_data.py`            | Default stale action, selective re-rendering on publish, midnight-reset ordering, save scheduling, aggregate performance and restore                                      |
-| `test_review2_lifecycle.py`       | Unreadable Store, parked listeners, entry removal, setup recovery, outage logs                                                                                            |
-| `test_listener_lifecycle.py`      | Worker finishes and releases the connection before unload/reload                                                                                                          |
-| `test_review_fixes.py`            | TCP interrupt, slow stop, invalid saved port, one-time connection-loss log                                                                                                |
+| `test_review2_lifecycle.py`       | Unreadable Store, serial path normalisation/character-device checks, parked listeners, entry removal, setup recovery, outage logs                                         |
+| `test_listener_lifecycle.py`      | Worker finishes and releases the port before unload/reload                                                                                                                |
+| `test_review_fixes.py`            | TCP interrupt, slow stop, invalid saved port, `/dev/` paths, symlinks, one-time connection-loss log                                                                       |
 | `test_sensor.py`                  | Sensor platform entities, values, aggregates                                                                                                                              |
 | `test_diagnostics.py`             | Diagnostics payload and redaction                                                                                                                                         |
 | `test_energy.py`                  | Pure energy accumulation                                                                                                                                                  |
@@ -546,7 +560,7 @@ python3 -m ruff check custom_components/pytap/ tests/
 | ---------------------------------------------- | ------------------------------------------------------------------------------------------------ |
 | Gateway device registration / `via_device`     | Not implemented (optimizer, string and installation devices only)                                |
 | Connectivity binary sensors                    | Not implemented                                                                                  |
-| SerialSource (pyserial) in `pytap.core.source` | Unused by the integration (TCP only)                                                             |
+| SerialSource (pyserial) in `pytap.core.source` | Unused by the integration; serial access goes through `connection.SerialProxySource` (`serialx`) |
 
 ---
 
@@ -701,21 +715,26 @@ Created this implementation document capturing all development work to date.
 - **Migration clamp** — the v4→v5 migration now clamps any stale `write_interval` into `[MIN_WRITE_INTERVAL, MAX_WRITE_INTERVAL]` (5–300) so the reporting form stays submittable after upgrade. Added `MIN_WRITE_INTERVAL`/`MAX_WRITE_INTERVAL` constants shared by the migration and the config-flow schema.
 - Added regression tests (`TestLivePushAndIdleFlush`, migration clamp tests) and corrected the previously misnamed live-mode buffer test. Full suite: 162 tests passing, ruff clean.
 
-### Phase 19 — Stale Readings and Review Fixes
+### Phase 19 — Serial and ESPHome Proxy Transports
+
+- Added `connection.py` with `normalize_connection()`, `SerialProxySource` (`serialx`) and `open_source()`; the config and options flows gained a TCP/serial menu with the native serial-port picker.
+- Config entry version 6 (`connection_type = "tcp"` for existing entries); HA 2026.11+ required.
+
+### Phase 20 — Stale Readings and Review Fixes
 
 - Configurable stale-reading action/timeout (`change_stale` options step) replacing a fixed report timeout; freshness check every 5 s that re-renders only the entities of panels whose reporting state changed (per-barcode freshness listeners).
 - Coordinator stored in `entry.runtime_data`; `hass.data[DOMAIN]` kept only as a registry of coordinators still stopping after a timed-out unload.
 - Worker-owned `_state` with published copies; DST-safe midnight reset via `async_track_time_change`.
 - Aggregate energy accumulates member increases with restored baselines.
 - Lifecycle: bounded stop with `ConfigEntryNotReady` retry, `TcpSource.interrupt()`, listener stopped on `EVENT_HOMEASSISTANT_STOP`, saved state deleted with the entry.
-- Connection: `connection.py` with `normalize_connection()` and `open_source()`, probe-then-resubmit, one-time connection-loss log, `ConfigEntryError` for invalid saved settings.
-- Parser: an invalid header slot counter never updates the slot clock; power reports with invalid slot counters are dropped; both increment `invalid_slots` (refined in Phase 20).
+- Connection: `/dev/` paths only, symlink-aware port comparison, probe-then-resubmit, one-time connection-loss log, `ConfigEntryError` for invalid saved settings.
+- Parser: an invalid header slot counter never updates the slot clock; power reports with invalid slot counters are dropped; both increment `invalid_slots` (refined in Phase 21).
 
-### Phase 20 — Second Review Fixes
+### Phase 21 — Second Review Fixes
 
 - Stale readings: default `hold` for all entries (`unavailable` / `zero` opt-in); in `zero` mode aggregate performance divides by every present member's rating.
 - Publishing: per-barcode data listeners, so a publish re-renders only changed panels and their aggregates; snapshot sequence numbers protect the midnight reset.
-- Lifecycle: timed-out stops still cancel timers/saves; parked coordinators claim their endpoint in config flows and clean up when their worker exits; entry removal waits (bounded) for them and blocks their saves; setup failures stop or park the listener; corrected connection settings recover a failed setup; unreadable Store blocks saves; outage logged once until data flows.
+- Lifecycle: timed-out stops still cancel timers/saves; parked coordinators claim their endpoint in config flows and clean up when their worker exits; entry removal waits (bounded) for them and blocks their saves; setup failures stop or park the listener; corrected connection settings recover a failed setup; unreadable Store blocks saves; normalised serial paths and character-device checks; outage logged once until data flows.
 - Parser: invalid-header-slot frames kept only when the strict packet walk succeeds (`invalid_slot_frames_kept` / `invalid_slot_frames_dropped`); `no_slot_clock_drops`, with the warning logged once per gateway per parser.
 
 ---

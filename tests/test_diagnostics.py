@@ -7,7 +7,11 @@ from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
 
 from custom_components.pytap.const import (
+    CONF_BAUD_RATE,
+    CONF_CONNECTION_TYPE,
     CONF_MODULES,
+    CONF_SERIAL_PORT,
+    CONNECTION_SERIAL,
     DEFAULT_PORT,
     DOMAIN,
 )
@@ -168,12 +172,25 @@ async def test_config_entry_diagnostics_all_keys_present(
     assert diagnostics["discovered_barcodes"] == ["Z-0000000A"]
 
 
-async def test_diagnostics_redact_title_containing_host(hass: HomeAssistant) -> None:
+async def test_serial_diagnostics_redact_complete_endpoint(hass: HomeAssistant) -> None:
     entry = _make_entry()
-    entry.as_dict.return_value["title"] = "PyTap (192.168.1.100)"
+    endpoint = "esphome-hass://esphome/private-entry?port_udev_id=private-device"
+    entry.data = {
+        CONF_CONNECTION_TYPE: CONNECTION_SERIAL,
+        CONF_SERIAL_PORT: endpoint,
+        CONF_BAUD_RATE: 38400,
+        CONF_MODULES: [],
+    }
+    entry.as_dict.return_value["data"] = entry.data
+    entry.as_dict.return_value["title"] = f"PyTap ({endpoint})"
     coordinator = PyTapDataUpdateCoordinator(hass, entry)
     entry.runtime_data = coordinator
     result = await async_get_config_entry_diagnostics(hass, entry)
+    assert result["config_entry"]["data"][CONF_SERIAL_PORT] == "**REDACTED**"
     assert result["config_entry"]["title"] == "**REDACTED**"
-    assert result["connection_state"][CONF_HOST] == "**REDACTED**"
-    assert "192.168.1.100" not in str(result)
+    assert result["connection_state"][CONF_SERIAL_PORT] == "**REDACTED**"
+    assert result["connection_state"][CONF_BAUD_RATE] == 38400
+    assert result["connection_state"][CONF_CONNECTION_TYPE] == CONNECTION_SERIAL
+    assert "host" not in result["connection_state"]
+    assert "port" not in result["connection_state"]
+    assert endpoint not in str(result)

@@ -38,11 +38,12 @@ def _event(barcode: str) -> PowerReportEvent:
 async def _setup(hass: HomeAssistant) -> tuple[MockConfigEntry, PyTapDataUpdateCoordinator]:
     entry = MockConfigEntry(
         domain=DOMAIN,
-        version=5,
+        version=6,
         unique_id="freshness-entry",
         data={
             "host": "gateway",
             "port": 502,
+            "connection_type": "tcp",
             "modules": [MODULE, MODULE_B],
             "stale_action": "unavailable",  # Opt-in; makes freshness visible.
         },
