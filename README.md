@@ -112,7 +112,9 @@ Member counters and aggregate baselines are saved separately. After an abrupt
 stop, an older restored member counter can look like a reset and overcount by
 as much as that restored value (potentially its lifetime total for total energy,
 or its current-day total for daily energy). Use graceful restarts to reduce this
-accepted persistence-skew risk.
+accepted persistence-skew risk. Graceful shutdown uses a bounded listener join
+before flushing final counters; a timed-out stop is not a completed save.
+This does not make the two stores atomic or repair previously affected totals.
 
 ---
 

@@ -1,23 +1,28 @@
 """The worker must finish and release the port before unload/reload."""
 
 import asyncio
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.pytap import _async_stop_on_shutdown
 from custom_components.pytap.const import DOMAIN
 from custom_components.pytap.coordinator import PyTapDataUpdateCoordinator
 from custom_components.pytap.pytap.core.events import PowerReportEvent
 
 
-def _coordinator(hass, serial=False):
+def _coordinator(hass, serial=False, modules=None):
     connection = {"connection_type": "tcp", "host": "gateway"}
     if serial:
         connection = {"connection_type": "serial", "serial_port": "/dev/fake-tigo"}
-    entry = MockConfigEntry(domain=DOMAIN, version=6, data={**connection, "modules": []})
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        version=6,
+        data={**connection, "modules": modules or []},
+    )
     entry.add_to_hass(hass)
     coordinator = PyTapDataUpdateCoordinator(hass, entry)
     coordinator._async_load_coordinator_state = AsyncMock()
@@ -121,6 +126,88 @@ async def test_cancelled_wrapper_does_not_lose_worker(hass):
         assert not coordinator._worker_future.done()
         release.set()
         assert await coordinator.async_stop_listener() is True
+
+
+async def test_native_shutdown_flushes_energy_processed_by_cancelled_worker(hass):
+    barcode = "A-1234567B"
+    coordinator = _coordinator(
+        hass,
+        modules=[
+            {
+                "string": "A",
+                "name": "Panel",
+                "barcode": barcode,
+                "peak_power": 455,
+            }
+        ],
+    )
+    coordinator._async_save_coordinator_state = (
+        PyTapDataUpdateCoordinator._async_save_coordinator_state.__get__(coordinator)
+    )
+    coordinator._store.async_save = AsyncMock()
+    entered = asyncio.Event()
+    stopping = threading.Event()
+    release = threading.Event()
+    exited = threading.Event()
+    first_at = datetime(2026, 1, 1, tzinfo=UTC)
+    latest_at = first_at + timedelta(seconds=30)
+
+    def report(at):
+        return PowerReportEvent(
+            gateway_id=1,
+            node_id=1,
+            barcode=barcode,
+            voltage_in=30,
+            voltage_out=30,
+            current_in=0.04,
+            temperature=25,
+            dc_dc_duty_cycle=0.5,
+            rssi=-60,
+            timestamp=at,
+        )
+
+    with patch("custom_components.pytap.coordinator.dt_util.now", return_value=first_at):
+        coordinator._process_event(report(first_at))
+    coordinator._cancel_scheduled_save()
+
+    def worker():
+        hass.loop.call_soon_threadsafe(entered.set)
+        try:
+            assert coordinator._stop_event.wait(2)
+            stopping.set()
+            assert release.wait(2)
+            with patch(
+                "custom_components.pytap.coordinator.dt_util.now",
+                return_value=latest_at,
+            ):
+                coordinator._process_event(report(latest_at))
+        finally:
+            exited.set()
+
+    try:
+        with patch.object(coordinator, "_listen", new=worker):
+            await coordinator.async_start_listener()
+            async with asyncio.timeout(1):
+                await entered.wait()
+            _async_stop_on_shutdown(hass, coordinator.config_entry, coordinator)
+            stop = asyncio.create_task(hass.async_stop(force=True))
+            async with asyncio.timeout(1):
+                while not stopping.is_set():
+                    await asyncio.sleep(0)
+            assert not stop.done()
+            coordinator._store.async_save.assert_not_awaited()
+            release.set()
+            await stop
+    finally:
+        release.set()
+        coordinator._stop_event.set()
+
+    assert exited.is_set()
+    coordinator._store.async_save.assert_awaited_once()
+    saved = coordinator._store.async_save.await_args.args[0]
+    energy = saved["energy_data"][barcode]
+    assert energy["daily_energy_wh"] == pytest.approx(0.01)
+    assert energy["total_energy_wh"] == pytest.approx(0.01)
 
 
 async def test_stop_timeout_blocks_replacement_until_worker_finishes(hass):

@@ -36,6 +36,7 @@
 
 ### Fixed
 
+- Graceful Home Assistant shutdown preserves the listener's completion future and saves its final energy counters. This prevents stale restored counters from causing false aggregate reset credit when HA cancels its background tasks.
 - The listener thread now keeps its own state and Home Assistant only receives published copies, so averaged reporting mode no longer occasionally shows raw readings.
 - Unloading or reloading no longer gets stuck when the listener is slow to stop: setup is retried until the old listener has released its port, so it is never shared. A stop that times out still cancels timers and pending saves; the stuck listener's port or host counts as in use for new entries until it exits, and it then cleans up after itself. Removing an entry waits (bounded) for it before deleting the saved state.
 - Stopping a TCP connection wakes the blocked socket read immediately.

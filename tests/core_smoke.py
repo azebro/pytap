@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tarfile
 from tempfile import TemporaryDirectory
+import threading
 from types import MappingProxyType
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -55,6 +56,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import restore_state
 from homeassistant.helpers.selector import SerialPortSelector
 from homeassistant.setup import async_setup_component
+from homeassistant.util import dt as dt_util
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 import serialx
@@ -65,7 +67,7 @@ from custom_components.pytap.config_flow import PyTapConfigFlow, PyTapOptionsFlo
 from custom_components.pytap.connection import InvalidConnectionSettings, normalize_connection, open_source
 from custom_components.pytap.coordinator import PyTapDataUpdateCoordinator
 from custom_components.pytap.pytap.core.capture import iter_capture
-from custom_components.pytap.pytap.core.events import InfrastructureEvent
+from custom_components.pytap.pytap.core.events import InfrastructureEvent, PowerReportEvent
 
 ENDPOINT = "esphome-hass://esphome/entry-one?port_name=Tigo%20Bus"
 MODULE = {"string": "A", "name": "Panel", "barcode": "A-1234567B", "peak_power": 455}
@@ -1046,6 +1048,198 @@ class CoreSmoke(unittest.IsolatedAsyncioTestCase):
         with unittest.TestCase().assertRaises(serialx.common.UnknownUriScheme):
             await port.open()
 
+    async def test_graceful_stop_persists_latest_energy_before_native_restart(self):
+        barcode = MODULE["barcode"]
+        entered = asyncio.Event()
+        stopping = threading.Event()
+        release = threading.Event()
+        worker_exited = threading.Event()
+        save_started = threading.Event()
+        saved_before_exit = False
+        time_zone = zoneinfo.ZoneInfo("Pacific/Auckland")
+        first_at = datetime(2035, 6, 15, 12, 0, tzinfo=time_zone)
+        prior_at = first_at + timedelta(seconds=30)
+        latest_at = prior_at + timedelta(seconds=30)
+        clock = first_at
+        prior_tz = dt_util.DEFAULT_TIME_ZONE
+
+        def now(time_zone=None):
+            return clock.astimezone(time_zone) if time_zone is not None else clock
+
+        def utcnow():
+            return clock.astimezone(UTC)
+
+        def report(at):
+            return PowerReportEvent(
+                gateway_id=1,
+                node_id=1,
+                barcode=barcode,
+                voltage_in=30.0,
+                voltage_out=30.0,
+                current_in=0.04,
+                temperature=20.0,
+                dc_dc_duty_cycle=0.5,
+                rssi=100,
+                timestamp=at,
+                high_output_mode=True,
+                status_code=0x64,
+                low_voltage_flag=False,
+            )
+
+        def worker(coordinator):
+            coordinator.hass.loop.call_soon_threadsafe(entered.set)
+            try:
+                assert coordinator._stop_event.wait(5)
+                stopping.set()
+                assert release.wait(5)
+            finally:
+                worker_exited.set()
+
+        self.hass.config.components.add("usb")
+        restore_state.async_get(self.hass).async_setup_dump()
+        entry = self.entry(
+            version=7,
+            unique_id="shutdown-persistence",
+            data={
+                "connection_type": "tcp",
+                "host": "127.0.0.1",
+                "port": self._available_port(),
+                "modules": [MODULE],
+                "live_reporting": True,
+            },
+        )
+        try:
+            await self.hass.config.async_update(time_zone="Pacific/Auckland")
+            with (
+                patch("custom_components.pytap.coordinator.dt_util.now", side_effect=now),
+                patch("custom_components.pytap.coordinator.dt_util.utcnow", side_effect=utcnow),
+                patch.object(PyTapDataUpdateCoordinator, "_listen", new=worker),
+            ):
+                try:
+                    await self.hass.config_entries.async_add(entry)
+                    self.assertIs(entry.state, ConfigEntryState.LOADED)
+                    async with asyncio.timeout(1):
+                        await entered.wait()
+                    coordinator = entry.runtime_data
+                    assert coordinator._process_event(report(first_at))
+                    clock = prior_at
+                    assert coordinator._process_event(report(prior_at))
+                    coordinator._ha_update_pending = True
+                    coordinator._push_live_update(MagicMock(counters={}))
+                    await self.hass.async_block_till_done()
+                    coordinator._cancel_scheduled_save()
+                    await coordinator._async_save_coordinator_state()
+                    self.assertAlmostEqual(
+                        coordinator._energy_state[barcode].total_energy_wh, 0.01
+                    )
+                    clock = latest_at
+                    assert coordinator._process_event(report(latest_at))
+                    coordinator._ha_update_pending = True
+                    coordinator._push_live_update(MagicMock(counters={}))
+                    await self.hass.async_block_till_done()
+                    coordinator._cancel_scheduled_save()
+                    original_save = coordinator._async_save_coordinator_state
+
+                    async def observed_save():
+                        nonlocal saved_before_exit
+                        save_started.set()
+                        saved_before_exit = not worker_exited.is_set()
+                        await original_save()
+
+                    coordinator._async_save_coordinator_state = observed_save
+
+                    async def release_worker_after_stage_two():
+                        async with asyncio.timeout(2):
+                            while not stopping.is_set():
+                                await asyncio.sleep(0)
+                        self.assertFalse(save_started.is_set())
+                        release.set()
+
+                    release_task = asyncio.create_task(
+                        release_worker_after_stage_two()
+                    )
+                    await asyncio.gather(
+                        self.hass.async_stop(force=True),
+                        release_task,
+                    )
+                    self.assertTrue(worker_exited.is_set())
+                    self.assertTrue(save_started.is_set())
+                    self.assertFalse(saved_before_exit)
+                finally:
+                    release.set()
+                    if "coordinator" in locals():
+                        coordinator._stop_event.set()
+        finally:
+            dt_util.set_default_time_zone(prior_tz)
+
+        config_dir = self.hass.config.config_dir
+        restarted = HomeAssistant(config_dir)
+        restarted.config.skip_pip = True
+        loader.async_setup(restarted)
+        restarted.config_entries = ConfigEntries(restarted, {})
+        try:
+            self.assertTrue(await bootstrap.async_load_base_functionality(restarted))
+            if not hasattr(restarted, "auth"):
+                await async_process_ha_core_config(restarted, {})
+            self.assertEqual(restarted.config.time_zone, "Pacific/Auckland")
+            dr.async_get(restarted)
+            er.async_get(restarted)
+            restarted.config.components.add("usb")
+            restored_entry = restarted.config_entries.async_get_entry(entry.entry_id)
+            self.assertIsNotNone(restored_entry)
+            with (
+                patch(
+                    "custom_components.pytap.coordinator.dt_util.now",
+                    return_value=latest_at,
+                ),
+                patch(
+                    "custom_components.pytap.coordinator.dt_util.utcnow",
+                    return_value=latest_at.astimezone(UTC),
+                ),
+                patch.object(
+                    PyTapDataUpdateCoordinator,
+                    "_listen",
+                    return_value=None,
+                ),
+            ):
+                self.assertTrue(
+                    await restarted.config_entries.async_setup(restored_entry.entry_id)
+                )
+                await restarted.async_block_till_done()
+            restored = restored_entry.runtime_data.data["nodes"][barcode]
+            self.assertAlmostEqual(restored["daily_energy_wh"], 0.02)
+            self.assertAlmostEqual(restored["total_energy_wh"], 0.02)
+
+            registry = er.async_get(restarted)
+            component = restarted.data["sensor"]
+            for kind in ("daily_energy", "total_energy"):
+                unique_id = (
+                    f"pytap_{restored_entry.entry_id}_installation_{kind}"
+                )
+                entity_id = registry.async_get_entity_id("sensor", "pytap", unique_id)
+                self.assertIsNotNone(entity_id)
+                entity = component.get_entity(entity_id)
+                saved_state = await entity.async_get_last_state()
+                saved_extra = await entity.async_get_last_extra_data()
+                self.assertIsNotNone(saved_state)
+                self.assertIsNotNone(saved_extra)
+                self.assertAlmostEqual(float(saved_state.state), 0.02)
+                saved_data = saved_extra.as_dict()
+                self.assertAlmostEqual(saved_data["native_value"], 0.02)
+                self.assertEqual(saved_data["baselines"], {barcode: 0.02})
+                self.assertAlmostEqual(entity.native_value, 0.02)
+                self.assertAlmostEqual(
+                    float(restarted.states.get(entity_id).state), 0.02
+                )
+                self.assertAlmostEqual(
+                    entity.extra_restore_state_data.as_dict()["native_value"], 0.02
+                )
+        finally:
+            try:
+                await restarted.async_stop(force=True)
+            finally:
+                dt_util.set_default_time_zone(prior_tz)
+
     @staticmethod
     def _assert_port_released(port: int | None) -> None:
         if port is None:
@@ -1158,7 +1352,23 @@ class CoreSmoke(unittest.IsolatedAsyncioTestCase):
                                 entry.runtime_data.device_info.serial_proxies
                             ):
                                 await asyncio.sleep(0)
-                yield hass, entry, clients
+                try:
+                    yield hass, entry, clients
+                finally:
+                    async with asyncio.timeout(30):
+                        await hass.async_block_till_done()
+                        for pytap_entry in hass.config_entries.async_entries(
+                            "pytap"
+                        ):
+                            if pytap_entry.state is ConfigEntryState.LOADED:
+                                coordinator = pytap_entry.runtime_data
+                                self.assertTrue(
+                                    await hass.config_entries.async_unload(
+                                        pytap_entry.entry_id
+                                    )
+                                )
+                                self.assertIsNone(coordinator._listener_task)
+                                self.assertIsNone(coordinator._worker_future)
 
     @staticmethod
     def _esphome_entry():

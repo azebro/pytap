@@ -1,22 +1,123 @@
 # PRD-PYTAP-1.4.0-001 v9 r14 - Integrated candidate evidence
 
-**Status: automated gates and independent reviews passed.**
-The pytest, parser, strict native smoke/rollback, lint and whitespace gates
-pass, including strict reruns after the final C4/C8 proof corrections. Both
-independent reviewers accepted the affected proof with no material findings.
-Deployment still requires the fresh live baseline in criterion 11; this report
-does not claim deployment or soak acceptance.
+**Status: the original candidate failed the live restart gate; code-only rollback is complete.**
+The graceful-restart persistence correction and all automated validation gates
+are complete. A corrected candidate archive is frozen and verified, but it has
+not been staged or deployed. A fresh live v7 baseline, corrected deployment,
+and new valid soak remain required; this is not release-ready.
 The [delivery board](../kanban.md) owns task status.
 
-This report covers the integrated 1.4.0 working tree, not the historical
+The original results cover the integrated 1.4.0 candidate, not the historical
 476-test baseline or the separate [pre-port environment evidence](prd-pytap-1.4.0-001-v9-r14-preport.md).
-The candidate changes are currently uncommitted on `azebro-legendary-spork`,
-above merge commit `66ce47833034b338f862ae904d92b774abfe9fc2`.
+That candidate was committed locally on `azebro-legendary-spork` as
+`3ea5aedc6544f59dd91f3fb4b9950bad916dcfd8`, above merge commit
+`66ce47833034b338f862ae904d92b774abfe9fc2`.
 Exact PR #39 is `a80698fca67bef4847a3c6ce5217f163fee94c01`; a fresh
 `git cat-file -e 'a80698fca67bef4847a3c6ce5217f163fee94c01^{commit}'`
-succeeded. No live deployment, backup/restore, soak, release or push is claimed.
+succeeded before the original artifact was frozen. No successful soak, release
+or push is claimed.
 
-## Frozen code artifacts
+## Failed live gate and recovery
+
+On 2026-11-25 the candidate was deployed with checked Core stop/start, unchanged
+v7 membership and fresh production readings. Its soak began at 15:31:10 UTC.
+The required additional graceful restart completed at 15:33:44 UTC, after which
+two settled samples showed daily excesses of 283.60 Wh and 432.08 Wh for the
+strings, and 715.68 Wh for the installation. The installation cumulative total
+increased by 253,156.87 Wh across the immediate restart comparison.
+Membership remained unchanged; no PyTap ERROR/CRITICAL records were found.
+The soak clock is invalid, not paused for later resumption.
+
+The user selected code-only rollback to exact #39, followed by correction and
+revalidation. Rollback completed at 17:12:32 UTC; native confirmation at
+17:15:08 UTC showed manifest 1.2.0 on the unchanged Core 2026.11.2 and v7 entry.
+Existing inflated stored totals were not repaired. That nighttime confirmation
+did not prove fresh production. No backup was made or restored.
+
+Read-only recorder history identifies the trigger: five daily and three
+cumulative optimizer counters restored 0.01 Wh lower, immediately before the
+aggregate credited them as resets. Correcting persistence must preserve
+legitimate reset accounting, not hide decreases with a numerical tolerance.
+The original archives and failed run remain evidence, not deployment defaults
+for the corrected candidate.
+
+Private, machine-local evidence includes `pytap-live-soak.json`,
+`pytap-restart-energy-history-20261125T153230-153530.json`,
+`pytap-live-operation-rollback-20261125T171232Z.json` and
+`pytap-live-snapshot-rollback-native-confirmation-2026-11-25T171508.389956Z0000.json`.
+
+## Restart correction: focused evidence
+
+Native HA registers executor futures created by its background tasks for
+shutdown cancellation. PyTap used that helper inside its background listener,
+so HA cancelled both the wrapper and the worker future before firing its stop
+event. Awaiting that cancelled future raised `CancelledError` and bypassed
+the existing final coordinator save. Shielding the waiter alone did not prevent
+HA from cancelling the future directly.
+
+The correction keeps the completion future from the public event loop's
+default executor, while retaining the existing background wrapper, explicit
+interrupt, bounded join, port ownership and tracked final-save task. Aggregate
+reset arithmetic and persisted schemas are unchanged.
+
+| Focused case | Before correction | After correction |
+|---|---|---|
+| `test_native_shutdown_flushes_energy_processed_by_cancelled_worker` | Final Store save awaited zero times; failed in 3.20 s | Included in 91 passing lifecycle/persistence tests, 18.63 s |
+| `CoreSmoke.test_graceful_stop_persists_latest_energy_before_native_restart` | Real native restart restored 0.01 Wh instead of 0.02 Wh; failed on HA 2026.11.2 in 2.067 s | Passed on HA 2026.10.4 in 1.319 s and HA 2026.11.2 in 1.324 s |
+
+The native case uses real Core shutdown, coordinator accumulation, Store
+persistence and a fresh native instance with real aggregate entities. Its
+controlled listener supplies the final report during shutdown; it does not
+manually save that latest state or substitute the final-save path.
+These focused results are not the required complete-suite or live gates.
+
+Private logs are `restart-persistence-red-lifecycle.log`,
+`restart-persistence-native-red.log`, `restart-persistence-green-focused-suite.log`,
+`restart-persistence-native-green-2026.10.4.log` and
+`restart-persistence-native-green-2026.11.2.log`. Fresh dependency checks and
+real public imports also passed on both unchanged environments, recorded in
+`restart-runtime-minimum-check.log` and `restart-runtime-current-check.log`;
+the current-Core environment still has no pytest harness.
+Claude Opus 5.5 and GPT-6.1 Sol independently accepted the production correction
+and its root-cause evidence with no material production findings. Both noted
+a midnight-sensitive fixture and unbounded readiness waits. Their additional
+test suggestions distinguish joining the worker before saving from saving
+early, and durable aggregate restore from reconstruction using member values.
+The regression proof now includes a deterministic worker barrier: native
+shutdown remains pending, and final Store persistence has not started, until
+the listener worker is released. The separate native restart/restore case
+continues to exercise real Core shutdown and a fresh integration instance.
+Timezone restoration and the public restored aggregate checks are also
+covered. No aggregate arithmetic, persisted schema, or dependency changed.
+
+The final smoke harness performs bounded ESPHome/PyTap test cleanup: it waits
+for pending HA tasks, unloads entries left loaded by a case, and asserts that
+the coordinator listener and worker futures are cleared. This cleanup addresses
+cross-case C8 call leakage; it is not native-shutdown proof and does not replace
+the separate restart/restore regression. Main checked the captured prior C8
+failure logs for `PyTap shutdown timed out` and `PyTap listener did not stop`;
+neither marker was present.
+
+The complete minimum-Core suite, parser suite and strict C1-C8 smoke gates have
+now passed after these test refinements. Both final read-only reviewers
+accepted the production correction and test proof with no remaining material
+findings. The optional, unverified capture-preparation cancellation concern
+remains in task PYTAP-140-09, outside this correction.
+
+The WSL distro restarted and removed its temporary virtual environments after
+the initial worker handoff. Main recreated both environments in a unique
+temporary location using Python 3.14.4 and the official constraint files whose
+SHA-256 values match the table above. No system packages or repository
+dependencies were changed. `prepare_ha_tests.py` and its real-import checks
+pass on both restored environments; the minimum retains the pinned test
+harness and serialx 1.11.0, while the current-Core environment has no harness
+and serialx 1.15.1. Main independently reran the focused lifecycle/persistence
+selection (91 passed in 16.66 s) and the new native restart/restore case on
+HA 2026.10.4 (1 passed in 1.680 s) and 2026.11.2 (1 passed in 1.958 s).
+These were targeted proof runs, not criterion 10's complete gates; final
+corrected-candidate results are recorded below.
+
+## Original frozen code artifacts
 
 The following archives are local preparation artifacts, not published release
 assets or live backups. Each contains 37 component files with `manifest.json`
@@ -34,6 +135,25 @@ It hashes sorted component-relative names, a NUL separator, each file's SHA-256
 hex digest and a newline. Production source did not change during the later
 native-test refinements. Machine-local
 `pytap-deployment-artifacts-20261125T124456Z.json` records both archive identities.
+
+## Corrected candidate archive
+
+The corrected component-only candidate was frozen after the production and
+regression-test changes. Its 37 archived files were byte-compared with the
+component source, `manifest.json` is at the archive root, and ZIP integrity
+passed. This is a new artifact; the original failed candidate remains preserved
+with its original hash and is not a deployment default.
+
+| Artifact | Manifest | SHA-256 |
+|---|---|---|
+| `pytap-1.4.0-corrected-candidate-20261125T191343Z.zip` | 1.4.0 | `80190ac85ad672bcf7ede0a2142f2fe32364ad7a6d1c3298d068461f1dd7de13` |
+
+Corrected candidate source-tree SHA-256 is
+`134f197bd111c90dabba054304a59d34203644b68ea0ae990ff4c32cfd4c08a4`.
+The machine-local metadata now points to this archive and preserves the exact
+PR #39 rollback archive identity. The private control helper's defaults and
+remote candidate hash pin were updated and its 16 unit tests passed. No remote
+stage or deployment action has been run for this candidate.
 
 ## Candidate validation environments
 
@@ -99,7 +219,7 @@ environment's `site-packages`, not repository substitutes.
 Core's `build_url`, or current Core's `build_port_url` and `identity_port_info`,
 resolved to the real `homeassistant/components/esphome/serial_proxy.py`.
 
-## Integrated runs
+## Original candidate integrated runs
 
 Commands below are portable equivalents of the recorded WSL invocations,
 executed from the Git root. `PY_MIN` and `PY_CURRENT` denote the corresponding
@@ -185,7 +305,13 @@ entry-ID checks and logger restoration, plus the non-identity encoding guard.
 Energy and capture each passed independent Claude/GPT review. Main's
 discovery/options/CI/documentation integration passed Claude/Gemini review after
 the runtime-discovery edit-preservation correction. No open finding in those
-completed slices is being waived by the pending compatibility work.
+completed slices is being waived.
+
+For the restart correction, both final reviewers (Claude Opus 5.5 and
+GPT-6.1 Sol) accepted the production change and refined regression proof.
+Claude verified the worker references clear only after join; GPT confirmed the
+explicit-unload cleanup boundary does not substitute for the native shutdown
+test. Both found no remaining material concern.
 
 ## Evidence availability
 
@@ -201,3 +327,20 @@ Detailed outputs are machine-local in this session's `files` directory:
 They are not represented as Git-transferred
 artifacts. This concise report and the repository journal remain local-only
 until included in an authorized Git checkpoint.
+
+## Final corrected-candidate validation
+
+| Gate | Command | Result |
+|---|---|---|
+| Focused lifecycle/persistence | `"$PY_MIN" -m pytest tests/test_listener_lifecycle.py -q` | 91 passed |
+| Complete minimum-Core suite | `"$PY_MIN" -m pytest tests -q --tb=short --show-capture=no` | 521 passed, 129.60 s |
+| Minimum parser suite | `PYTHONPATH=custom_components/pytap "$PY_MIN" -c 'import pytap, pytest; raise SystemExit(pytest.main(["custom_components/pytap/pytap/tests", "--import-mode=importlib", "-q", "--tb=short"]))'` | 73 passed, 4.03 s |
+| HA 2026.10.4 strict native smoke | `"$PY_MIN" scripts/run_core_smoke.py` | 31 passed; zero skips, failures or errors; 98.468 s |
+| HA 2026.11.2 strict native smoke | `"$PY_CURRENT" scripts/run_core_smoke.py` | 31 passed; zero skips, failures or errors; 134.812 s |
+| Ruff and whitespace | `python -m ruff check custom_components/pytap tests scripts`; `git diff --check` | Both exit 0 |
+
+The strict native runs include the graceful-stop persistence regression on
+both Cores and the exact-#39 C7 rollback-readability cases. These automated
+results validate the corrected code, not live deployment or soak acceptance.
+The final run output and helper-unit-test output remain machine-local session
+evidence; the summarized results above are the repository record.

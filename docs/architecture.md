@@ -302,7 +302,7 @@ The listener thread owns `self._state` and the energy accumulators (guarded by a
 
 #### Threading Model
 
-1. **Background listener task** — An `asyncio.Task` created by `config_entry.async_create_background_task()` that awaits the blocking `_listen()` method in the executor (`hass.async_add_executor_job`), shielded so HA cancelling the task during shutdown doesn't lose track of the worker.
+1. **Background listener task** — An `asyncio.Task` created by `config_entry.async_create_background_task()` that awaits the blocking `_listen()` method in HA's default executor (`hass.loop.run_in_executor`). The coordinator owns and shields the completion future: HA may cancel the wrapper, but the worker must still be joined before the final save. `hass.async_add_executor_job` would also register this background future for direct shutdown cancellation, which shielding the wrapper cannot prevent.
 2. **Publishing** — The worker publishes snapshots back to the event loop with `call_soon_threadsafe` (immediately in live mode, once per interval in averaged mode).
 3. **Midnight reset** — `async_track_time_change(hour=0, minute=0, second=0)` resets daily accumulators at every local midnight (DST-safe), even when no reports arrive overnight.
 4. **Freshness check** — `async_track_time_interval` every 5 s recomputes which panels are reporting. Entities register per-barcode callbacks with `async_add_freshness_listener(barcodes, callback)`: live per-optimizer sensors and binary sensors for their own barcode, every aggregate for its current members (re-registered when membership changes). Only the callbacks of panels that started or stopped reporting run (once per registration), not every entity.
@@ -594,12 +594,15 @@ The worker uses blocking reads. Rather than rewriting the library with `asyncio`
 ```python
 self._listener_task = self.config_entry.async_create_background_task(
     self.hass,
-    self._async_listen(),   # awaits hass.async_add_executor_job(self._listen)
+    self._async_listen(),   # shields the future from hass.loop.run_in_executor
     name="pytap_listener",
 )
 ```
 
 Serial/proxy I/O stays on HA's loop (`serialx`), bridged to the worker with `run_coroutine_threadsafe` and bounded timeouts.
+The default executor is unchanged; only completion ownership differs from
+`hass.async_add_executor_job`, so native shutdown cannot cancel the join handle
+before the worker's cleanup and final energy save.
 
 ### 4. Worker-Owned State, Published Copies
 

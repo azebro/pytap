@@ -901,7 +901,11 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_listen(self) -> None:
         """Async wrapper to run the blocking listener in an executor."""
-        self._worker_future = self.hass.async_add_executor_job(self._listen)
+        # HA registers executor jobs started through async_add_executor_job for
+        # stage-2 shutdown cancellation. Keep the completion future owned here:
+        # only the wrapper is cancellable; this future must survive until the
+        # blocked listener is explicitly interrupted and has released the port.
+        self._worker_future = self.hass.loop.run_in_executor(None, self._listen)
         try:
             # HA may cancel background tasks during shutdown. Cancelling the
             # waiter must not lose the handle tracking actual worker completion.
