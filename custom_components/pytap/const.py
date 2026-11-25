@@ -2,7 +2,7 @@
 
 DOMAIN = "pytap"
 DEFAULT_NAME = "PyTap"
-INTEGRATION_VERSION = "1.2.0"
+INTEGRATION_VERSION = "1.4.0"
 
 # Configuration keys
 CONF_HOST = "host"

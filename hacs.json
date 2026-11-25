@@ -2,5 +2,5 @@
     "name": "PyTap",
     "render_readme": true,
     "filename": "custom_components/pytap",
-    "homeassistant": "2026.11.0"
+    "homeassistant": "2026.10.4"
 }

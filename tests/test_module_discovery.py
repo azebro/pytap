@@ -1,5 +1,6 @@
 """Passive module admission, persistence, live entities, and metadata edits."""
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from homeassistant import config_entries
@@ -7,6 +8,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
+import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.pytap import async_migrate_entry
@@ -420,3 +422,112 @@ async def test_discovery_policy_options_rebuild_coordinator(hass):
         newest._process_event(_infra(BARCODE, OTHER))
         assert {m["barcode"] for m in newest.modules} == {BARCODE}
         assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_discovery_respects_unloaded_owner_and_later_config_removal(hass):
+    """Unloaded entries reserve configured barcodes, but not removed modules."""
+    owner = _entry(hass, automatic=False, modules=[MODULE])
+    assert owner.state is config_entries.ConfigEntryState.NOT_LOADED
+    _, scanner = _coordinator(hass)
+    scanner._process_event(_infra(BARCODE, OTHER))
+    scanner._process_event(_power())
+    assert {m["barcode"] for m in scanner.modules} == {OTHER}
+    assert BARCODE not in scanner._state["nodes"]
+
+    hass.config_entries.async_update_entry(owner, data={**owner.data, "modules": []})
+    await hass.async_block_till_done()
+    scanner._process_event(_power())
+    assert {m["barcode"] for m in scanner.modules} == {BARCODE, OTHER}
+    assert scanner._state["nodes"][BARCODE]["power"] == 120
+
+
+def test_releasing_worker_claim_keeps_configured_ownership(hass):
+    owner, coordinator = _coordinator(hass, automatic=False, modules=[MODULE])
+    coordinator.release_barcode_claims()
+    owner.mock_state(hass, config_entries.ConfigEntryState.NOT_LOADED)
+    _, scanner = _coordinator(hass)
+    scanner._process_event(_power())
+    assert scanner.modules == []
+    assert BARCODE not in scanner._state["nodes"]
+
+
+async def test_manual_claim_conflict_disables_only_conflicting_entities(hass, caplog):
+    """A duplicate configuration must not create or process duplicate sensors."""
+    _coordinator(hass, automatic=False, modules=[MODULE])
+    healthy = {**MODULE, "barcode": OTHER, "name": "Healthy Panel"}
+    entry = _entry(hass, modules=[MODULE, healthy])
+
+    with patch(
+        "custom_components.pytap.coordinator.PyTapDataUpdateCoordinator._listen",
+        new=lambda self: None,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        coordinator = entry.runtime_data
+        assert coordinator.modules == [healthy]
+        for _ in range(2):
+            coordinator._process_event(_power())
+        coordinator._process_event(_power(OTHER))
+        coordinator.async_set_updated_data(coordinator._snapshot())
+        await hass.async_block_till_done()
+        assert BARCODE not in coordinator._state["nodes"]
+        assert coordinator._state["nodes"][OTHER]["power"] == 120
+        registry = er.async_get(hass)
+        assert registry.async_get_entity_id("sensor", DOMAIN, f"{DOMAIN}_{BARCODE}_power") is None
+        assert registry.async_get_entity_id("sensor", DOMAIN, f"{DOMAIN}_{OTHER}_power") is not None
+        conflicts = [r for r in caplog.records if "another PyTap entry" in r.message]
+        assert len(conflicts) == 1
+        assert conflicts[0].levelno == logging.WARNING
+        assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_options_done_preserves_external_deletion_edits_and_exclusions(hass):
+    other = {**MODULE, "barcode": OTHER, "name": "Other Panel"}
+    entry, _ = _coordinator(hass, modules=[MODULE, other])
+    flow = PyTapOptionsFlow(entry)
+    flow.hass = hass
+    await flow.async_step_init()
+    await flow.async_step_edit_module({"barcode": BARCODE})
+    await flow.async_step_module_details(
+        {"name": "Flow edit", "string": "East", "peak_power": 500}
+    )
+    added = {**MODULE, "barcode": "E-3456789F", "name": "Added elsewhere"}
+    excluded = "F-4567890A"
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            "modules": [{**MODULE, "string": "West"}, added],
+            CONF_EXCLUDED_BARCODES: [OTHER, excluded],
+            CONF_AUTO_DISCOVERY: False,
+        },
+    )
+    result = await flow.async_step_done()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    modules = {m["barcode"]: m for m in entry.data["modules"]}
+    assert set(modules) == {BARCODE, added["barcode"]}
+    assert modules[BARCODE] == {**MODULE, "name": "Flow edit", "string": "West"}
+    assert modules[added["barcode"]] == added
+    assert set(entry.data[CONF_EXCLUDED_BARCODES]) == {OTHER, excluded}
+    assert entry.data[CONF_AUTO_DISCOVERY] is False
+
+
+@pytest.mark.parametrize("excluded", [False, True])
+async def test_options_preserve_discovered_edits_during_reload_without_resurrection(hass, excluded):
+    entry, coordinator = _coordinator(hass)
+    coordinator._process_event(_infra(BARCODE))
+    flow = PyTapOptionsFlow(entry)
+    flow.hass = hass
+    await flow.async_step_init()
+    await flow.async_step_edit_module({"barcode": BARCODE})
+    edited = {"name": "Roof panel", "string": "South", "peak_power": 410}
+    await flow.async_step_module_details(edited)
+    if excluded:
+        hass.config_entries.async_update_entry(
+            entry, data={**entry.data, CONF_EXCLUDED_BARCODES: [BARCODE]}
+        )
+    entry.mock_state(hass, config_entries.ConfigEntryState.SETUP_RETRY)
+    result = await flow.async_step_done()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.data["modules"] == ([] if excluded else [{"barcode": BARCODE, **edited}])

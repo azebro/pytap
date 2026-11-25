@@ -619,9 +619,8 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
         return datetime.combine(reset_day, time.min, tzinfo=self._timezone())
 
     def _timezone(self) -> tzinfo:
-        if self.hass is not None:
-            return dt_util.get_time_zone(self.hass.config.time_zone) or dt_util.UTC
-        return dt_util.UTC
+        hass = self.hass or self.coordinator.hass
+        return dt_util.get_time_zone(hass.config.time_zone) or dt_util.UTC
 
 
 @dataclass
@@ -647,10 +646,10 @@ class PyTapAggregateSensor(
 ):
     """Aggregate across optimizers.
 
-    Live values sum current member readings. Energy totals instead add up each
-    member's *increase* since it was last seen, so membership changes (a panel
-    moved between strings, a newly discovered panel) never add a member's
-    lifetime energy or look like a meter reset in long-term statistics.
+    Live values sum current member readings. Energy totals accumulate each
+    member's production since its saved baseline; new members start at their
+    first reading, while a nonnegative counter decrease contributes the
+    post-reset value.
     """
 
     _attr_has_entity_name = True
@@ -692,6 +691,11 @@ class PyTapAggregateSensor(
         """Update aggregate membership without recreating its stable entity."""
         changed = set(barcodes) != set(self._barcodes)
         self._barcodes = list(barcodes)
+        if changed:
+            members = set(self._barcodes)
+            self._baselines = {
+                barcode: value for barcode, value in self._baselines.items() if barcode in members
+            }
         if changed and self._member_unsubs:
             # Follow membership so new members' changes re-render this.
             self._subscribe_members()
@@ -775,6 +779,16 @@ class PyTapAggregateSensor(
             # Earlier versions summed lifetime totals; continue from that value
             # and treat every member as newly joined (no double counting).
             self._energy_total = await self._async_restored_value()
+        members = set(self._barcodes)
+        self._baselines = {
+            barcode: value for barcode, value in self._baselines.items() if barcode in members
+        }
+        if self._is_daily:
+            today = self._today()
+            if self._cycle_date != today:
+                self._cycle_date = today
+                self._energy_total = 0.0 if self._energy_total is not None else None
+                self._baselines = {barcode: 0.0 for barcode in self._baselines}
         if self._energy_total is not None:
             self._attr_native_value = self._energy_total
             self._restored_native_value = True
@@ -791,19 +805,47 @@ class PyTapAggregateSensor(
         return dt_util.now(self._timezone()).date().isoformat()
 
     def _timezone(self) -> tzinfo:
-        if self.hass is not None:
-            return dt_util.get_time_zone(self.hass.config.time_zone) or dt_util.UTC
-        return dt_util.UTC
+        hass = self.hass or self.coordinator.hass
+        return dt_util.get_time_zone(hass.config.time_zone) or dt_util.UTC
 
     def _accumulate_energy(self, nodes: dict[str, Any]) -> None:
-        if self._is_daily and self._cycle_date != (today := self._today()):
+        today = self._today() if self._is_daily else None
+        cycle_changed = self._is_daily and self._cycle_date != today
+        if cycle_changed:
             self._cycle_date = today
             self._energy_total = 0.0 if self._energy_total is not None else None
+
+        members = set(self._barcodes)
+        self._baselines = {
+            barcode: value for barcode, value in self._baselines.items() if barcode in members
+        }
+        if cycle_changed:
+            # Reset existing members; missing baselines still identify new members.
+            self._baselines = {barcode: 0.0 for barcode in self._baselines}
+
+        stale_members: set[str] = set()
+        if self._is_daily:
+            stale_members = {
+                barcode
+                for barcode in self._barcodes
+                if (node := nodes.get(barcode)) is not None
+                and node.get("daily_reset_date") != today
+            }
+            self._baselines.update(
+                {
+                    barcode: 0.0
+                    for barcode in stale_members
+                    if self._energy_total is None or barcode in self._baselines
+                }
+            )
+
         values = {
             barcode: float(value)
             for barcode in self._barcodes
             if (node := nodes.get(barcode)) is not None
+            and (not self._is_daily or node.get("daily_reset_date") == today)
             and isinstance(value := node.get(self.entity_description.value_key), (int, float))
+            and value >= 0
         }
         if self._energy_total is None:
             # First ever value: start from the members' current totals.
@@ -811,10 +853,16 @@ class PyTapAggregateSensor(
         else:
             for barcode, value in values.items():
                 previous = self._baselines.get(barcode)
-                # New members and member resets (e.g. midnight) only rebase.
-                if previous is not None and value > previous:
+                if previous is None:
+                    continue
+                if value < previous:
+                    self._energy_total += value
+                else:
                     self._energy_total += value - previous
-        self._baselines = values if self._energy_total is not None else {}
+        if self._energy_total is not None:
+            self._baselines.update(values)
+        elif not self._is_daily:
+            self._baselines = {}
 
     def _members(self) -> list[str]:
         """Members whose data counts; live values may exclude stale panels."""

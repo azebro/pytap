@@ -352,7 +352,9 @@ async def test_disabled_entry_parked_coordinator_cleans_up_when_worker_exits(has
         await _wait_for(lambda: entry.entry_id not in parked_coordinators(hass))
         await hass.async_block_till_done()
     assert coordinator._worker_future is None
-    # Its optimizers are free for other entries again.
+    assert barcode_claims(hass).claim(BARCODE, "another") is False
+    hass.config_entries.async_update_entry(entry, data={**entry.data, "modules": []})
+    await hass.async_block_till_done()
     assert barcode_claims(hass).claim(BARCODE, "another") is True
 
 
@@ -436,6 +438,9 @@ async def test_setup_failure_after_start_stops_the_listener(hass):
     assert entry.state is ConfigEntryState.SETUP_ERROR
     assert coordinator._worker_future is None and coordinator._listener_task is None
     assert coordinator._midnight_reset_unsub is None and coordinator._freshness_unsub is None
+    assert barcode_claims(hass).claim(BARCODE, "another") is False
+    hass.config_entries.async_update_entry(entry, data={**entry.data, "modules": []})
+    await hass.async_block_till_done()
     assert barcode_claims(hass).claim(BARCODE, "another") is True
 
 

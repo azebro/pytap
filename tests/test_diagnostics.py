@@ -174,7 +174,7 @@ async def test_config_entry_diagnostics_all_keys_present(
 
 async def test_serial_diagnostics_redact_complete_endpoint(hass: HomeAssistant) -> None:
     entry = _make_entry()
-    endpoint = "esphome-hass://esphome/private-entry?port_udev_id=private-device"
+    endpoint = "esphome-hass://esphome/private-entry?port_name=private-port&port_udev_id=private-device"
     entry.data = {
         CONF_CONNECTION_TYPE: CONNECTION_SERIAL,
         CONF_SERIAL_PORT: endpoint,

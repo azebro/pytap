@@ -19,7 +19,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.typing import ConfigType
 
 from .capture_services import async_remove_captures, register_capture_services
-from .connection import InvalidConnectionSettings
+from .connection import VERSION_UNSUPPORTED_SERIAL_ERRORS, InvalidConnectionSettings
 from .const import (
     CONF_AUTO_DISCOVERY,
     CONF_BAUD_RATE,
@@ -113,6 +113,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: PyTapConfigEntry) -> boo
     try:
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
     except InvalidConnectionSettings as err:
+        if err.error in VERSION_UNSUPPORTED_SERIAL_ERRORS:
+            raise ConfigEntryError(
+                translation_domain=DOMAIN,
+                translation_key=err.error,
+            ) from err
         # Older versions could save e.g. an out-of-range port. Ask the user
         # to fix it in the options flow rather than retrying forever.
         raise ConfigEntryError(

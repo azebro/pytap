@@ -298,3 +298,98 @@ def test_remove_capture_root(tmp_path):
     with pytest.raises(CaptureError):
         remove_capture_root(link)
     assert (target / "keep").is_file()
+
+
+def test_symlinked_parent_below_trusted_root_is_refused_non_destructively(tmp_path):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    external = tmp_path / "external"
+    writer = CaptureWriter(external / "entry", {})
+    writer.start()
+    _stop(writer)
+    archive = export_archive(writer.directory)
+    (config_dir / "pytap_captures").symlink_to(external, target_is_directory=True)
+    root = config_dir / "pytap_captures" / "entry"
+    original = {
+        path.relative_to(external): path.read_bytes()
+        for path in external.rglob("*")
+        if path.is_file()
+    }
+
+    actions = (
+        lambda: CaptureWriter(root, {}, trusted_root=config_dir).start(),
+        lambda: list_captures(root, trusted_root=config_dir),
+        lambda: capture_directory(root, writer.capture_id, trusted_root=config_dir),
+        lambda: export_archive(root / writer.capture_id, trusted_root=config_dir),
+        lambda: delete_capture(root, writer.capture_id, trusted_root=config_dir),
+        lambda: remove_capture_root(root, trusted_root=config_dir),
+    )
+    for action in actions:
+        with pytest.raises(CaptureError, match="move.*config directory") as err:
+            action()
+        assert err.value.translation_key == "capture_path_unsafe"
+
+    assert archive.is_file() and writer.directory.is_dir()
+    assert {
+        path.relative_to(external): path.read_bytes()
+        for path in external.rglob("*")
+        if path.is_file()
+    } == original
+
+
+def test_trusted_capture_root_allows_symlinked_ancestors_above_boundary(tmp_path):
+    real = tmp_path / "real"
+    config_dir = real / "config"
+    config_dir.mkdir(parents=True)
+    config_alias = tmp_path / "config-parent"
+    config_alias.symlink_to(real, target_is_directory=True)
+    trusted_root = config_alias / "config"
+    capture_root = trusted_root / "pytap_captures" / "entry"
+
+    writer = CaptureWriter(capture_root, {}, trusted_root=trusted_root)
+    writer.start()
+    _stop(writer)
+    assert list_captures(capture_root, trusted_root=trusted_root)[0]["capture_id"] == writer.capture_id
+    assert (
+        capture_directory(capture_root, writer.capture_id, trusted_root=trusted_root)
+        == writer.directory
+    )
+    archive = export_archive(writer.directory, trusted_root=trusted_root)
+    assert archive.is_file()
+    assert delete_capture(capture_root, writer.capture_id, trusted_root=trusted_root)[
+        "deleted_archives"
+    ] == 1
+    assert remove_capture_root(capture_root, trusted_root=trusted_root) is True
+
+
+def test_capture_path_outside_trusted_root_is_refused_non_destructively(tmp_path):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    writer = CaptureWriter(tmp_path / "outside", {})
+    writer.start()
+    _stop(writer)
+    with pytest.raises(CaptureError, match="config directory") as err:
+        remove_capture_root(writer.root, trusted_root=config_dir)
+    assert err.value.translation_key == "capture_path_unsafe"
+    assert writer.directory.is_dir()
+
+
+def test_existing_archive_counts_toward_next_capture_budget(tmp_path):
+    writer = _writer(tmp_path)
+    writer.record(b"evidence", 1)
+    _stop(writer)
+    archive = export_archive(writer.directory)
+    used_with_archive = sum(
+        path.stat().st_size for path in writer.root.rglob("*") if path.is_file() and not path.is_symlink()
+    )
+    next_budget = used_with_archive + capture.MANIFEST_RESERVE
+    next_writer = CaptureWriter(writer.root, {}, max_storage_bytes=next_budget)
+    with pytest.raises(CaptureError) as err:
+        next_writer.start()
+    assert err.value.translation_key == "storage_budget_exhausted"
+    assert writer.directory.is_dir() and archive.is_file()
+
+    archive.unlink()
+    next_writer = CaptureWriter(writer.root, {}, max_storage_bytes=next_budget)
+    next_writer.start()
+    _stop(next_writer)

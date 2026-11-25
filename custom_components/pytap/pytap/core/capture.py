@@ -74,9 +74,44 @@ def _mib(value: int) -> str:
     return str(max(0, -(-value // (1024 * 1024))))
 
 
-def _check_root(root: Path) -> None:
-    if root.is_symlink():
-        raise CaptureError("capture_unsafe", "Capture root must not be a symlink")
+def _unsafe_path_error(trusted_root: Path | None, *, outside: bool = False) -> CaptureError:
+    if outside:
+        message = (
+            "Capture path is outside the Home Assistant config directory; move the capture data "
+            "manually into a real pytap_captures directory beneath the config directory and retry; "
+            "PyTap did not delete or migrate the data"
+        )
+    elif trusted_root is not None:
+        message = (
+            "Capture path contains a symlink below the Home Assistant config directory; move the "
+            "capture data manually into a real pytap_captures directory beneath the config "
+            "directory, replace the symlink, and retry; PyTap did not delete or migrate the data"
+        )
+    else:
+        message = "Capture root must not be a symlink"
+    key = "capture_path_unsafe" if trusted_root is not None else "capture_unsafe"
+    return CaptureError(key, message)
+
+
+def validate_capture_path(path: Path, trusted_root: Path | None = None) -> Path:
+    """Reject links below the trusted boundary without resolving links above it."""
+    path = Path(os.path.abspath(path))
+    if trusted_root is None:
+        if path.is_symlink():
+            raise _unsafe_path_error(None)
+        return path
+
+    trusted_root = Path(os.path.abspath(trusted_root))
+    try:
+        relative = path.relative_to(trusted_root)
+    except ValueError:
+        raise _unsafe_path_error(trusted_root, outside=True) from None
+    current = trusted_root
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            raise _unsafe_path_error(trusted_root)
+    return path
 
 
 def _private_file(path: Path) -> BinaryIO:
@@ -138,6 +173,7 @@ class CaptureWriter:
         root: Path,
         metadata: Mapping[str, Any],
         *,
+        trusted_root: Path | None = None,
         duration_seconds: float = 86400,
         max_storage_bytes: int = 1024 * 1024 * 1024,
         segment_bytes: int = 16 * 1024 * 1024,
@@ -151,6 +187,7 @@ class CaptureWriter:
         ):
             raise ValueError("Invalid capture limits")
         self.root = Path(root)
+        self.trusted_root = Path(trusted_root) if trusted_root is not None else None
         self.capture_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ_") + uuid.uuid4().hex[:12]
         self.directory = self.root / self.capture_id
         self.metadata = dict(metadata)
@@ -227,8 +264,10 @@ class CaptureWriter:
                 raise ValueError("Capture has already started")
             self._state = "starting"
         try:
-            _check_root(self.root)
+            self.root = validate_capture_path(self.root, self.trusted_root)
+            self.directory = self.root / self.capture_id
             self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self.directory = validate_capture_path(self.directory, self.trusted_root)
             self._session_budget = min(
                 self.max_storage_bytes - _tree_size(self.root),
                 shutil.disk_usage(self.root).free - FREE_SPACE_RESERVE,
@@ -590,12 +629,13 @@ def _check_capture_id(capture_id: Any) -> None:
         raise CaptureError("invalid_capture_id", "Invalid capture ID")
 
 
-def capture_directory(root: Path, capture_id: str) -> Path:
+def capture_directory(
+    root: Path, capture_id: str, *, trusted_root: Path | None = None
+) -> Path:
     """Resolve a generated session ID, never an arbitrary caller-supplied path."""
     _check_capture_id(capture_id)
-    root = Path(root)
-    _check_root(root)
-    directory = root / capture_id
+    root = validate_capture_path(Path(root), trusted_root)
+    directory = validate_capture_path(root / capture_id, trusted_root)
     if directory.is_symlink() or not directory.is_dir():
         raise CaptureError("capture_not_found", "Capture directory is unavailable", capture_id=capture_id)
     return directory
@@ -779,9 +819,10 @@ def iter_capture(directory: Path, *, allow_incomplete: bool = False) -> Iterator
     return _iter_capture(directory, allow_incomplete, _warn)
 
 
-def list_captures(root: Path, limit: int = 20) -> list[dict[str, Any]]:
-    root = Path(root)
-    _check_root(root)
+def list_captures(
+    root: Path, limit: int = 20, *, trusted_root: Path | None = None
+) -> list[dict[str, Any]]:
+    root = validate_capture_path(Path(root), trusted_root)
     if not root.exists():
         return []
     result = []
@@ -855,7 +896,11 @@ def _zip_info(arcname: str, info: os.stat_result) -> zipfile.ZipInfo:
 
 
 def export_archive(
-    directory: Path, *, allow_interrupted: bool = False, max_storage_bytes: int | None = None
+    directory: Path,
+    *,
+    allow_interrupted: bool = False,
+    max_storage_bytes: int | None = None,
+    trusted_root: Path | None = None,
 ) -> Path:
     """Archive stopped evidence, including incomplete captures with clear flags.
 
@@ -864,11 +909,9 @@ def export_archive(
     so a capture that filled its own budget can still be exported). It must
     always fit in free disk space. Both limits are also enforced while writing.
     """
-    directory = Path(directory)
+    directory = validate_capture_path(Path(directory), trusted_root)
     root = directory.parent
-    _check_root(root)
-    if directory.is_symlink():
-        raise CaptureError("capture_unsafe", "Capture directory must not be a symlink")
+    root = validate_capture_path(root, trusted_root)
     manifest = read_manifest(directory, allow_incomplete=True)
     if manifest["state"] not in ("stopped", "error") and not allow_interrupted:
         raise CaptureError("stop_before_export", "Stop capture before exporting")
@@ -988,19 +1031,20 @@ def _capture_archives(root: Path, capture_id: str) -> list[Path]:
     ]
 
 
-def delete_capture(root: Path, capture_id: str) -> dict[str, Any]:
+def delete_capture(
+    root: Path, capture_id: str, *, trusted_root: Path | None = None
+) -> dict[str, Any]:
     """Delete one capture and its exports; the caller must exclude the active session.
 
     Archives left behind after their capture directory disappeared are deleted too.
     """
-    root = Path(root)
-    _check_root(root)
+    root = validate_capture_path(Path(root), trusted_root)
     _check_capture_id(capture_id)
     candidate = root / capture_id
     directory: Path | None = None
     entries: list[Path] = []
     if candidate.is_symlink() or candidate.exists():
-        directory = capture_directory(root, capture_id)
+        directory = capture_directory(root, capture_id, trusted_root=trusted_root)
         entries = list(directory.iterdir())
         archives = _capture_archives(root, capture_id)
     else:
@@ -1020,11 +1064,9 @@ def delete_capture(root: Path, capture_id: str) -> dict[str, Any]:
     return {"capture_id": capture_id, "deleted_archives": len(archives), "deleted_bytes": deleted}
 
 
-def remove_capture_root(root: Path) -> bool:
+def remove_capture_root(root: Path, trusted_root: Path | None = None) -> bool:
     """Delete an instance's entire capture root without following a symlinked root."""
-    root = Path(root)
-    if root.is_symlink():
-        raise CaptureError("capture_unsafe", "Capture root must not be a symlink")
+    root = validate_capture_path(Path(root), trusted_root)
     if not root.exists():
         return False
     if not root.is_dir():

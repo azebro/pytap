@@ -412,25 +412,51 @@ class PyTapOptionsFlow(OptionsFlow):
         self._config_entry = config_entry
         self._modules: list[dict[str, Any]] = []
         self._initial_barcodes: set[str] = set()
+        self._initial_modules: dict[str, dict[str, Any]] = {}
+        self._initial_configured_barcodes: set[str] = set()
+        self._added_barcodes: set[str] = set()
         self._modules_initialized = False
         self._auto_discovery = config_entry.data.get(CONF_AUTO_DISCOVERY, False)
+        self._discovery_changed = False
         self._excluded_barcodes = set(config_entry.data.get(CONF_EXCLUDED_BARCODES, []))
+        self._initial_excluded_barcodes = self._excluded_barcodes.copy()
         self._editing_barcode: str | None = None
         self._unreachable: dict[str, Any] | None = None
 
     def _current_modules(self) -> list[dict[str, Any]]:
         """Read the live discovery catalogue without opening or changing a port."""
+        configured = {
+            module[CONF_MODULE_BARCODE]: dict(module)
+            for module in self._config_entry.data.get(CONF_MODULES, [])
+        }
+        modules = {}
         if self._config_entry.state is ConfigEntryState.LOADED:
-            return self._config_entry.runtime_data.modules
-        return [dict(module) for module in self._config_entry.data.get(CONF_MODULES, [])]
+            modules = {
+                module[CONF_MODULE_BARCODE]: module
+                for module in self._config_entry.runtime_data.modules
+            }
+        modules.update(configured)
+        removed = self._initial_configured_barcodes - configured.keys()
+        excluded = set(self._config_entry.data.get(CONF_EXCLUDED_BARCODES, []))
+        return [
+            module for barcode, module in modules.items()
+            if barcode not in removed | excluded
+        ]
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Show the options menu: change connection / add / remove / done."""
         if not self._modules_initialized:
+            self._initial_configured_barcodes = {
+                module[CONF_MODULE_BARCODE]
+                for module in self._config_entry.data.get(CONF_MODULES, [])
+            }
             self._modules = self._current_modules()
             self._initial_barcodes = {m[CONF_MODULE_BARCODE] for m in self._modules}
+            self._initial_modules = {
+                module[CONF_MODULE_BARCODE]: dict(module) for module in self._modules
+            }
             self._modules_initialized = True
         return self.async_show_menu(
             step_id="init",
@@ -454,19 +480,37 @@ class PyTapOptionsFlow(OptionsFlow):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Save modules and close the options flow."""
-        # A listener can discover more modules while this options flow is open.
-        # Merge late arrivals, but don't overwrite edits or undo explicit removals.
+        # Apply only this flow's edits to the latest catalogue, not its snapshot.
         selected = {m[CONF_MODULE_BARCODE] for m in self._modules}
         removed = self._initial_barcodes - selected
-        self._excluded_barcodes.update(removed)
-        self._excluded_barcodes.difference_update(selected)
-        modules = list(self._modules)
-        modules.extend(
-            module
+        excluded = set(self._config_entry.data.get(CONF_EXCLUDED_BARCODES, []))
+        excluded.update(self._excluded_barcodes - self._initial_excluded_barcodes)
+        excluded.update(removed)
+        excluded.difference_update(self._added_barcodes)
+        modules = {
+            module[CONF_MODULE_BARCODE]: module
             for module in self._current_modules()
-            if module[CONF_MODULE_BARCODE] not in selected | self._excluded_barcodes
+            if module[CONF_MODULE_BARCODE] not in excluded
+        }
+        for module in self._modules:
+            barcode = module[CONF_MODULE_BARCODE]
+            if barcode in excluded:
+                continue
+            if barcode in self._added_barcodes or (
+                barcode not in modules and barcode not in self._initial_configured_barcodes
+            ):
+                modules[barcode] = dict(module)
+            elif barcode in modules:
+                initial = self._initial_modules[barcode]
+                modules[barcode] = {
+                    **modules[barcode],
+                    **{key: value for key, value in module.items() if initial.get(key) != value},
+                }
+        auto_discovery = (
+            self._auto_discovery if self._discovery_changed
+            else self._config_entry.data.get(CONF_AUTO_DISCOVERY, False)
         )
-        if not modules and not self._auto_discovery:
+        if not modules and not auto_discovery:
             return self.async_show_form(
                 step_id="change_discovery",
                 data_schema=vol.Schema({vol.Required(CONF_AUTO_DISCOVERY, default=False): bool}),
@@ -474,9 +518,9 @@ class PyTapOptionsFlow(OptionsFlow):
             )
         new_data = {
             **self._config_entry.data,
-            CONF_MODULES: modules,
-            CONF_AUTO_DISCOVERY: self._auto_discovery,
-            CONF_EXCLUDED_BARCODES: sorted(self._excluded_barcodes),
+            CONF_MODULES: list(modules.values()),
+            CONF_AUTO_DISCOVERY: auto_discovery,
+            CONF_EXCLUDED_BARCODES: sorted(excluded),
         }
         self.hass.config_entries.async_update_entry(self._config_entry, data=new_data)
         return self.async_create_entry(title="", data={})
@@ -485,6 +529,7 @@ class PyTapOptionsFlow(OptionsFlow):
         """Discovery changes are saved together with module edits on Done."""
         if user_input is not None:
             self._auto_discovery = user_input[CONF_AUTO_DISCOVERY]
+            self._discovery_changed = True
             return await self.async_step_init()
         return self.async_show_form(
             step_id="change_discovery",
@@ -741,6 +786,7 @@ class PyTapOptionsFlow(OptionsFlow):
                 errors[CONF_MODULE_BARCODE] = "duplicate_barcode"
 
             if not errors:
+                self._added_barcodes.add(barcode)
                 self._modules.append(
                     {
                         CONF_MODULE_STRING: string_group,
@@ -772,6 +818,7 @@ class PyTapOptionsFlow(OptionsFlow):
         if user_input is not None:
             remove_barcode = user_input.get("remove_barcode")
             if remove_barcode:
+                self._added_barcodes.discard(remove_barcode)
                 self._modules = [
                     m for m in self._modules if m[CONF_MODULE_BARCODE] != remove_barcode
                 ]

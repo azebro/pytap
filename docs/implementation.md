@@ -1,6 +1,6 @@
 # PyTap — Implementation Document
 
-> Version 1.2.0 · Last updated: November 2026
+> Version 1.4.0 · Last updated: November 2026
 
 This document captures the current implementation state of the PyTap Home Assistant custom component. It describes what has been built, how each module works, the design decisions made during development, and the test coverage in place.
 
@@ -109,7 +109,7 @@ Defines all integration-wide constants in a single location, including:
 
 ```python
 DOMAIN = "pytap"
-INTEGRATION_VERSION = "1.2.0"
+INTEGRATION_VERSION = "1.4.0"
 
 # Connection
 DEFAULT_PORT = 502
@@ -163,12 +163,14 @@ ENERGY_LOW_POWER_THRESHOLD_W = 1.0
   "integration_type": "hub",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/azebro/pytap/issues",
-  "requirements": ["serialx>=1.15.1"],
-  "version": "1.2.0"
+  "requirements": ["serialx>=1.11.0"],
+  "version": "1.4.0"
 }
 ```
 
-`hacs.json` requires Home Assistant 2026.11.0.
+`hacs.json` requires Home Assistant 2026.10.4. Each Core's official constraints
+choose its compatible `serialx` version (1.11.0 on the minimum, 1.15.1 on
+2026.11.2); neither dependency metadata nor Core internals are overridden.
 
 ---
 
@@ -219,6 +221,15 @@ ENERGY_LOW_POWER_THRESHOLD_W = 1.0
 - **`SerialProxySource`** — Wraps `serialx.async_serial_for_url` (8N1, no flow control, DTR/RTS left undefined). Its blocking `connect()/read()/close()` submit bounded coroutines to HA's loop; an idle read returns `b""` after `SERIAL_READ_TIMEOUT`, EOF raises `ConnectionResetError`.
 - **`open_source(loop, data)`** — Opens a `SerialProxySource` or `TcpSource`; closes it if `connect()` fails.
 - **`connection_title()`** — `PyTap (<host>)`, `PyTap (Home Assistant serial proxy)` or `PyTap (Serial)`.
+
+HA 2026.10.4 accepts supported proxy URLs with `port_name`, except decoded
+`port_udev_id` values ending in `-port<number>` (P9). P9 is checked before a
+missing `port_name` (P1), with distinct flow/setup errors that advise selecting
+the port again or upgrading to HA 2026.11+. HA 2026.11.2 accepts both forms.
+Other supported identity filters are retained, and malformed P2–P8 URLs are
+rejected on both versions. Availability or identity-mismatch failures retain
+the existing background-retry and flow resubmission rules; no additional
+matcher limitation is introduced.
 
 ---
 
@@ -303,7 +314,12 @@ In averaged mode the `_AVERAGED_FIELDS` are appended to `_reading_buffers[barcod
 
 #### Module Discovery
 
-`_add_discovered_module(barcode, node_id, restored)` returns `False` for configured or excluded barcodes, when discovery is off (unless restoring), or when `BarcodeClaims.claim()` fails because another PyTap entry claimed the barcode (logged once). Claims live in `hass.data` (`barcode_claims()`), are atomic across worker threads, are taken for configured barcodes when the coordinator is created (a duplicate logs a warning) and are released by `release_barcode_claims()` once the listener has stopped or the entry is removed. Otherwise it adds `{"name": "Optimizer <barcode>", "string": "Discovered", "peak_power": 0}` (restored metadata overrides), a baseline node, marks a full update and schedules a save. Entities are created by the platform listeners on the next update.
+`_add_discovered_module(barcode, node_id, restored)` returns `False` for configured or excluded barcodes, when discovery is off (unless restoring), or when `BarcodeClaims.claim()` finds another owner (logged once). Claims live in `hass.data` and are atomic across workers. A separate configured-ownership snapshot, refreshed on the event loop by `SIGNAL_CONFIG_ENTRY_CHANGED`, reserves unloaded entries' barcodes too. `release_barcode_claims()` releases active claims after worker shutdown, not configured reservations. A manual duplicate is removed from only the conflicting coordinator's active module set; healthy modules remain. Otherwise discovery adds `{"name": "Optimizer <barcode>", "string": "Discovered", "peak_power": 0}` (restored metadata overrides), a baseline node, marks a full update and schedules a save. Entities are created by the platform listeners on the next update.
+
+Options Save and close reconciles its initial module snapshot with current
+entry/runtime data. Only fields edited in that form overwrite current values;
+external deletions, exclusions, unrelated edits and discovery additions are
+preserved. An explicit re-add can clear an exclusion.
 
 #### Reporting Modes
 
@@ -329,7 +345,7 @@ One HA Store (`pytap_<entry_id>_coordinator`, version 2; `_MigratingStore` accep
 
 #### Packet Capture
 
-`async_start_capture`, `async_stop_capture`, `async_capture_info`, `async_list_captures`, `async_export_capture`, `async_delete_capture` operate on `<config>/pytap_captures/<entry_id>` under `_capture_lock`. Start validates 1–10080 minutes and 16–4096 MiB, and refuses while the listener is stopped or another capture/export/delete runs (including one left running by an unloaded coordinator: jobs are registered per capture root with `track_capture_job()`). Export refuses while recording, defaults its budget to the capture's own (`max_storage_bytes` from its manifest), and runs as a shielded executor job that does not block unload. Delete refuses the active session. `capture_status` (for diagnostics) never includes the directory; action responses do.
+`async_start_capture`, `async_stop_capture`, `async_capture_info`, `async_list_captures`, `async_export_capture`, `async_delete_capture` operate on `<config>/pytap_captures/<entry_id>` under `_capture_lock`. The trusted boundary is `hass.config.config_dir`: symlinks below it are rejected for creation, listing, resolution, export, deletion and entry removal; symlinked ancestors above it are allowed. Refused external paths are never followed, deleted or migrated. Start validates 1–10080 minutes and 16–4096 MiB (default 1024), and refuses while the listener is stopped or another capture/export/delete runs (including one left running by an unloaded coordinator: jobs are registered per capture root with `track_capture_job()`). Export refuses while recording, defaults its budget to the capture's own (`max_storage_bytes` from its manifest), and runs as a shielded executor job that does not block unload. Delete refuses the active session. `capture_status` (for diagnostics) never includes the directory; action responses do.
 
 ---
 
@@ -372,8 +388,9 @@ The coordinator calls it only for plausible reports. Daily values are also reset
 #### `PyTapAggregateSensor`
 
 - Live values (power, performance) use `_members()`: all members with data in `hold`, or only reporting ones otherwise; `zero` mode reports 0 when none report. In `zero` mode performance divides by the rating of every member with data, counting stale members as 0 W. Performance is `None` if any member is unrated.
-- Energy values accumulate member increases against `baselines`, stored with the own total and `cycle_date` as `_AggregateEnergyData` extra restore data. Legacy restored totals (no baselines) continue as the starting value.
-- Attributes: `optimizer_count`, `reporting_count`. `last_reset` (daily) = start of `cycle_date`.
+- Energy values accumulate production against per-member `baselines`, stored with the total and `cycle_date` as `_AggregateEnergyData`. Nonnegative member-counter decreases credit the post-reset value once; new/re-added members initially rebase without credit. Daily updates require a matching `daily_reset_date`; a stale tracked member retains zero as its baseline, while an uninitialized member stays uninitialized. Restore advances stale cycles without waiting for node data and prunes removed members. Temporarily omitted current members retain their baselines. Unattached optimizer/aggregate sensors use the coordinator's HA timezone.
+- Coordinator counters and aggregate baselines persist separately. An abrupt stop before the delayed coordinator save can make exact reset credit overcount by as much as the restored member-counter value, potentially its lifetime total for total energy or current-day total for daily energy.
+- Attributes: `optimizer_count` is the configured member count; `reporting_count` counts present members reporting inside the stale timeout plus the averaged interval, where enabled. It can be zero overnight or after restart, including in hold mode. Daily `last_reset` is the HA-local start of `cycle_date`.
 
 ---
 
@@ -394,7 +411,7 @@ Same dynamic creation as the sensor platform. Descriptions: `high_output_mode`, 
 - `mark()` queues connection events (`events.jsonl`).
 - The writer thread writes `bus-NNNNNN.bin` / `chunks-NNNNNN.bin` (`<QQQII` index), rotates at 16 MiB, stops on `duration_limit`, `storage_limit`, `disk_space_low` or `disk_error`, and rewrites `manifest.json` only when it changed (at most every 10 s, plus rotation/stop) after fsyncing the data files and before fsyncing the directory. SHA-256 checksums cover every segment, index and `events.jsonl`.
 
-**Reading and export:** `read_manifest()` validates structure (format 1 or 2; format 2 requires the `events` block; a too deeply nested manifest raises `ValueError`) and refuses incomplete captures unless allowed. `iter_capture()` verifies sizes/checksums (strict for complete captures; a format 1 event log only gets a warning, as it has no checksum) and streams `CapturedChunk`s; for incomplete evidence it warns, stops at an invalid index row, and never replays unindexed tails. `export_archive()` refuses a symlinked root or session, validates, and checks the estimated ZIP size against the budget left by everything else under the root (the exported capture excluded; `export_budget_exceeded`) and against free disk space minus 64 MiB (`CaptureRuntimeError`, `export_insufficient_space`); both limits are re-checked while writing. Inputs are opened with `O_NOFOLLOW` (relative to the session directory where supported) and must be regular files. It writes `<capture_id>-<hex>.zip` next to the session; incomplete captures also get unlisted crash segments, and archives that are incomplete or have warnings/unverified files (e.g. a format 1 event log) get `recovery.json` (`verified`, `format_version`, `validation_warnings`, `unverified_files`). `delete_capture()` validates every entry before deleting the session and its ZIPs, and also deletes ZIPs whose session directory is gone. `list_captures()` returns the latest 20.
+**Reading and export:** `read_manifest()` validates structure (format 1 or 2; format 2 requires the `events` block; a too deeply nested manifest raises `ValueError`) and refuses incomplete captures unless allowed. `iter_capture()` verifies sizes/checksums (strict for complete captures; a format 1 event log only gets a warning, as it has no checksum) and streams `CapturedChunk`s; for incomplete evidence it warns, stops at an invalid index row, and never replays unindexed tails. `export_archive()` enforces the trusted boundary, validates, and checks the estimated ZIP size against the budget left by everything else under the root (the exported capture excluded; `export_budget_exceeded`) and against free disk space minus 64 MiB (`CaptureRuntimeError`, `export_insufficient_space`); both limits are re-checked while writing. The source plus its archive may therefore use approximately twice the selected budget; this is not a combined hard cap. Inputs are opened with `O_NOFOLLOW` (relative to the session directory where supported) and must be regular files. It writes `<capture_id>-<hex>.zip` next to the session; incomplete captures also get unlisted crash segments, and archives that are incomplete or have warnings/unverified files (e.g. a format 1 event log) get `recovery.json` (`verified`, `format_version`, `validation_warnings`, `unverified_files`). `delete_capture()` validates every entry before deleting the session and its ZIPs, and also deletes ZIPs whose session directory is gone. `list_captures()` returns the latest 20. No automatic pruning or HA backup-policy changes are introduced.
 
 ---
 
@@ -536,7 +553,8 @@ Home Assistant frontend / automations / history
 
 - **Framework:** pytest with `pytest-homeassistant-custom-component` (pinned in `requirements-test.txt`; currently targets HA 2026.10.4).
 - **Async mode:** `asyncio_mode = auto` (in `pytest.ini`).
-- **Smoke tests:** `tests/core_smoke.py` runs with `unittest` against HA 2026.11.0 in a separate CI job.
+- **Smoke tests:** `tests/core_smoke.py` runs through `scripts/run_core_smoke.py` on HA 2026.10.4 and 2026.11.2. The runner rejects zero tests, skips, failures, errors, expected failures and unexpected successes. It includes real public API/transport checks and subprocess-isolated exact-#39 persisted-state rollback.
+- **Dependencies:** CI downloads the running Core's official constraints, installs Core (and the pytest harness only on 2026.10.4), then runs `scripts/prepare_ha_tests.py`. It follows both manifest dependency kinds from ESPHome, USB, Zeroconf and Assist Satellite, checks every applicable resolved requirement, runs `pip check`, and verifies real module/API origins. The 2026.11.2 environment deliberately has no harness.
 
 ### Integration Tests (`tests/`)
 

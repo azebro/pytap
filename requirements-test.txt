@@ -2,8 +2,7 @@
 # pytest-homeassistant-custom-component pulls in pytest, pytest-asyncio,
 # and all HA core dependencies transitively.
 pytest-homeassistant-custom-component==0.13.375
-# The published harness currently targets Core 2026.10.4; do not override
-# Core without a matching harness (its private logger fixtures changed in 11).
-serialx==1.15.1
+# Install with HA 2026.10.4's official constraints. The supported-Core smoke
+# environment uses no harness; serialx is resolved from each Core's constraints.
 aiousbwatcher==1.1.2
 pytest_freezer==0.4.9

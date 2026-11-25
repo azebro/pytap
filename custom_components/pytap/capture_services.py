@@ -13,7 +13,12 @@ from homeassistant.util.hass_dict import HassKey
 import voluptuous as vol
 
 from .const import DOMAIN
-from .pytap.core.capture import CaptureError, CaptureRuntimeError, remove_capture_root
+from .pytap.core.capture import (
+    CaptureError,
+    CaptureRuntimeError,
+    remove_capture_root,
+    validate_capture_path,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -29,7 +34,9 @@ CAPTURE_JOB_WAIT_TIMEOUT = 30.0
 
 def capture_root(hass: HomeAssistant, entry_id: str) -> Path:
     """Private per-instance capture directory (included in Home Assistant backups)."""
-    return Path(hass.config.path("pytap_captures", entry_id))
+    return validate_capture_path(
+        Path(hass.config.path("pytap_captures", entry_id)), Path(hass.config.config_dir)
+    )
 
 
 def _capture_job(hass: HomeAssistant, root: Path) -> asyncio.Future[Any] | None:
@@ -69,8 +76,20 @@ async def async_remove_captures(hass: HomeAssistant, entry_id: str) -> None:
 
     Never deletes under a running export: removal is deferred until it ends.
     """
-    if not await async_wait_for_capture_jobs(hass, entry_id, CAPTURE_JOB_WAIT_TIMEOUT):
-        job = _capture_job(hass, capture_root(hass, entry_id))
+    try:
+        root = capture_root(hass, entry_id)
+    except CaptureError as err:
+        _LOGGER.warning("Could not remove PyTap packet captures safely: %s", err)
+        return
+    try:
+        job_finished = await async_wait_for_capture_jobs(
+            hass, entry_id, CAPTURE_JOB_WAIT_TIMEOUT
+        )
+    except CaptureError as err:
+        _LOGGER.warning("Could not remove PyTap packet captures safely: %s", err)
+        return
+    if not job_finished:
+        job = _capture_job(hass, root)
         if job is not None:
             _LOGGER.info("PyTap packet capture export still running; captures are removed when it ends")
             job.add_done_callback(
@@ -80,7 +99,11 @@ async def async_remove_captures(hass: HomeAssistant, entry_id: str) -> None:
             )
             return
     try:
-        await hass.async_add_executor_job(remove_capture_root, capture_root(hass, entry_id))
+        await hass.async_add_executor_job(
+            remove_capture_root, root, Path(hass.config.config_dir)
+        )
+    except CaptureError as err:
+        _LOGGER.warning("Could not remove PyTap packet captures safely: %s", err)
     except (OSError, ValueError) as err:
         # Exception text may include filesystem paths.
         _LOGGER.warning("Could not remove PyTap packet captures (%s)", type(err).__name__)

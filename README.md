@@ -1,7 +1,7 @@
 # PyTap
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![HA Version](https://img.shields.io/badge/Home%20Assistant-2026.11%2B-blue.svg)](https://www.home-assistant.io/)
+[![HA Version](https://img.shields.io/badge/Home%20Assistant-2026.10.4%2B-blue.svg)](https://www.home-assistant.io/)
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://hacs.xyz/)
 [![Validate](https://github.com/azebro/pytap/actions/workflows/validate.yml/badge.svg)](https://github.com/azebro/pytap/actions/workflows/validate.yml)
 
@@ -101,10 +101,18 @@ PyTap also creates aggregate virtual devices:
 When automatic discovery is enabled, the installation device also has a
 diagnostic **Module discovery** sensor (see [Step 2](#step-2-add-modules)).
 
-String and installation energy totals add up each member panel's increase
-since it was last seen, so moving a panel to another string or discovering a
-new panel doesn't add that panel's lifetime energy to the group. The daily
-aggregate resets at local midnight.
+String and installation energy totals add up each member panel's production
+since it was last seen. A counter reset credits its new nonnegative value once;
+new or re-added members establish a baseline without adding their existing
+energy. Temporarily missing members retain their baseline; removed members do
+not. The daily aggregate resets at HA-local midnight and ignores prior-day
+readings, including after restore.
+
+Member counters and aggregate baselines are saved separately. After an abrupt
+stop, an older restored member counter can look like a reset and overcount by
+as much as that restored value (potentially its lifetime total for total energy,
+or its current-day total for daily energy). Use graceful restarts to reduce this
+accepted persistence-skew risk.
 
 ---
 
@@ -176,7 +184,14 @@ This uses the current [ESPHome serial proxy component](https://esphome.io/compon
 
 Serial ports are exclusive: another PyTap entry cannot use the same endpoint (a symlink such as `/dev/serial/by-id/…` counts as the same port as its target), and another application/integration may also hold it busy. A port or TCP host/port still held by a PyTap listener that is shutting down also counts as in use until it is released. An absent proxy is retried, never replaced automatically with a different port. If you remove and recreate the ESPHome config entry, reselect its port in PyTap. No serial data at night does not make the saved settings invalid.
 
-PyTap requires **HA 2026.11+**. Existing TCP entries migrate automatically without changing their entities or energy history.
+PyTap requires **HA 2026.10.4+**. Existing TCP entries migrate automatically without changing their entities or energy history; config entries remain version 7.
+
+On HA **2026.10.4**, two ESPHome proxy URL forms need a newly selected port or
+an upgrade to **HA 2026.11+**: URLs whose decoded `port_udev_id` ends in a
+`-port<number>` suffix, and other URLs without `port_name`. Setup and connection
+changes explain the appropriate remedy rather than silently dropping identity
+filters. Other valid identity filters remain supported; malformed URLs are
+rejected on both versions.
 
 ### Step 2: Add Modules
 
@@ -226,7 +241,12 @@ Go to **Settings → Devices & Services → PyTap → Configure** to:
 - **Remove** modules you no longer want to track. Removed barcodes are ignored by automatic discovery until you explicitly add them again.
 - **Save and close** to apply changes.
 
-Module/discovery edits are saved together on **Save and close**. Modules discovered while the options flow is open are merged into the saved catalogue, without overwriting your edits or undoing explicit removals.
+Module/discovery edits are saved together on **Save and close**. Modules discovered while the options flow is open are merged into the saved catalogue. Concurrent deletions and ignore rules are preserved, and unrelated metadata edits are not overwritten by an older options form.
+
+A barcode configured in another PyTap entry stays reserved even while that
+entry is unloaded. If two entries configure the same barcode, only the owning
+entry tracks it; the other logs one warning and continues with its healthy
+modules instead of creating duplicate entities.
 
 You can also delete an optimizer device, or a string device that no longer contains any optimizers, from its device page in Home Assistant. Deleting an optimizer (configured or discovered) works like **Remove**: its barcode is ignored by automatic discovery. The installation device can't be deleted. When PyTap starts, it also removes devices of removed (ignored) optimizers and of empty strings; other optimizer devices it doesn't recognise are kept, so you can delete them here. If the saved state can't be read, no devices are removed.
 
@@ -298,7 +318,7 @@ On startup, PyTap restores persisted coordinator state (barcode mappings, discov
 
 ### Raw packet capture (opt-in)
 
-Version 1.5 adds admin-only actions under **Tools → Actions**. Capture is **off
+Version 1.4.0 adds admin-only actions under **Tools → Actions**. Capture is **off
 by default**, and never resumes automatically after a restart or integration
 reload. It copies reads from the existing listener before decoding, without
 opening another connection or transmitting any bus commands. A running capture
@@ -306,7 +326,7 @@ is stopped and finalised when Home Assistant shuts down.
 
 1. Call **`pytap.start_capture`**, select the PyTap instance, and choose:
    - `duration_minutes`: maximum duration, default **1440** (24 hours).
-   - `max_storage_mib`: storage budget, default **1024** (1 GiB).
+   - `max_storage_mib`: storage budget, default **1024** (1 GiB), range **16–4096**.
 2. Use **`pytap.capture_status`** to check progress, stop reason, queue/disk
    errors, and dropped bytes/records. Capture status is also in diagnostics.
 3. Call **`pytap.stop_capture`** when finished, or let the limit stop it.
@@ -320,7 +340,9 @@ is stopped and finalised when Home Assistant shuts down.
    instance's other captures and exports, but not the capture being exported
    (optional `max_storage_mib`, default that capture's own budget). It must also
    fit in free disk space (keeping 64 MiB spare); otherwise the export is
-   refused.
+   refused. Because the source is excluded only for this export calculation,
+   the source plus its archive can occupy approximately twice the chosen budget;
+   this is not a hard cap on their combined size.
 6. **`pytap.delete_capture`** permanently deletes one stopped session and its
    exported ZIPs, including ZIPs left behind after the session folder was
    removed. The active session can't be deleted.
@@ -338,7 +360,17 @@ refused until they finish.
 
 Files live in the Home Assistant configuration directory, below
 `/config/pytap_captures/<config_entry_id>/<capture_id>/` (ZIPs are written next
-to the session directory). They are therefore **included in Home Assistant
+to the session directory). All capture path operations reject symlinks below
+the configured Home Assistant directory, including linked capture roots,
+entry/session directories and export targets. Symlinked ancestors above that
+trusted directory are allowed. Refused external paths are never followed,
+migrated or deleted.
+
+If `pytap_captures` was previously a symlink, finish any capture/export jobs,
+then manually move the recordings into a real `pytap_captures` directory
+beneath the HA configuration directory before retrying.
+
+Captures are therefore **included in Home Assistant
 backups**; delete captures, and older backups, to remove them fully. Each
 session directory contains:
 
@@ -476,17 +508,40 @@ python3 -m homeassistant --config config/ --debug
 ### Running Tests
 
 ```bash
-# Python 3.14 (as in CI); install the published custom-component test harness.
-pip install -r requirements-test.txt
+# From the repository root in an isolated Python 3.14.2+ environment.
+# Windows: run these POSIX commands in WSL.
+CORE=2026.10.4
+python3 -m venv .venv
+. .venv/bin/activate
+curl -fsSL "https://raw.githubusercontent.com/home-assistant/core/$CORE/homeassistant/package_constraints.txt" \
+  -o .venv/ha-constraints.txt
+python -m pip install -c .venv/ha-constraints.txt "homeassistant==$CORE" pydantic -r requirements-test.txt
+python scripts/prepare_ha_tests.py --constraints .venv/ha-constraints.txt
+
+# The rollback checks need this exact baseline object, including in shallow clones.
+git fetch origin a80698fca67bef4847a3c6ce5217f163fee94c01
 
 # Integration tests
-python3 -m pytest tests/ -vv --tb=short
+python -m pytest tests/ -vv --tb=short
 
 # Parser library tests
-PYTHONPATH=custom_components/pytap python3 -c 'import pytap, pytest; raise SystemExit(pytest.main(["custom_components/pytap/pytap/tests/", "--import-mode=importlib", "-vv"]))'
+PYTHONPATH=custom_components/pytap python -c 'import pytap, pytest; raise SystemExit(pytest.main(["custom_components/pytap/pytap/tests/", "--import-mode=importlib", "-vv"]))'
+
+# Real supported-Core APIs, transports and exact-baseline rollback
+python scripts/run_core_smoke.py
 ```
 
-The current published harness pins HA 2026.10.4; its private fixtures are not compatible with 2026.11. CI also runs `tests/core_smoke.py` on the supported 2026.11 baseline without that harness. Real ESPHome firmware restart/reconnection and frontend picker labels still need hardware acceptance testing.
+Repeat the environment preparation in a **separate** environment with
+`CORE=2026.11.2`, omitting `-r requirements-test.txt`; run only the smoke command
+there. The published harness pins HA 2026.10.4 and conflicts with 2026.11's
+Pydantic requirement. Never override either Core's official pins.
+
+`prepare_ha_tests.py` follows both manifest dependency kinds from ESPHome, USB,
+Zeroconf and Assist Satellite, installs their full requirement closure under
+the official constraints, runs `pip check`, and checks real module/API origins.
+The smoke runner rejects zero tests, skips, failures and expected failures.
+CI uses this same two-environment matrix. Real firmware restart/reconnection
+and frontend picker labels still need hardware acceptance testing.
 
 ### Linting
 

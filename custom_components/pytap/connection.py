@@ -12,6 +12,7 @@ import stat
 from typing import Any, Protocol, TypeVar
 from urllib.parse import parse_qs, parse_qsl, urlsplit
 
+from homeassistant.const import MAJOR_VERSION, MINOR_VERSION
 import serialx
 
 from .const import (
@@ -45,6 +46,12 @@ _T = TypeVar("_T")
 _LOGGER = logging.getLogger(__name__)
 # Entries under /dev that alias process file descriptors or memory, not ports.
 _NON_PORT_DEVICES = ("/dev/fd", "/dev/shm", "/dev/mqueue")
+SERIAL_PORT_NAME_REQUIRED = "serial_port_name_required"
+SERIAL_PORT_UDEV_SUFFIX_UNSUPPORTED = "serial_port_udev_suffix_unsupported"
+VERSION_UNSUPPORTED_SERIAL_ERRORS = {
+    SERIAL_PORT_NAME_REQUIRED,
+    SERIAL_PORT_UDEV_SUFFIX_UNSUPPORTED,
+}
 
 
 class InvalidConnectionSettings(ValueError):
@@ -105,7 +112,12 @@ def normalize_connection(data: Mapping[str, Any]) -> dict[str, Any]:
                 and not parsed.fragment
                 and bool(filters)
                 and filters.keys() <= _PROXY_FILTERS
-                and all(len(values) == 1 and values[0] for values in filters.values())
+                and all(
+                    len(values) == 1
+                    and values[0]
+                    and not re.search(r"[\x00-\x1f\x7f]", values[0])
+                    for values in filters.values()
+                )
                 and not re.search(r"%(?![0-9a-fA-F]{2})", endpoint)
             )
             for key, values in filters.items():
@@ -115,6 +127,14 @@ def normalize_connection(data: Mapping[str, Any]) -> dict[str, Any]:
             valid = False
         if not valid:
             raise InvalidConnectionSettings(CONF_SERIAL_PORT, "invalid_serial_port")
+        if (MAJOR_VERSION, MINOR_VERSION) == (2026, 10):
+            udev_id = filters.get("port_udev_id", [""])[0]
+            if re.search(r"-port[0-9]+$", udev_id):
+                raise InvalidConnectionSettings(
+                    CONF_SERIAL_PORT, SERIAL_PORT_UDEV_SUFFIX_UNSUPPORTED
+                )
+            if "port_name" not in filters:
+                raise InvalidConnectionSettings(CONF_SERIAL_PORT, SERIAL_PORT_NAME_REQUIRED)
     else:
         # Only device nodes: never open arbitrary files (e.g. config) or
         # special devices outside /dev as a "serial port". Normalise first so

@@ -30,7 +30,13 @@ from custom_components.pytap.coordinator import (
     barcode_claims,
 )
 from custom_components.pytap.pytap.core.events import InfrastructureEvent, PowerReportEvent
-from custom_components.pytap.sensor import STRING_SENSOR_DESCRIPTIONS, PyTapAggregateSensor
+from custom_components.pytap.sensor import (
+    SENSOR_DESCRIPTIONS,
+    STRING_SENSOR_DESCRIPTIONS,
+    PyTapAggregateSensor,
+    PyTapSensor,
+    _AggregateEnergyData,
+)
 
 BARCODE = "A-1234567B"
 OTHER = "C-2345678D"
@@ -203,8 +209,12 @@ async def test_manual_modules_are_claimed_at_init(hass: HomeAssistant) -> None:
     assert automatic._add_discovered_module(BARCODE, 1) is False
     assert automatic._add_discovered_module(OTHER, 2) is True
 
-    # Released on unload/removal: the other entry may now track it.
     manual.release_barcode_claims()
+    assert automatic._add_discovered_module(BARCODE, 1) is False
+    hass.config_entries.async_update_entry(
+        manual.config_entry, data={**manual.config_entry.data, "modules": []}
+    )
+    await hass.async_block_till_done()
     assert automatic._add_discovered_module(BARCODE, 1) is True
 
 
@@ -424,6 +434,8 @@ async def test_schedule_save_posts_once_per_cycle(hass: HomeAssistant) -> None:
 def _aggregate(description, barcodes, nodes, *, action, reporting):
     coordinator = MagicMock(spec=PyTapDataUpdateCoordinator)
     coordinator.data = {"nodes": nodes}
+    coordinator.hass = MagicMock()
+    coordinator.hass.config.time_zone = "UTC"
     coordinator.stale_action = action
     coordinator.is_reporting.side_effect = lambda barcode: barcode in reporting
     coordinator.module_peak_power.return_value = 500
@@ -450,23 +462,345 @@ def test_aggregate_performance_by_stale_action(action: str, expected: float) -> 
 def test_daily_aggregate_rolls_over_with_its_cycle_date() -> None:
     description = next(d for d in STRING_SENSOR_DESCRIPTIONS if d.key == "daily_energy")
     coordinator, sensor = _aggregate(
-        description, [BARCODE], {BARCODE: {"daily_energy_wh": 400.0}}, action="hold", reporting={BARCODE}
+        description,
+        [BARCODE],
+        {BARCODE: {"daily_energy_wh": 20.0}},
+        action="hold",
+        reporting={BARCODE},
     )
     today = dt_util.now(dt_util.UTC).date()
     yesterday = (today - timedelta(days=1)).isoformat()
     sensor._energy_total, sensor._baselines, sensor._cycle_date = 500.0, {BARCODE: 390.0}, yesterday
 
-    # The member reset at midnight: a new cycle starts at zero, no negative step.
-    coordinator.data = {"nodes": {BARCODE: {"daily_energy_wh": 20.0}}}
-    sensor._handle_coordinator_update()
-    assert sensor.native_value == 0.0
-    assert sensor.extra_restore_state_data.as_dict()["cycle_date"] == today.isoformat()
-    assert sensor.last_reset == datetime.combine(today, dt_time.min, tzinfo=dt_util.UTC)
+    # A report-first rollover must include the first value of the new day.
+    coordinator.data = {
+        "nodes": {BARCODE: {"daily_energy_wh": 20.0, "daily_reset_date": today.isoformat()}}
+    }
+    with patch.object(sensor, "_today", return_value=today.isoformat()):
+        sensor._handle_coordinator_update()
+        assert sensor.native_value == 20.0
+        assert sensor.extra_restore_state_data.as_dict()["cycle_date"] == today.isoformat()
+        assert sensor.last_reset == datetime.combine(today, dt_time.min, tzinfo=dt_util.UTC)
 
-    coordinator.data = {"nodes": {BARCODE: {"daily_energy_wh": 30.0}}}
-    sensor._handle_coordinator_update()
-    assert sensor.native_value == 10.0
+        coordinator.data = {
+            "nodes": {BARCODE: {"daily_energy_wh": 30.0, "daily_reset_date": today.isoformat()}}
+        }
+        sensor._handle_coordinator_update()
+    assert sensor.native_value == 30.0
     assert date.fromisoformat(sensor._cycle_date) == today
+
+
+def test_daily_aggregate_report_first_uses_current_day_and_ignores_stale_members() -> None:
+    description = next(d for d in STRING_SENSOR_DESCRIPTIONS if d.key == "daily_energy")
+    coordinator, sensor = _aggregate(
+        description,
+        [BARCODE, OTHER],
+        {},
+        action="hold",
+        reporting={BARCODE, OTHER},
+    )
+    today = dt_util.now(dt_util.UTC).date()
+    today_str = today.isoformat()
+    yesterday = (today - timedelta(days=1)).isoformat()
+    sensor._energy_total = 900.0
+    sensor._baselines = {BARCODE: 400.0, OTHER: 500.0}
+    sensor._cycle_date = yesterday
+    coordinator.data = {
+        "nodes": {
+            BARCODE: {"daily_energy_wh": 420.0, "daily_reset_date": today_str},
+            OTHER: {"daily_energy_wh": 510.0, "daily_reset_date": yesterday},
+        }
+    }
+
+    with patch.object(sensor, "_today", return_value=today_str):
+        sensor._handle_coordinator_update()
+        assert sensor.native_value == 420.0
+        coordinator.data = {
+            "nodes": {
+                BARCODE: {"daily_energy_wh": 425.0, "daily_reset_date": today_str},
+                OTHER: {"daily_energy_wh": 5.0, "daily_reset_date": today_str},
+            }
+        }
+        sensor._handle_coordinator_update()
+
+    assert sensor.native_value == 430.0
+
+
+def test_daily_aggregate_retains_baseline_for_temporarily_omitted_member() -> None:
+    description = next(d for d in STRING_SENSOR_DESCRIPTIONS if d.key == "daily_energy")
+    coordinator, sensor = _aggregate(
+        description,
+        [BARCODE, OTHER],
+        {},
+        action="hold",
+        reporting={BARCODE, OTHER},
+    )
+    today = dt_util.now(dt_util.UTC).date().isoformat()
+    sensor._energy_total = 100.0
+    sensor._baselines = {BARCODE: 10.0, OTHER: 20.0}
+    sensor._cycle_date = today
+    coordinator.data = {
+        "nodes": {BARCODE: {"daily_energy_wh": 15.0, "daily_reset_date": today}}
+    }
+
+    with patch.object(sensor, "_today", return_value=today):
+        sensor._handle_coordinator_update()
+        assert sensor._baselines[OTHER] == 20.0
+        coordinator.data = {
+            "nodes": {
+                BARCODE: {"daily_energy_wh": 16.0, "daily_reset_date": today},
+                OTHER: {"daily_energy_wh": 25.0, "daily_reset_date": today},
+            }
+        }
+        sensor._handle_coordinator_update()
+
+    assert sensor.native_value == 111.0
+
+
+def test_daily_aggregate_stale_date_keeps_zero_baseline_for_current_member() -> None:
+    description = next(d for d in STRING_SENSOR_DESCRIPTIONS if d.key == "daily_energy")
+    coordinator, sensor = _aggregate(
+        description,
+        [BARCODE],
+        {},
+        action="hold",
+        reporting={BARCODE},
+    )
+    today = dt_util.now(dt_util.UTC).date().isoformat()
+    yesterday = (date.fromisoformat(today) - timedelta(days=1)).isoformat()
+    sensor._energy_total = 100.0
+    sensor._baselines = {BARCODE: 20.0}
+    sensor._cycle_date = today
+
+    coordinator.data = {
+        "nodes": {BARCODE: {"daily_energy_wh": 250.0, "daily_reset_date": yesterday}}
+    }
+    with patch.object(sensor, "_today", return_value=today):
+        sensor._handle_coordinator_update()
+        assert sensor._energy_total == 100.0
+        assert sensor._baselines == {BARCODE: 0.0}
+
+        coordinator.data = {
+            "nodes": {BARCODE: {"daily_energy_wh": 30.0, "daily_reset_date": today}}
+        }
+        sensor._handle_coordinator_update()
+
+    assert sensor.native_value == 130.0
+
+
+def test_daily_aggregate_new_member_with_stale_date_rebases_without_credit() -> None:
+    description = next(d for d in STRING_SENSOR_DESCRIPTIONS if d.key == "daily_energy")
+    coordinator, sensor = _aggregate(
+        description,
+        [BARCODE, OTHER],
+        {},
+        action="hold",
+        reporting={BARCODE, OTHER},
+    )
+    today = dt_util.now(dt_util.UTC).date().isoformat()
+    yesterday = (date.fromisoformat(today) - timedelta(days=1)).isoformat()
+    sensor._energy_total = 100.0
+    sensor._baselines = {BARCODE: 10.0}
+    sensor._cycle_date = today
+    coordinator.data = {
+        "nodes": {
+            BARCODE: {"daily_energy_wh": 10.0, "daily_reset_date": today},
+            OTHER: {"daily_energy_wh": 50.0, "daily_reset_date": yesterday},
+        }
+    }
+
+    with patch.object(sensor, "_today", return_value=today):
+        sensor._handle_coordinator_update()
+        assert OTHER not in sensor._baselines
+        coordinator.data = {
+            "nodes": {
+                BARCODE: {"daily_energy_wh": 10.0, "daily_reset_date": today},
+                OTHER: {"daily_energy_wh": 60.0, "daily_reset_date": today},
+            }
+        }
+        sensor._handle_coordinator_update()
+
+    assert sensor.native_value == 100.0
+    assert sensor._baselines[OTHER] == 60.0
+
+
+def test_unseeded_daily_aggregate_retains_stale_baseline_when_member_is_omitted() -> None:
+    description = next(d for d in STRING_SENSOR_DESCRIPTIONS if d.key == "daily_energy")
+    coordinator, sensor = _aggregate(
+        description,
+        [BARCODE, OTHER],
+        {},
+        action="hold",
+        reporting={BARCODE, OTHER},
+    )
+    today = dt_util.now(dt_util.UTC).date().isoformat()
+    yesterday = (date.fromisoformat(today) - timedelta(days=1)).isoformat()
+    sensor._cycle_date = today
+    coordinator.data = {
+        "nodes": {OTHER: {"daily_energy_wh": 50.0, "daily_reset_date": yesterday}}
+    }
+
+    with patch.object(sensor, "_today", return_value=today):
+        sensor._handle_coordinator_update()
+        coordinator.data = {"nodes": {}}
+        sensor._handle_coordinator_update()
+        assert sensor._baselines == {OTHER: 0.0}
+
+        coordinator.data = {
+            "nodes": {BARCODE: {"daily_energy_wh": 10.0, "daily_reset_date": today}}
+        }
+        sensor._handle_coordinator_update()
+        coordinator.data = {
+            "nodes": {
+                BARCODE: {"daily_energy_wh": 10.0, "daily_reset_date": today},
+                OTHER: {"daily_energy_wh": 5.0, "daily_reset_date": today},
+            }
+        }
+        sensor._handle_coordinator_update()
+
+    assert sensor.native_value == 15.0
+    assert sensor._baselines == {BARCODE: 10.0, OTHER: 5.0}
+
+
+def test_aggregate_removed_then_readded_member_rebases_without_credit() -> None:
+    description = next(d for d in STRING_SENSOR_DESCRIPTIONS if d.key == "total_energy")
+    coordinator, sensor = _aggregate(
+        description,
+        [BARCODE, OTHER],
+        {
+            BARCODE: {"total_energy_wh": 100.0},
+            OTHER: {"total_energy_wh": 200.0},
+        },
+        action="hold",
+        reporting={BARCODE, OTHER},
+    )
+    sensor._energy_total = 1000.0
+    sensor._baselines = {BARCODE: 100.0, OTHER: 200.0}
+
+    sensor.set_barcodes([BARCODE])
+    coordinator.data = {"nodes": {BARCODE: {"total_energy_wh": 100.0}}}
+    sensor._handle_coordinator_update()
+    assert sensor._baselines == {BARCODE: 100.0}
+
+    sensor.set_barcodes([BARCODE, OTHER])
+    coordinator.data = {
+        "nodes": {
+            BARCODE: {"total_energy_wh": 100.0},
+            OTHER: {"total_energy_wh": 225.0},
+        }
+    }
+    sensor._handle_coordinator_update()
+    assert sensor.native_value == 1000.0
+    assert sensor._baselines == {BARCODE: 100.0, OTHER: 225.0}
+
+    coordinator.data["nodes"][OTHER]["total_energy_wh"] = 230.0
+    sensor._handle_coordinator_update()
+    assert sensor.native_value == 1005.0
+
+
+def test_total_aggregate_credits_member_reset_value_once() -> None:
+    description = next(d for d in STRING_SENSOR_DESCRIPTIONS if d.key == "total_energy")
+    coordinator, sensor = _aggregate(
+        description,
+        [BARCODE],
+        {BARCODE: {"total_energy_wh": 20.0}},
+        action="hold",
+        reporting={BARCODE},
+    )
+    sensor._energy_total = 1000.0
+    sensor._baselines = {BARCODE: 100.0}
+
+    sensor._handle_coordinator_update()
+    assert sensor.native_value == 1020.0
+
+    coordinator.data = {"nodes": {BARCODE: {"total_energy_wh": 25.0}}}
+    sensor._handle_coordinator_update()
+    assert sensor.native_value == 1025.0
+
+
+def test_daily_aggregate_credits_member_reset_value_once() -> None:
+    description = next(d for d in STRING_SENSOR_DESCRIPTIONS if d.key == "daily_energy")
+    coordinator, sensor = _aggregate(
+        description,
+        [BARCODE],
+        {BARCODE: {"daily_energy_wh": 10.0}},
+        action="hold",
+        reporting={BARCODE},
+    )
+    today = dt_util.now(dt_util.UTC).date().isoformat()
+    sensor._energy_total = 100.0
+    sensor._baselines = {BARCODE: 50.0}
+    sensor._cycle_date = today
+
+    coordinator.data = {
+        "nodes": {BARCODE: {"daily_energy_wh": 10.0, "daily_reset_date": today}}
+    }
+    with patch.object(sensor, "_today", return_value=today):
+        sensor._handle_coordinator_update()
+        assert sensor.native_value == 110.0
+        coordinator.data = {
+            "nodes": {BARCODE: {"daily_energy_wh": 15.0, "daily_reset_date": today}}
+        }
+        sensor._handle_coordinator_update()
+
+    assert sensor.native_value == 115.0
+
+
+def test_total_aggregate_ignores_negative_value_without_rebasing() -> None:
+    description = next(d for d in STRING_SENSOR_DESCRIPTIONS if d.key == "total_energy")
+    coordinator, sensor = _aggregate(
+        description,
+        [BARCODE],
+        {BARCODE: {"total_energy_wh": -1.0}},
+        action="hold",
+        reporting={BARCODE},
+    )
+    sensor._energy_total = 1000.0
+    sensor._baselines = {BARCODE: 100.0}
+
+    sensor._handle_coordinator_update()
+    assert sensor.native_value == 1000.0
+    assert sensor._baselines == {BARCODE: 100.0}
+
+    coordinator.data = {"nodes": {BARCODE: {"total_energy_wh": 105.0}}}
+    sensor._handle_coordinator_update()
+    assert sensor.native_value == 1005.0
+
+
+def test_daily_aggregate_callback_first_ordering_remains_correct() -> None:
+    description = next(d for d in STRING_SENSOR_DESCRIPTIONS if d.key == "daily_energy")
+    coordinator, sensor = _aggregate(
+        description,
+        [BARCODE, OTHER],
+        {},
+        action="hold",
+        reporting={BARCODE, OTHER},
+    )
+    today = dt_util.now(dt_util.UTC).date()
+    today_str = today.isoformat()
+    yesterday = (today - timedelta(days=1)).isoformat()
+    sensor._energy_total = 500.0
+    sensor._baselines = {BARCODE: 400.0, OTHER: 100.0}
+    sensor._cycle_date = yesterday
+    coordinator.data = {
+        "nodes": {
+            BARCODE: {"daily_energy_wh": 0.0, "daily_reset_date": today_str},
+            OTHER: {"daily_energy_wh": 0.0, "daily_reset_date": today_str},
+        }
+    }
+
+    with patch.object(sensor, "_today", return_value=today_str):
+        sensor._handle_coordinator_update()
+        assert sensor.native_value == 0.0
+        coordinator.data = {
+            "nodes": {
+                BARCODE: {"daily_energy_wh": 20.0, "daily_reset_date": today_str},
+                OTHER: {"daily_energy_wh": 5.0, "daily_reset_date": today_str},
+            }
+        }
+        sensor._handle_coordinator_update()
+
+    assert sensor.native_value == 25.0
 
 
 ENTRY_ID = "aggregate-restore"
@@ -476,9 +810,15 @@ def _installation_uid(key: str) -> str:
     return f"{DOMAIN}_{ENTRY_ID}_installation_{key}"
 
 
-async def _setup_with_restore(hass: HomeAssistant, restored: dict[str, tuple[str, dict]]):
+async def _setup_with_restore(
+    hass: HomeAssistant,
+    restored: dict[str, tuple[str, dict]],
+    *,
+    modules=None,
+    stored: dict | None = None,
+):
     """Set up with saved member totals and pre-seeded aggregate restore data."""
-    entry = _entry(hass, [MODULE], entry_id=ENTRY_ID)
+    entry = _entry(hass, [MODULE] if modules is None else modules, entry_id=ENTRY_ID)
     registry = er.async_get(hass)
     cache = []
     for key, (state, extra) in restored.items():
@@ -487,13 +827,18 @@ async def _setup_with_restore(hass: HomeAssistant, restored: dict[str, tuple[str
         )
         cache.append((State(f"sensor.inst_{key}", state), extra))
     mock_restore_cache_with_extra_data(hass, cache)
-    today = dt_util.now().date().isoformat()
-    stored = {
-        "energy_data": {
-            BARCODE: {"total_energy_wh": 1010.0, "daily_energy_wh": 15.0, "daily_reset_date": today}
-        },
-        "node_snapshots": {BARCODE: {"total_energy_wh": 1010.0, "daily_energy_wh": 15.0}},
-    }
+    if stored is None:
+        today = dt_util.now().date().isoformat()
+        stored = {
+            "energy_data": {
+                BARCODE: {
+                    "total_energy_wh": 1010.0,
+                    "daily_energy_wh": 15.0,
+                    "daily_reset_date": today,
+                }
+            },
+            "node_snapshots": {BARCODE: {"total_energy_wh": 1010.0, "daily_energy_wh": 15.0}},
+        }
     with patch(STORE_LOAD, new=AsyncMock(return_value=stored)), patch(LISTEN, return_value=None):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
@@ -568,3 +913,124 @@ async def test_aggregate_restore_upgrades_plain_sum(hass: HomeAssistant) -> None
     await hass.async_block_till_done()
     assert float(hass.states.get(total.entity_id).state) == 2510.0
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_aggregate_restore_prunes_removed_baselines_without_node_data(
+    hass: HomeAssistant,
+) -> None:
+    entry, coordinator = await _setup_with_restore(
+        hass,
+        {
+            "total_energy": (
+                "3000.0",
+                {
+                    "native_value": 3000.0,
+                    "native_unit_of_measurement": "Wh",
+                    "baselines": {BARCODE: 1000.0, OTHER: 2000.0},
+                    "cycle_date": None,
+                },
+            ),
+        },
+        modules=[MODULE],
+        stored={},
+    )
+    total = _sensor_entity(hass, "total_energy")
+
+    assert coordinator.data["nodes"] == {}
+    assert total.native_value == 3000.0
+    assert total.extra_restore_state_data.as_dict()["baselines"] == {BARCODE: 1000.0}
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_daily_restore_rolls_cycle_without_node_data(hass: HomeAssistant) -> None:
+    today = dt_util.now().date().isoformat()
+    yesterday = (date.fromisoformat(today) - timedelta(days=1)).isoformat()
+    entry, coordinator = await _setup_with_restore(
+        hass,
+        {
+            "daily_energy": (
+                "40.0",
+                {
+                    "native_value": 40.0,
+                    "native_unit_of_measurement": "Wh",
+                    "baselines": {BARCODE: 10.0, OTHER: 20.0},
+                    "cycle_date": yesterday,
+                },
+            ),
+        },
+        modules=[MODULE],
+        stored={},
+    )
+    daily = _sensor_entity(hass, "daily_energy")
+
+    assert coordinator.data["nodes"] == {}
+    assert daily.native_value == 0.0
+    assert daily.extra_restore_state_data.as_dict() == {
+        "native_value": 0.0,
+        "native_unit_of_measurement": "Wh",
+        "baselines": {BARCODE: 0.0},
+        "cycle_date": today,
+    }
+    assert daily.available
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_unattached_sensors_use_coordinator_timezone(hass: HomeAssistant) -> None:
+    await hass.config.async_set_time_zone("America/Los_Angeles")
+    coordinator = _bare(hass, [MODULE])
+    coordinator.data = {"nodes": {BARCODE: {"daily_reset_date": "2026-01-01"}}}
+    optimizer_description = next(d for d in SENSOR_DESCRIPTIONS if d.key == "daily_energy")
+    optimizer = PyTapSensor(coordinator, optimizer_description, MODULE)
+    aggregate_description = next(
+        d for d in STRING_SENSOR_DESCRIPTIONS if d.key == "daily_energy"
+    )
+    aggregate = PyTapAggregateSensor(
+        coordinator, aggregate_description, [BARCODE], MagicMock(), "uid"
+    )
+
+    assert optimizer.hass is None
+    assert aggregate.hass is None
+    assert optimizer._timezone().key == "America/Los_Angeles"
+    assert aggregate._timezone().key == "America/Los_Angeles"
+    assert optimizer.last_reset == datetime(2026, 1, 1, tzinfo=optimizer._timezone())
+
+    local_previous_day = datetime(2026, 1, 1, 7, 30, tzinfo=dt_util.UTC)
+    with patch(
+        "custom_components.pytap.sensor.dt_util.now",
+        side_effect=lambda timezone: local_previous_day.astimezone(timezone),
+    ):
+        assert aggregate._today() == "2025-12-31"
+        assert aggregate.last_reset == datetime(2025, 12, 31, tzinfo=aggregate._timezone())
+
+
+async def test_daily_restore_uses_local_date_just_after_local_midnight(
+    hass: HomeAssistant,
+) -> None:
+    await hass.config.async_set_time_zone("Asia/Tokyo")
+    coordinator = _bare(hass, [MODULE])
+    coordinator.data = {"nodes": {}}
+    description = next(d for d in STRING_SENSOR_DESCRIPTIONS if d.key == "daily_energy")
+    sensor = PyTapAggregateSensor(coordinator, description, [BARCODE], MagicMock(), "uid")
+    extra = _AggregateEnergyData(
+        native_value=40.0,
+        native_unit_of_measurement="Wh",
+        baselines={BARCODE: 10.0},
+        cycle_date="2025-12-31",
+    )
+    local_after_midnight = datetime(2025, 12, 31, 15, 30, tzinfo=dt_util.UTC)
+
+    with (
+        patch.object(sensor, "async_get_last_extra_data", new=AsyncMock(return_value=extra)),
+        patch(
+            "custom_components.pytap.sensor.dt_util.now",
+            side_effect=lambda timezone: local_after_midnight.astimezone(timezone),
+        ),
+    ):
+        await sensor._async_restore_energy()
+
+    assert sensor._cycle_date == "2026-01-01"
+    assert sensor.native_value == 0.0
+    assert sensor._baselines == {BARCODE: 0.0}
+    assert sensor.available
+    assert sensor.last_reset == datetime(2026, 1, 1, tzinfo=sensor._timezone())

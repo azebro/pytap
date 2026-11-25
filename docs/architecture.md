@@ -203,7 +203,7 @@ The entry also stores `auto_discovery` and `excluded_barcodes`. With automatic d
 
 **Unique ID:** a random UUID per entry; duplicate serial ports are prevented by the port check instead.
 
-**Options Flow:** menu with _Change connection settings_ (TCP/serial; saved immediately, current serial port not probed while the listener owns it), _Change reporting settings_ (+ _Reporting Interval_ step when live reporting is off), _Change stale reading behaviour_, _Change module discovery_, _Add / Edit / Remove a module_, and _Save and close_. Connection, reporting and stale-reading changes are written immediately; module and discovery edits are written on _Save and close_, merged with modules discovered meanwhile without undoing removals. Removed barcodes are added to `excluded_barcodes`.
+**Options Flow:** menu with _Change connection settings_ (TCP/serial; saved immediately, current serial port not probed while the listener owns it), _Change reporting settings_ (+ _Reporting Interval_ step when live reporting is off), _Change stale reading behaviour_, _Change module discovery_, _Add / Edit / Remove a module_, and _Save and close_. Connection, reporting and stale-reading changes are written immediately. Saving modules/discovery reconciles the initial snapshot, local edits and latest entry/runtime catalogue: only locally edited fields overwrite current values, concurrent deletions/exclusions are retained, and newly discovered modules survive. Removed barcodes are added to `excluded_barcodes`; only an explicit add clears an exclusion.
 
 ### 3. `const.py` — Constants
 
@@ -386,7 +386,7 @@ Saves are throttled (at most one pending, written 10 s after the first change) a
 
 #### Module Discovery
 
-With `auto_discovery` enabled, `_add_discovered_module()` admits a barcode seen in a node table or power report unless it is configured, in `excluded_barcodes`, or claimed by another PyTap entry. Claims (`BarcodeClaims`, in `hass.data`) are domain-wide and atomic across worker threads; each coordinator claims its configured barcodes when created (a barcode configured in two entries logs a warning) and releases its claims once its listener has stopped. Discovered modules get the name `Optimizer <barcode>`, string `Discovered` and rating 0 Wp (unknown), are saved in the Store (not the config entry, so no reload), and survive restarts. Enabling discovery later also admits barcodes recorded in earlier manual sessions. With discovery off, unconfigured barcodes are only logged:
+With `auto_discovery` enabled, `_add_discovered_module()` admits a barcode seen in a node table or power report unless it is configured, in `excluded_barcodes`, or owned by another PyTap entry. `BarcodeClaims` keeps lock-protected active claims plus a configured-ownership snapshot refreshed on HA's event loop through `SIGNAL_CONFIG_ENTRY_CHANGED`. Unloaded entries therefore retain their reservations without parser workers calling HA config-entry APIs. Releasing a worker claim does not release a configured reservation. A duplicate manual barcode logs one warning and is removed from the conflicting coordinator's active module set, leaving its healthy modules running. Discovered modules get the name `Optimizer <barcode>`, string `Discovered` and rating 0 Wp (unknown), are saved in the Store (not the config entry, so no reload), and survive restarts. Enabling discovery later also admits barcodes recorded in earlier manual sessions. With discovery off, unconfigured barcodes are only logged:
 
 ```
 INFO: Discovered unconfigured Tigo optimizer barcode: S-9999999Z (gateway=1, node=55).
@@ -465,7 +465,11 @@ In hold mode a sensor with no coordinator node but a restored HA state stays ava
 
 #### Aggregate Energy
 
-String/installation energy sensors store their own total plus each member's last seen value (`baselines`) as extra restore data. On each update they add every member's increase since its baseline; new members and member decreases (e.g. midnight) only rebase. Membership changes therefore never add a panel's lifetime energy or look like a meter reset. Upgrading from an older version, the total aggregate continues from its restored plain sum. The daily aggregate starts a new cycle when the local date changes, and `last_reset` is the start of that cycle. Aggregate attributes: `optimizer_count`, `reporting_count`.
+String/installation energy sensors store their own total plus each current member's last seen value (`baselines`) as extra restore data. A nonnegative total or daily counter decrease credits its current post-reset value once; subsequent increases contribute only their delta. New/re-added members establish a baseline without credit. Temporarily omitted current members retain their baselines, while removed members are pruned during both update and restore.
+
+Daily aggregates require each member's `daily_reset_date` to match the HA-local cycle date on every update. A tracked member with a stale date retains a zero baseline so its first matching reading is credited in full; a new member remains uninitialized until a matching reading establishes its baseline. A new local-date cycle resets the daily total and tracked baselines. Restore advances stale cycles even without current node data. Unattached optimizer and aggregate sensors use the coordinator's HA timezone for `_timezone()`, `_today()` and `last_reset` where applicable.
+
+Coordinator member totals and aggregate baselines are persisted separately. An abrupt stop before the delayed coordinator save can make an older restored member value look like a reset; exact reset credit can overcount by as much as that restored member-counter value, potentially its lifetime total for total energy or current-day total for daily energy. `optimizer_count` is the configured member count; `reporting_count` is the number of present members with a valid report inside the stale timeout plus the averaged reporting interval, where enabled. It can be zero overnight or after restart, including in hold mode.
 
 #### Barcode-to-Node Matching
 
@@ -491,10 +495,13 @@ Byte 7 and byte 9 meanings are correlations from captured data, not confirmed by
 - `SerialProxySource` runs `serialx`'s async transport on HA's loop (8N1, no flow control, DTR/RTS untouched) behind a blocking `read()`/`close()` used by the worker; idle reads return `b""` after 1 s.
 - `open_source()` opens a `SerialProxySource` or `pytap` `TcpSource`, closing it again if `connect()` fails.
 - `connection_title()` never includes proxy URLs or serial identities.
+- Minimum HA is 2026.10.4. Its ESPHome handler cannot represent a decoded udev identity ending in `-port<number>` or, otherwise, a proxy URL without `port_name`. These yield separate reselect/HA-2026.11+ errors, with the udev-suffix check first. Other valid URL filters remain intact; malformed forms fail on both releases. Dependencies use each Core's official `serialx` constraint.
 
 ### 8. `capture_services.py` — Packet-Capture Actions
 
 Admin-only actions with optional responses: `start_capture`, `stop_capture`, `capture_status`, `list_captures`, `export_capture` (optional `max_storage_mib`) and `delete_capture`. They require a loaded PyTap entry. `CaptureError` and other `ValueError`s (invalid evidence: `capture_invalid`) become `ServiceValidationError`; runtime failures — `CaptureRuntimeError` (e.g. `export_insufficient_space`) and `OSError`/`KeyError` (`capture_failed`, with only the exception type) — become `HomeAssistantError`. Export/delete jobs are registered per capture root (`track_capture_job()`), so they stay visible across reloads. `async_remove_captures()` deletes `pytap_captures/<entry_id>` when the entry is removed, after waiting up to 30 s for a running job (otherwise once it ends). Responses may include local paths; diagnostics do not.
+
+The trusted path boundary is `hass.config.config_dir`. All capture operations reject symlink components below it, including capture/entry/session roots and export targets; ancestors above it may be symlinks. Rejected external data is not deleted or migrated. Storage behavior remains a 1024 MiB default (16–4096 MiB), existing capture/ZIP accounting, no pruning, deletion of a session's exported archives, and normal HA backup inclusion. Export alone excludes its source from the budget calculation, so source plus archive can occupy approximately twice the selected budget.
 
 ### 9. `manifest.json` — Integration Metadata
 
@@ -510,8 +517,8 @@ Admin-only actions with optional responses: `start_capture`, `stop_capture`, `ca
   "integration_type": "hub",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/azebro/pytap/issues",
-  "requirements": ["serialx>=1.15.1"],
-  "version": "1.2.0"
+  "requirements": ["serialx>=1.11.0"],
+  "version": "1.4.0"
 }
 ```
 
@@ -563,7 +570,7 @@ Key choices:
 
 The `pytap` parser library is bundled inside the custom component at `custom_components/pytap/pytap/`:
 
-- **Shipped together** — Each integration release bundles its parser; the parser's own `pytap.__version__` (currently 1.1.1) is not kept in step with the integration version (`manifest.json`, currently 1.2.0).
+- **Shipped together** — Each integration release bundles its parser; the parser's own `pytap.__version__` (currently 1.1.1) is not kept in step with the integration version (`manifest.json`, currently 1.4.0).
 - **No PyPI publishing required** — Reduces release complexity for a niche integration.
 - The only runtime requirement is `serialx`, for serial and proxy access.
 
@@ -709,7 +716,13 @@ Configurable at runtime without removing the integration: connection, reporting 
 | `test_diagnostics.py` | Diagnostics payload and redaction |
 | `test_energy.py` | Trapezoidal energy accumulation |
 | `test_migration.py` | Config entry migration and legacy entity cleanup |
-| `core_smoke.py` | Smoke tests against HA 2026.11 without the test harness |
+| `core_smoke.py` | Real public APIs, transports, migrations, lifecycle and exact-#39 rollback on HA 2026.10.4 and 2026.11.2 |
+
+CI installs each Core with its own official constraints and the full recursive
+ESPHome/USB/Zeroconf/Assist Satellite manifest closure (both dependency kinds).
+Only 2026.10.4 installs the published pytest harness and runs integration/parser
+pytest. Both environments run `scripts/run_core_smoke.py`, which rejects zero
+tests, skips and every unsuccessful unittest outcome.
 
 ### Parser Tests (`custom_components/pytap/pytap/tests/`)
 

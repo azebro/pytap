@@ -11,12 +11,13 @@ from homeassistant.exceptions import HomeAssistantError, ServiceValidationError,
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.pytap.const import DOMAIN
+from custom_components.pytap.const import DOMAIN, INTEGRATION_VERSION
 from custom_components.pytap.pytap.core.capture import iter_capture, list_captures
 
 
 @pytest.fixture
 async def capture_entry(hass, tmp_path):
+    hass.config.config_dir = str(tmp_path)
     entry = MockConfigEntry(
         domain=DOMAIN, version=7, data={"host": "private-host", "port": 502, "modules": []}
     )
@@ -54,7 +55,7 @@ async def test_actions_start_stop_list_export_and_private_metadata(hass, capture
     assert result["bytes_written"] == 15
     manifest = json.loads((Path(result["directory"]) / "manifest.json").read_text())
     assert "private-host" not in json.dumps(manifest)
-    assert manifest["metadata"]["integration_version"] == "1.2.0"
+    assert manifest["metadata"]["integration_version"] == INTEGRATION_VERSION
     assert "parser_state" in manifest["metadata"]
     listed = await _call(hass, "list_captures", entry)
     assert listed["captures"][0]["capture_id"] == result["capture_id"]
@@ -360,6 +361,19 @@ async def test_export_budget_is_enforced(hass, capture_entry):
     assert Path((await _call(hass, "export_capture", entry, max_storage_mib=64))["archive"]).is_file()
 
 
+async def test_capture_start_applies_default_and_supported_storage_limits(hass, capture_entry):
+    entry, coordinator = capture_entry
+    for supplied, expected in ((None, 1024), (16, 16), (4096, 4096)):
+        data = {} if supplied is None else {"max_storage_mib": supplied}
+        started = await _call(hass, "start_capture", entry, duration_minutes=1, **data)
+        assert started["max_storage_bytes"] == expected * 1024 * 1024
+        await _call(hass, "stop_capture", entry)
+    for invalid in (15, 4097):
+        with pytest.raises(ValueError) as err:
+            await coordinator.async_start_capture(1, invalid)
+        assert err.value.translation_key == "invalid_storage"
+
+
 async def test_export_does_not_hold_the_capture_lock(hass, capture_entry):
     entry, coordinator = capture_entry
     started = await _call(hass, "start_capture", entry, duration_minutes=1, max_storage_mib=16)
@@ -434,9 +448,84 @@ async def test_diagnostics_capture_status_has_no_directory(hass, capture_entry):
 async def test_remove_captures_for_removed_entry(hass, tmp_path):
     from custom_components.pytap.capture_services import async_remove_captures
 
-    root = tmp_path / "pytap_captures" / "entry"
+    hass.config.config_dir = str(tmp_path)
+    root = Path(hass.config.path("pytap_captures", "entry"))
     (root / "20260101T000000Z_aaaaaaaaaaaa").mkdir(parents=True)
-    with patch("custom_components.pytap.capture_services.capture_root", return_value=root):
+    await async_remove_captures(hass, "entry")
+    assert not root.exists()
+    await async_remove_captures(hass, "entry")  # Already gone: no error.
+
+
+async def test_remove_captures_refuses_symlinked_parent_non_destructively(hass, tmp_path, caplog):
+    from custom_components.pytap.capture_services import async_remove_captures, capture_root
+    from custom_components.pytap.pytap.core.capture import CaptureError
+
+    hass.config.config_dir = str(tmp_path)
+    external = tmp_path / "external"
+    entry_root = external / "entry"
+    entry_root.mkdir(parents=True)
+    (entry_root / "keep").write_text("keep")
+    symlink = Path(hass.config.path("pytap_captures"))
+    symlink.symlink_to(external, target_is_directory=True)
+    try:
+        with pytest.raises(CaptureError, match="move.*config directory"):
+            capture_root(hass, "entry")
         await async_remove_captures(hass, "entry")
-        assert not root.exists()
-        await async_remove_captures(hass, "entry")  # Already gone: no error.
+        assert (entry_root / "keep").read_text() == "keep"
+        assert "move" in caplog.text.lower() and "config directory" in caplog.text.lower()
+    finally:
+        symlink.unlink()
+
+
+@pytest.mark.parametrize(
+    "service", ["start_capture", "list_captures", "capture_status", "export_capture", "delete_capture"]
+)
+async def test_capture_actions_reject_redirected_parent(hass, capture_entry, tmp_path_factory, service):
+    from custom_components.pytap.pytap.core.capture import CaptureWriter
+
+    entry, coordinator = capture_entry
+    outside = tmp_path_factory.mktemp("external-capture-data")
+    writer = CaptureWriter(outside / entry.entry_id, {})
+    writer.start()
+    writer.record(b"must remain unchanged", 1)
+    writer.request_stop("test")
+    assert writer.join(5)
+    original = {
+        path.relative_to(outside): path.read_bytes()
+        for path in outside.rglob("*")
+        if path.is_file()
+    }
+    link = coordinator._capture_root.parent
+    link.symlink_to(outside, target_is_directory=True)
+    try:
+        args = {} if service in ("start_capture", "list_captures") else {"capture_id": writer.capture_id}
+        with pytest.raises(ServiceValidationError) as err:
+            await _call(hass, service, entry, **args)
+        assert err.value.translation_key == "capture_path_unsafe"
+        assert {
+            path.relative_to(outside): path.read_bytes()
+            for path in outside.rglob("*")
+            if path.is_file()
+        } == original
+    finally:
+        await coordinator.async_stop_capture()
+        link.unlink()
+
+
+async def test_capture_actions_allow_symlinked_ancestor_above_config(hass, capture_entry, tmp_path):
+    entry, coordinator = capture_entry
+    real = tmp_path / "real"
+    (real / "config").mkdir(parents=True)
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+    hass.config.config_dir = str(alias / "config")
+    coordinator._capture_root = alias / "config" / "pytap_captures" / entry.entry_id
+    started = await _call(hass, "start_capture", entry, duration_minutes=1, max_storage_mib=16)
+    await _call(hass, "stop_capture", entry)
+    listed = await _call(hass, "list_captures", entry)
+    assert listed["captures"][0]["capture_id"] == started["capture_id"]
+    exported = await _call(hass, "export_capture", entry)
+    assert Path(exported["archive"]).is_file()
+    await _call(hass, "delete_capture", entry, capture_id=started["capture_id"])
+    assert not Path(started["directory"]).exists()
+    assert not Path(exported["archive"]).exists()

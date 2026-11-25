@@ -26,6 +26,10 @@ from custom_components.pytap.const import (
 
 PROXY_URL = "esphome-hass://esphome/entry-one?port_name=Tigo%20Bus"
 IDENTITY_URL = "esphome-hass://esphome/entry-one?port_udev_id=usb-Tigo_AbC-if00-port0"
+NAMED_IDENTITY_URL = (
+    "esphome-hass://esphome/entry-one?port_name=Tigo%20Bus"
+    "&port_udev_id=usb-Tigo_AbC-if00"
+)
 MODULES = [{"string": "A", "name": "Panel", "barcode": "A-1234567B", "peak_power": 455}]
 
 
@@ -89,7 +93,7 @@ async def test_native_discovery_includes_multiple_proxy_ports(hass):
         unsub()
 
 
-@pytest.mark.parametrize("endpoint", [PROXY_URL, IDENTITY_URL, "/dev/serial/by-id/tigo"])
+@pytest.mark.parametrize("endpoint", [PROXY_URL, "/dev/serial/by-id/tigo"])
 async def test_complete_offline_serial_setup(hass, endpoint):
     result = await _serial_flow(hass)
     with patch("custom_components.pytap.config_flow.validate_connection", side_effect=OSError("offline")):
@@ -126,6 +130,45 @@ async def test_invalid_serial_settings_stay_on_form(hass, input_data, errors):
     with patch("custom_components.pytap.config_flow.validate_connection") as probe:
         result = await hass.config_entries.flow.async_configure(result["flow_id"], input_data)
     assert result["errors"] == errors
+    probe.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "error"),
+    [
+        (
+            "esphome-hass://esphome/entry-one?"
+            "port_udev_id=usb-Tigo_CDC_Adapter_CDC123-if00",
+            "serial_port_name_required",
+        ),
+        (
+            "esphome-hass://esphome/entry-one?"
+            "port_udev_id=usb-Tigo_Vendor_Adapter_VEN123-if01%2Dport0",
+            "serial_port_udev_suffix_unsupported",
+        ),
+        (
+            "esphome-hass://esphome/entry-one?"
+            "port_name=Tigo&port_udev_id=usb-Tigo_Vendor_Adapter_VEN123-if01-port0",
+            "serial_port_udev_suffix_unsupported",
+        ),
+    ],
+)
+async def test_2026_10_proxy_limitations_are_actionable_flow_errors(hass, endpoint, error):
+    result = await _serial_flow(hass)
+    with (
+        patch("custom_components.pytap.connection.MAJOR_VERSION", 2026),
+        patch("custom_components.pytap.connection.MINOR_VERSION", 10),
+        patch("custom_components.pytap.config_flow.validate_connection") as probe,
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_SERIAL_PORT: endpoint}
+        )
+        assert result["errors"] == {CONF_SERIAL_PORT: error}
+        assert (
+            await hass.config_entries.flow.async_configure(
+                result["flow_id"], {CONF_SERIAL_PORT: endpoint}
+            )
+        )["errors"] == {CONF_SERIAL_PORT: error}
     probe.assert_not_called()
 
 
@@ -195,9 +238,11 @@ async def test_options_change_proxy_preserves_url(hass):
     entry = _entry(hass, serial=True)
     result = await _connection_options(hass, entry)
     with patch("custom_components.pytap.config_flow.validate_connection") as probe:
-        await hass.config_entries.options.async_configure(result["flow_id"], {CONF_SERIAL_PORT: IDENTITY_URL})
+        await hass.config_entries.options.async_configure(
+            result["flow_id"], {CONF_SERIAL_PORT: NAMED_IDENTITY_URL}
+        )
     probe.assert_awaited_once()
-    assert entry.data[CONF_SERIAL_PORT] == IDENTITY_URL
+    assert entry.data[CONF_SERIAL_PORT] == NAMED_IDENTITY_URL
 
 
 async def test_connection_warning_does_not_log_endpoint(hass, caplog):

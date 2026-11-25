@@ -8,6 +8,7 @@ and filters events by user-configured barcodes.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 from datetime import datetime, timedelta
 import logging
 from pathlib import Path
@@ -15,9 +16,14 @@ import threading
 import time
 from typing import Any
 
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import (
+    SIGNAL_CONFIG_ENTRY_CHANGED,
+    ConfigEntry,
+    ConfigEntryChange,
+)
 from homeassistant.const import __version__ as HA_VERSION
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.event import async_track_time_change, async_track_time_interval
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
@@ -150,10 +156,25 @@ class BarcodeClaims:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._owners: dict[str, str] = {}
+        self._configured: dict[str, str] = {}
+
+    def set_configured_entries(self, entries: Iterable[ConfigEntry]) -> None:
+        """Publish configured ownership from HA's loop for worker-side claims."""
+        configured: dict[str, str] = {}
+        for entry in entries:
+            for module in entry.data.get(CONF_MODULES, []):
+                if barcode := module.get(CONF_MODULE_BARCODE):
+                    configured.setdefault(barcode, entry.entry_id)
+        with self._lock:
+            self._configured = configured
 
     def claim(self, barcode: str, entry_id: str) -> bool:
         """Claim ``barcode`` for ``entry_id``; True if it now (or already) owns it."""
         with self._lock:
+            if owner := self._owners.get(barcode):
+                return owner == entry_id
+            if (owner := self._configured.get(barcode)) is not None and owner != entry_id:
+                return False
             return self._owners.setdefault(barcode, entry_id) == entry_id
 
     def release_entry(self, entry_id: str) -> None:
@@ -167,7 +188,19 @@ BARCODE_CLAIMS_KEY = f"{DOMAIN}_barcode_claims"
 
 def barcode_claims(hass: HomeAssistant) -> BarcodeClaims:
     """The shared claim map; create it on the event loop before any worker starts."""
-    return hass.data.setdefault(BARCODE_CLAIMS_KEY, BarcodeClaims())
+    if BARCODE_CLAIMS_KEY not in hass.data:
+        claims = BarcodeClaims()
+        hass.data[BARCODE_CLAIMS_KEY] = claims
+
+        @callback
+        def update_configured(_change: ConfigEntryChange, entry: ConfigEntry) -> None:
+            if entry.domain == DOMAIN:
+                claims.set_configured_entries(hass.config_entries.async_entries(DOMAIN))
+
+        async_dispatcher_connect(hass, SIGNAL_CONFIG_ENTRY_CHANGED, update_configured)
+    claims = hass.data[BARCODE_CLAIMS_KEY]
+    claims.set_configured_entries(hass.config_entries.async_entries(DOMAIN))
+    return claims
 
 
 class _MigratingStore(Store):
@@ -275,7 +308,14 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._claims = barcode_claims(hass)
         for barcode in sorted(self._configured_barcodes):
             if not self._claims.claim(barcode, entry.entry_id):
+                self._foreign_barcodes.add(barcode)
+                self._configured_barcodes.remove(barcode)
+                self._module_lookup.pop(barcode)
                 _LOGGER.warning("Optimizer %s is configured here but another PyTap entry tracks it", barcode)
+        self._modules = [
+            module for module in self._modules
+            if module.get(CONF_MODULE_BARCODE) not in self._foreign_barcodes
+        ]
 
         # Counter for power reports dropped because barcode could not be
         # resolved.  Used to emit periodic INFO-level messages so operators
@@ -575,7 +615,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return self._claims.claim(barcode, self.config_entry.entry_id)
 
     def release_barcode_claims(self) -> None:
-        """Let other entries track this entry's optimizers (on unload or removal)."""
+        """Release worker claims; configured ownership persists while unloaded."""
         self._claims.release_entry(self.config_entry.entry_id)
 
     def _add_discovered_module(
@@ -706,6 +746,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 },
                 duration_seconds=duration_minutes * 60,
                 max_storage_bytes=max_storage_mib * 1024 * 1024,
+                trusted_root=Path(self.hass.config.config_dir),
             )
             self._capture = writer  # Publish before enabling the producer.
             self._capture_start_future = self.hass.async_add_executor_job(writer.start)
@@ -737,14 +778,18 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return writer.status(include_directory=True)
 
     async def async_list_captures(self) -> list[dict[str, Any]]:
-        return await self.hass.async_add_executor_job(list_captures, self._capture_root)
+        boundary = Path(self.hass.config.config_dir)
+        return await self.hass.async_add_executor_job(
+            lambda: list_captures(self._capture_root, trusted_root=boundary)
+        )
 
     async def async_capture_info(self, capture_id: str | None = None) -> dict[str, Any]:
         if capture_id is None or (self._capture is not None and capture_id == self._capture.capture_id):
             return self._capture_service_status()
+        boundary = Path(self.hass.config.config_dir)
 
         def info() -> dict[str, Any]:
-            directory = capture_directory(self._capture_root, capture_id)
+            directory = capture_directory(self._capture_root, capture_id, trusted_root=boundary)
             manifest = read_manifest(directory, allow_incomplete=True)
             hidden = ("metadata", "segments", "events", "directory")
             return {
@@ -776,13 +821,16 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             else:
                 budget = max_storage_mib * 1024 * 1024
             root = self._capture_root
+            boundary = Path(self.hass.config.config_dir)
 
             def export() -> str:
-                directory = capture_directory(root, capture_id)
+                directory = capture_directory(root, capture_id, trusted_root=boundary)
                 limit = budget
                 if limit is None:
                     limit = read_manifest(directory, allow_incomplete=True)["max_storage_bytes"]
-                return str(export_archive(directory, allow_interrupted=True, max_storage_bytes=limit))
+                return str(export_archive(
+                    directory, allow_interrupted=True, max_storage_bytes=limit, trusted_root=boundary
+                ))
 
             future = self._capture_export_future = self.hass.async_add_executor_job(export)
             track_capture_job(self.hass, root, future)
@@ -804,8 +852,9 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     raise CaptureError("capture_active", "Stop the active capture before deleting it")
             if self._capture_job_running():
                 raise CaptureError("capture_busy", "A capture or export is already running or stopping")
+            boundary = Path(self.hass.config.config_dir)
             future = self._capture_export_future = self.hass.async_add_executor_job(
-                delete_capture, self._capture_root, capture_id
+                lambda: delete_capture(self._capture_root, capture_id, trusted_root=boundary)
             )
             track_capture_job(self.hass, self._capture_root, future)
         result = await asyncio.shield(future)

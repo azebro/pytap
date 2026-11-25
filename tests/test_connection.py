@@ -9,6 +9,8 @@ import serialx
 
 from custom_components.pytap.config_flow import validate_connection
 from custom_components.pytap.connection import (
+    SERIAL_PORT_NAME_REQUIRED,
+    SERIAL_PORT_UDEV_SUFFIX_UNSUPPORTED,
     InvalidConnectionSettings,
     SerialProxySource,
     connection_title,
@@ -82,6 +84,73 @@ def test_invalid_settings_never_open_a_source(data, field):
     with pytest.raises(InvalidConnectionSettings) as error:
         normalize_connection(data)
     assert error.value.field == field
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "error"),
+    [
+        (
+            "esphome-hass://esphome/entry-one?"
+            "port_udev_id=usb-Tigo_CDC_Adapter_CDC123-if00",
+            SERIAL_PORT_NAME_REQUIRED,
+        ),
+        (
+            "esphome-hass://esphome/entry-one?"
+            "port_usb_vid=0x10c4&port_usb_pid=0xea60",
+            SERIAL_PORT_NAME_REQUIRED,
+        ),
+        (
+            "esphome-hass://esphome/entry-one?"
+            "port_udev_id=usb-Tigo_Vendor_Adapter_VEN123-if01-port0",
+            SERIAL_PORT_UDEV_SUFFIX_UNSUPPORTED,
+        ),
+        (
+            "esphome-hass://esphome/entry-one?"
+            "port_name=Tigo&port_udev_id=usb-Tigo_Vendor_Adapter_VEN123-if01%2Dport0",
+            SERIAL_PORT_UDEV_SUFFIX_UNSUPPORTED,
+        ),
+    ],
+)
+def test_2026_10_rejects_only_approved_version_incompatible_proxy_forms(endpoint, error):
+    with (
+        patch("custom_components.pytap.connection.MAJOR_VERSION", 2026),
+        patch("custom_components.pytap.connection.MINOR_VERSION", 10),
+        pytest.raises(InvalidConnectionSettings) as caught,
+    ):
+        normalize_connection(
+            {
+                CONF_CONNECTION_TYPE: CONNECTION_SERIAL,
+                CONF_SERIAL_PORT: endpoint,
+                CONF_BAUD_RATE: 38400,
+            }
+        )
+    assert caught.value.field == CONF_SERIAL_PORT
+    assert caught.value.error == error
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "esphome-hass://esphome/entry-one?port_udev_id=usb-Tigo_CDC_Adapter_CDC123-if00",
+        "esphome-hass://esphome/entry-one?port_usb_vid=0x10c4&port_usb_pid=0xea60",
+        "esphome-hass://esphome/entry-one?port_udev_id=usb-Tigo_Vendor_Adapter_VEN123-if01-port0",
+        "esphome-hass://esphome/entry-one?"
+        "port_name=Tigo&port_udev_id=usb-Tigo_Vendor_Adapter_VEN123-if01-port0",
+    ],
+)
+def test_2026_11_accepts_identity_proxy_forms(endpoint):
+    with (
+        patch("custom_components.pytap.connection.MAJOR_VERSION", 2026),
+        patch("custom_components.pytap.connection.MINOR_VERSION", 11),
+    ):
+        settings = normalize_connection(
+            {
+                CONF_CONNECTION_TYPE: CONNECTION_SERIAL,
+                CONF_SERIAL_PORT: endpoint,
+                CONF_BAUD_RATE: 38400,
+            }
+        )
+    assert settings[CONF_SERIAL_PORT] == endpoint
 
 
 @pytest.fixture

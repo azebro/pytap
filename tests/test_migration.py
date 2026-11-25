@@ -4,15 +4,20 @@ Validates that legacy ``voltage`` and ``current`` entity unique IDs from
 pre-v0.2.0 are removed from the entity registry when the integration loads.
 """
 
+from unittest.mock import patch
+
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryError
 from homeassistant.helpers import entity_registry as er
+import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.pytap import (
     CONFIG_ENTRY_VERSION,
     _async_cleanup_legacy_entities,
     async_migrate_entry,
+    async_setup_entry,
 )
 from custom_components.pytap.const import (
     CONF_AUTO_DISCOVERY,
@@ -398,3 +403,41 @@ async def test_future_version_is_not_downgraded(hass: HomeAssistant) -> None:
     entry = _make_entry(hass, version=CONFIG_ENTRY_VERSION + 1)
     assert not await async_migrate_entry(hass, entry)
     assert entry.version == CONFIG_ENTRY_VERSION + 1
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "translation_key"),
+    [
+        (
+            "esphome-hass://esphome/entry-one?"
+            "port_udev_id=usb-Tigo_CDC_Adapter_CDC123-if00",
+            "serial_port_name_required",
+        ),
+        (
+            "esphome-hass://esphome/entry-one?"
+            "port_udev_id=usb-Tigo_Vendor_Adapter_VEN123-if01-port0",
+            "serial_port_udev_suffix_unsupported",
+        ),
+    ],
+)
+async def test_unsupported_proxy_setup_uses_actionable_translation(
+    hass: HomeAssistant, endpoint: str, translation_key: str
+) -> None:
+    entry = _make_entry(hass, version=CONFIG_ENTRY_VERSION)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_CONNECTION_TYPE: "serial",
+            "serial_port": endpoint,
+        },
+    )
+    with (
+        patch("custom_components.pytap.connection.MAJOR_VERSION", 2026),
+        patch("custom_components.pytap.connection.MINOR_VERSION", 10),
+        pytest.raises(ConfigEntryError) as caught,
+    ):
+        await async_setup_entry(hass, entry)
+    assert caught.value.translation_domain == DOMAIN
+    assert caught.value.translation_key == translation_key
+    assert caught.value.translation_placeholders is None

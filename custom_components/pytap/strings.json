@@ -82,6 +82,8 @@
       "invalid_serial_port": "Choose a serial device under /dev (for example /dev/serial/by-id/…) or a valid Home Assistant serial-proxy URL.",
       "invalid_baud_rate": "Enter a baud rate between 1 and 4000000.",
       "invalid_connection_type": "Choose TCP or serial.",
+      "serial_port_name_required": "Home Assistant 2026.10 requires a proxy URL with a port name. Reselect the ESPHome serial port, or upgrade to Home Assistant 2026.11 or newer.",
+      "serial_port_udev_suffix_unsupported": "Home Assistant 2026.10 cannot match a proxy URL whose udev ID ends in -port followed by digits. Reselect the ESPHome serial port, or upgrade to Home Assistant 2026.11 or newer.",
       "serial_port_in_use": "Another PyTap entry already uses this serial port, or is still releasing it.",
       "connection_in_use": "A PyTap entry that is still shutting down holds this connection. Wait a moment and try again.",
       "unsupported_serial_settings": "The serial backend does not support these settings. Check the selected port and baud rate."
@@ -309,6 +311,8 @@
       "invalid_serial_port": "Choose a serial device under /dev (for example /dev/serial/by-id/…) or a valid Home Assistant serial-proxy URL.",
       "invalid_baud_rate": "Enter a baud rate between 1 and 4000000.",
       "invalid_connection_type": "Choose TCP or serial.",
+      "serial_port_name_required": "Home Assistant 2026.10 requires a proxy URL with a port name. Reselect the ESPHome serial port, or upgrade to Home Assistant 2026.11 or newer.",
+      "serial_port_udev_suffix_unsupported": "Home Assistant 2026.10 cannot match a proxy URL whose udev ID ends in -port followed by digits. Reselect the ESPHome serial port, or upgrade to Home Assistant 2026.11 or newer.",
       "serial_port_in_use": "Another PyTap entry already uses this serial port, or is still releasing it.",
       "connection_in_use": "A PyTap entry that is still shutting down holds this connection. Wait a moment and try again.",
       "unsupported_serial_settings": "The serial backend does not support these settings. Check the selected port and baud rate.",
@@ -334,6 +338,12 @@
     "invalid_connection_settings": {
       "message": "The saved {field} setting is invalid. Update it with Configure → Change connection settings; the entry then retries setup."
     },
+    "serial_port_name_required": {
+      "message": "Home Assistant 2026.10 requires the saved ESPHome proxy URL to include a port name. Reselect the serial port in Configure → Change connection settings, or upgrade to Home Assistant 2026.11 or newer."
+    },
+    "serial_port_udev_suffix_unsupported": {
+      "message": "Home Assistant 2026.10 cannot match the saved ESPHome proxy URL because its udev ID ends in -port followed by digits. Reselect the serial port in Configure → Change connection settings, or upgrade to Home Assistant 2026.11 or newer."
+    },
     "capture_entry_not_loaded": {
       "message": "Select a loaded PyTap config entry."
     },
@@ -357,6 +367,9 @@
     },
     "capture_unsafe": {
       "message": "The capture contains unexpected files or links and was not changed."
+    },
+    "capture_path_unsafe": {
+      "message": "The capture path is unsafe. After capture/export jobs finish, move recordings manually into a real pytap_captures directory beneath Home Assistant's configuration directory and replace the symlink, then retry. PyTap did not delete or migrate the data."
     },
     "listener_not_running": {
       "message": "The PyTap listener is not running."

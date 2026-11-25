@@ -429,6 +429,11 @@ async def test_installation_power_sums_all(hass: HomeAssistant) -> None:
 
 async def test_string_daily_energy_sums(hass: HomeAssistant) -> None:
     """String aggregate daily energy should sum all members of the string."""
+    today = dt_util.now().date().isoformat()
+    nodes = {
+        barcode: {**node, "daily_reset_date": today}
+        for barcode, node in MOCK_NODE_DATA_TWO.items()
+    }
     modules = [
         {
             CONF_MODULE_STRING: "A",
@@ -444,7 +449,7 @@ async def test_string_daily_energy_sums(hass: HomeAssistant) -> None:
         },
     ]
     entry = _make_mock_config_entry(hass, modules=modules)
-    coordinator = _make_mock_coordinator(hass, entry, node_data=MOCK_NODE_DATA_TWO)
+    coordinator = _make_mock_coordinator(hass, entry, node_data=nodes)
 
     entry.runtime_data = coordinator
 
@@ -497,8 +502,13 @@ async def test_string_total_energy_sums(hass: HomeAssistant) -> None:
 
 async def test_installation_daily_energy_sums_all(hass: HomeAssistant) -> None:
     """Installation daily energy should sum all configured modules."""
+    today = dt_util.now().date().isoformat()
+    nodes = {
+        barcode: {**node, "daily_reset_date": today}
+        for barcode, node in MOCK_NODE_DATA_TWO.items()
+    }
     entry = _make_mock_config_entry(hass)
-    coordinator = _make_mock_coordinator(hass, entry, node_data=MOCK_NODE_DATA_TWO)
+    coordinator = _make_mock_coordinator(hass, entry, node_data=nodes)
 
     entry.runtime_data = coordinator
 
