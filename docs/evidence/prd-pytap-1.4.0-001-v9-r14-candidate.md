@@ -1,10 +1,15 @@
 # PRD-PYTAP-1.4.0-001 v9 r14 - Integrated candidate evidence
 
 **Status: the original candidate failed the live restart gate; code-only rollback is complete.**
-The graceful-restart persistence correction and all automated validation gates
-are complete. A corrected candidate archive is frozen and verified, but it has
-not been staged or deployed. A fresh live v7 baseline, corrected deployment,
-and new valid soak remain required; this is not release-ready.
+The graceful-restart persistence correction and approved automated validation
+gates are complete. The corrected archive is frozen and staged in a new private
+run, but not deployed. A 19:19 UTC snapshot confirmed the same 26-member v7
+configuration but found no current reports and stale energy readings. The live
+Core is now 2026.11.3, and its supplemental strict smoke passed 31/31.
+A fresh energy baseline, corrected deployment and new valid soak remain
+required; rechecks through 19:25 UTC still returned the same stale readings
+and zero reporters. Supplemental strict smoke on the live Core version
+2026.11.3 passed 31/31. This is not release-ready.
 The [delivery board](../kanban.md) owns task status.
 
 The original results cover the integrated 1.4.0 candidate, not the historical
@@ -152,8 +157,25 @@ Corrected candidate source-tree SHA-256 is
 `134f197bd111c90dabba054304a59d34203644b68ea0ae990ff4c32cfd4c08a4`.
 The machine-local metadata now points to this archive and preserves the exact
 PR #39 rollback archive identity. The private control helper's defaults and
-remote candidate hash pin were updated and its 16 unit tests passed. No remote
-stage or deployment action has been run for this candidate.
+remote candidate hash pin were updated and its 16 unit tests passed. The helper
+staged this candidate and the exact-#39 rollback archive in a new private run;
+the run records source commit `06b5461`. No HA deployment action has been run.
+
+The 2026-11-25 19:19:16 UTC pre-deployment snapshot reports manifest 1.2.0,
+Core 2026.11.3 with matching configuration, and 26 configured entries. Its
+membership fingerprint matches the 17:15 rollback confirmation. However,
+`reporting_count` is zero and both energy and node data are last updated at
+16:28:22 UTC. The three group differences remain 283.60, 432.08 and 715.68 Wh,
+with zero groups within 0.1 Wh. This is a fresh snapshot, not a fresh energy
+baseline; deployment remains gated. Read-only checks at 19:22:21 and
+19:25:43 UTC returned the same latest-report timestamps, zero reporting
+entities and group differences. The stored totals were not repaired.
+
+The live host's Core version has advanced from the validated 2026.11.2 to
+2026.11.3. An isolated strict native smoke run using the 2026.11.3 official
+constraints passed 31/31 with zero skips, failures or errors in 144.979 s.
+This additional compatibility result does not change the required
+live-reporting gate.
 
 ## Candidate validation environments
 
@@ -337,10 +359,19 @@ until included in an authorized Git checkpoint.
 | Minimum parser suite | `PYTHONPATH=custom_components/pytap "$PY_MIN" -c 'import pytap, pytest; raise SystemExit(pytest.main(["custom_components/pytap/pytap/tests", "--import-mode=importlib", "-q", "--tb=short"]))'` | 73 passed, 4.03 s |
 | HA 2026.10.4 strict native smoke | `"$PY_MIN" scripts/run_core_smoke.py` | 31 passed; zero skips, failures or errors; 98.468 s |
 | HA 2026.11.2 strict native smoke | `"$PY_CURRENT" scripts/run_core_smoke.py` | 31 passed; zero skips, failures or errors; 134.812 s |
+| HA 2026.11.3 supplemental strict native smoke | `"$PY_2026_11_3" scripts/run_core_smoke.py` | 31 passed; zero skips, failures or errors; 144.979 s |
 | Ruff and whitespace | `python -m ruff check custom_components/pytap tests scripts`; `git diff --check` | Both exit 0 |
 
-The strict native runs include the graceful-stop persistence regression on
-both Cores and the exact-#39 C7 rollback-readability cases. These automated
-results validate the corrected code, not live deployment or soak acceptance.
-The final run output and helper-unit-test output remain machine-local session
-evidence; the summarized results above are the repository record.
+`PY_2026_11_3` denotes the machine-local isolated interpreter prepared with
+HA 2026.11.3's official package constraints.
+
+The strict native runs include the graceful-stop persistence regression and
+exact-#39 C7 rollback-readability cases. The supplemental Core 2026.11.3
+environment used Python 3.14.4, serialx 1.15.1, Pydantic 2.14.1 and the
+official constraints SHA-256
+`cf1de9c4cd9ff73ae2a09e8dce0c1989734eeb81ce5c4f91d022c57a5b81ada7`;
+manifest-closure, dependency and real-public-API checks passed. These
+automated results validate the corrected code, not live deployment or soak
+acceptance. The final run output, helper-unit-test output and live snapshots
+remain machine-local session evidence; the summarized results above are the
+repository record.
