@@ -131,6 +131,19 @@ def _make_mock_coordinator(hass, entry, node_data=None):
     coordinator.hass = hass
     coordinator.config_entry = entry
     coordinator.last_update_success = True
+    coordinator.modules = entry.data.get(CONF_MODULES, [])
+    coordinator.module_count = len(
+        {m.get(CONF_MODULE_BARCODE) for m in coordinator.modules if m.get(CONF_MODULE_BARCODE)}
+    )
+    coordinator.auto_discovery = False
+    coordinator.module_peak_power.side_effect = lambda barcode: next(
+        (
+            m.get(CONF_MODULE_PEAK_POWER, 455)
+            for m in coordinator.modules
+            if m.get(CONF_MODULE_BARCODE) == barcode
+        ),
+        455,
+    )
     coordinator.is_reporting.return_value = True
     coordinator.async_request_refresh = AsyncMock()
     return coordinator
@@ -150,8 +163,8 @@ async def test_sensor_entities_created(hass: HomeAssistant) -> None:
 
     await async_setup_entry(hass, entry, capture_entities)
 
-    # 2 modules × 12 + 2 strings × 4 + installation 4 = 36 entities
-    assert len(entities) == 36
+    # 2 modules × 13 + 2 strings × 4 + installation 4 = 38 entities
+    assert len(entities) == 38
 
 
 async def test_sensor_unique_ids(hass: HomeAssistant) -> None:
@@ -233,8 +246,8 @@ async def test_sensor_skips_modules_without_barcode(hass: HomeAssistant) -> None
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
-    # Only the 2 valid modules should contribute to entities: 2*12 + 2*4 + 4 = 36
-    assert len(entities) == 36
+    # Only the 2 valid modules should contribute to entities: 2*13 + 2*4 + 4 = 38
+    assert len(entities) == 38
 
 
 async def test_sensor_device_info(hass: HomeAssistant) -> None:
@@ -259,7 +272,7 @@ async def test_sensor_device_info(hass: HomeAssistant) -> None:
 
 async def test_sensor_descriptions_count() -> None:
     """Test that we have the expected number of sensor descriptions."""
-    assert len(SENSOR_DESCRIPTIONS) == 12
+    assert len(SENSOR_DESCRIPTIONS) == 13
 
 
 async def test_energy_sensor_descriptions() -> None:
@@ -295,7 +308,7 @@ async def test_daily_energy_last_reset(hass: HomeAssistant) -> None:
 
 
 async def test_aggregate_entity_count_single_string(hass: HomeAssistant) -> None:
-    """Two modules on one string produce 32 entities."""
+    """Two modules on one string produce 34 entities."""
     modules = [
         {
             CONF_MODULE_STRING: "A",
@@ -318,7 +331,7 @@ async def test_aggregate_entity_count_single_string(hass: HomeAssistant) -> None
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
-    assert len(entities) == 32
+    assert len(entities) == 34
 
 
 async def test_readings_today_sensor_metadata(hass: HomeAssistant) -> None:

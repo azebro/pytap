@@ -10,7 +10,7 @@ from pytap import Parser, Event, PowerReportEvent, InfrastructureEvent
 from pytap import PersistentState
 ```
 
-All public symbols are re-exported from `pytap.__init__`.
+All public symbols are re-exported from `pytap.__init__`. Packet capture and offline replay live in `pytap.core.capture` and `pytap.core.replay` and are not re-exported.
 
 ---
 
@@ -19,13 +19,18 @@ All public symbols are re-exported from `pytap.__init__`.
 ### `create_parser`
 
 ```python
-pytap.create_parser(persistent_state: Optional[PersistentState] = None) -> Parser
+pytap.create_parser(
+    persistent_state: PersistentState | None = None,
+    *,
+    clock: Callable[[], datetime] | None = None,
+) -> Parser
 ```
 
 Create a new protocol parser instance.
 
 **Parameters:**
 - `persistent_state` — Optional `PersistentState` object. If provided, the parser uses this for infrastructure state (gateway identities, versions, node tables). The parser mutates the state in memory; the caller owns persistence (e.g., via `to_dict()` / `from_dict()`).
+- `clock` — Optional source of "now" for event timestamps and slot-clock synchronisation, e.g. recorded observation times during offline replay. Defaults to `datetime.now()`.
 
 **Returns:** A `Parser` ready to accept bytes via `feed()`.
 
@@ -92,12 +97,16 @@ while True:
 ### `Parser`
 
 ```python
-class pytap.Parser(persistent_state: Optional[PersistentState] = None)
+class pytap.Parser(
+    persistent_state: PersistentState | None = None,
+    *,
+    clock: Callable[[], datetime] | None = None,
+)
 ```
 
 The core protocol parser. Maintains internal state for frame assembly, transport correlation, slot clock synchronization, and infrastructure tracking across incremental `feed()` calls.
 
-The parser accepts an optional `PersistentState` object which it mutates in memory as infrastructure events are detected. The caller owns persistence (serialization/deserialization).
+The parser accepts an optional `PersistentState` object which it mutates in memory as infrastructure events are detected. The caller owns persistence (serialization/deserialization). `clock` works as in `create_parser()`.
 
 #### Methods
 
@@ -176,7 +185,7 @@ All events are `dataclass` instances with a `to_dict() -> dict` method for JSON 
 @dataclass
 class Event:
     event_type: str       # Discriminator: "power_report", "infrastructure", etc.
-    timestamp: datetime   # From the slot clock (power reports), otherwise wall time
+    timestamp: datetime   # From the slot clock (power reports) or the parser clock
 ```
 
 ### `PowerReportEvent`
@@ -195,7 +204,12 @@ class PowerReportEvent(Event):
     temperature: float       # Module temperature (°C)
     dc_dc_duty_cycle: float  # DC-DC converter duty cycle (0.0–1.0)
     rssi: int                # Raw received signal strength byte (0–255)
+    high_output_mode: bool | None  # Byte 7 bit 7
+    status_code: int | None  # Byte 9 raw value
+    low_voltage_flag: bool | None  # Byte 9 bit 7
 ```
+
+The last three fields come from undocumented report bytes; their meanings are correlations from captured data, not confirmed by Tigo. `status_code` is normally `0x64`, `0x68` at low current (around dawn/dusk) and `0xE4` at low input voltage; `high_output_mode` is set almost only above ~0.5 A input current. They default to `None` when an event is constructed without them; the parser always sets them.
 
 **JSON example:**
 ```json
@@ -212,7 +226,10 @@ class PowerReportEvent(Event):
     "current_out": 8.0,
     "temperature": 45.2,
     "dc_dc_duty_cycle": 0.78,
-    "rssi": 120
+    "rssi": 120,
+    "high_output_mode": true,
+    "status_code": 100,
+    "low_voltage_flag": false
 }
 ```
 
@@ -270,8 +287,28 @@ These are available from `pytap.core.types` (and re-exported from `pytap`).
 | `PacketType` / `FrameType` | PV packet / gateway frame types | `IntEnum` |
 | `Frame` | Decoded gateway link-layer frame | dataclass |
 | `ReceivedPacketHeader` | Header of a packet inside a receive response | dataclass |
-| `PowerReport` | Raw 13-byte power report with decoded properties | dataclass |
+| `PowerReport` | Raw 13-byte power report with decoded properties (incl. `high_output_mode`, `status_code`, `low_voltage_flag`) | dataclass |
 | `GatewayInfo` | Gateway address + version | dataclass |
 | `NodeInfo` | Node address + barcode | dataclass |
 
 Barcodes (`X-NNNNNNNC`) are plain strings; see `encode_barcode`, `decode_barcode` and `barcode_from_address`.
+
+---
+
+## Capture and Replay (`pytap.core.capture`, `pytap.core.replay`)
+
+Standard library only (Python 3.11+); no Home Assistant dependency.
+
+| Symbol                                                                                                                                  | Purpose                                                                                                                                                                                                                                                          |
+| --------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CaptureWriter(root, metadata, *, duration_seconds, max_storage_bytes, segment_bytes, queue_records)`                                   | One recording session. `start()` (blocking), `record(data, connection_id, bootstrap)` (non-blocking, from the reader thread before parsing), `mark(event, connection_id, **details)`, `request_stop(reason)`, `join(timeout)`, `status(include_directory=False)` |
+| `read_manifest(directory, *, allow_incomplete=False)`                                                                                   | Validate and load `manifest.json`                                                                                                                                                                                                                                |
+| `iter_capture(directory, *, allow_incomplete=False)`                                                                                    | Verify checksums/sizes and stream `CapturedChunk(utc_ns, monotonic_ns, stream_offset, connection_id, data, declared_length)`                                                                                                                                     |
+| `export_archive(directory, *, allow_interrupted=False, max_storage_bytes=None)`                                                         | Write a private ZIP next to the session; incomplete captures include `recovery.json`                                                                                                                                                                             |
+| `list_captures(root, limit=20)`, `capture_directory(root, capture_id)`, `delete_capture(root, capture_id)`, `remove_capture_root(root)` | Session management                                                                                                                                                                                                                                               |
+| `CaptureError`                                                                                                                          | User-actionable error with `translation_key` / `translation_placeholders`                                                                                                                                                                                        |
+| `FrameScanner().feed(chunk)` / `.finish()`                                                                                              | Yield `frame` / `noise` / `incomplete` / `oversized_fragment` records; frames include `giant`, `live_parser_would_drop` and `live_parser_drop_reason`                                                                                                            |
+| `decode_wire_frame(wire)`                                                                                                               | Decode one wire frame without discarding unknown types or bad CRCs                                                                                                                                                                                               |
+| `replay_events(chunks, state=None)`                                                                                                     | Run a `Parser` with each chunk's recorded UTC time as `clock`; yields `{stream_offset, connection_id, observed_utc_ns, event}`                                                                                                                                   |
+
+`scripts/replay_capture.py` in the repository wraps these as a command-line tool.

@@ -15,6 +15,9 @@ from custom_components.pytap import (
     async_migrate_entry,
 )
 from custom_components.pytap.const import (
+    CONF_AUTO_DISCOVERY,
+    CONF_CONNECTION_TYPE,
+    CONF_EXCLUDED_BARCODES,
     CONF_LIVE_REPORTING,
     CONF_MODULE_BARCODE,
     CONF_MODULE_NAME,
@@ -22,6 +25,7 @@ from custom_components.pytap.const import (
     CONF_MODULE_STRING,
     CONF_MODULES,
     CONF_WRITE_INTERVAL,
+    CONNECTION_TCP,
     DEFAULT_LIVE_REPORTING,
     DEFAULT_PEAK_POWER,
     DEFAULT_PORT,
@@ -371,6 +375,23 @@ class TestConfigEntryMigration:
         assert result is True
         assert entry.version == CONFIG_ENTRY_VERSION
         assert entry.data[CONF_WRITE_INTERVAL] == 60
+
+
+async def test_v5_migration_preserves_connection_and_identity(hass: HomeAssistant) -> None:
+    """Only the transport discriminator is added to existing TCP entries."""
+    entry = _make_entry(hass, version=5)
+    old_data = dict(entry.data)
+    old_entry_id, old_unique_id = entry.entry_id, entry.unique_id
+    assert await async_migrate_entry(hass, entry)
+    assert entry.version == CONFIG_ENTRY_VERSION
+    assert entry.data == {
+        **old_data,
+        CONF_CONNECTION_TYPE: CONNECTION_TCP,
+        CONF_AUTO_DISCOVERY: False,
+        CONF_EXCLUDED_BARCODES: [],
+    }
+    assert entry.entry_id == old_entry_id
+    assert entry.unique_id == old_unique_id
 
 
 async def test_future_version_is_not_downgraded(hass: HomeAssistant) -> None:

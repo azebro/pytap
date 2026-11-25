@@ -36,6 +36,9 @@ class PowerReportEvent(Event):
     temperature: float
     dc_dc_duty_cycle: float
     rssi: int
+    high_output_mode: bool | None
+    status_code: int | None
+    low_voltage_flag: bool | None
 
     def __init__(
         self,
@@ -49,7 +52,10 @@ class PowerReportEvent(Event):
         temperature: float,
         dc_dc_duty_cycle: float,
         rssi: int,
-        timestamp: datetime
+        timestamp: datetime,
+        high_output_mode: bool | None = None,
+        status_code: int | None = None,
+        low_voltage_flag: bool | None = None,
     ):
         super().__init__(event_type="power_report", timestamp=timestamp)
         self.gateway_id = gateway_id
@@ -65,6 +71,9 @@ class PowerReportEvent(Event):
         self.temperature = temperature
         self.dc_dc_duty_cycle = dc_dc_duty_cycle
         self.rssi = rssi
+        self.high_output_mode = high_output_mode
+        self.status_code = status_code
+        self.low_voltage_flag = low_voltage_flag
 
 
 @dataclass
