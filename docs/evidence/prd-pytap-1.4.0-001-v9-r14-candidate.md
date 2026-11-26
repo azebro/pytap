@@ -67,10 +67,26 @@ restart was performed. Keep the failed candidate and run as evidence. Root
 cause of the live discrepancy is not yet established; do not treat the
 automated pass or rollback as resolution.
 
-Read-only recorder history identifies the trigger: five daily and three
-cumulative optimizer counters restored 0.01 Wh lower, immediately before the
-aggregate credited them as resets. Correcting persistence must preserve
-legitimate reset accounting, not hide decreases with a numerical tolerance.
+The current code trace identifies a plausible path, not a confirmed cause:
+`PyTapAggregateSensor._accumulate_energy` credits the current counter value
+when a member value is lower than its saved baseline, preserving legitimate
+counter-reset energy. That behavior can produce a positive aggregate/member
+difference when a lower restored value is stale rather than a real reset, a
+specific accepted accounting risk in the approved PRD. The captured
+pre-deployment snapshots for the Nov 26 attempt contain aggregate sums but not
+each member's pre-deployment daily and lifetime counters, so the available
+evidence cannot establish that this branch caused that live jump. The recorder
+evidence below identifies reset-credit behavior in the separate Nov 25 failure;
+it does not establish the trigger for Nov 26. Do not remove reset credit, mask
+the difference with a tolerance, or infer a correction until a focused
+multi-member restart reproduction or sanitized per-member before/after
+evidence distinguishes the Nov 26 cause within the approved scope.
+
+For the Nov 25 failure, read-only recorder history identified the trigger:
+five daily and three cumulative optimizer counters restored 0.01 Wh lower,
+immediately before the aggregate credited them as resets. Correcting
+persistence must preserve legitimate reset accounting, not hide decreases
+with a numerical tolerance.
 The original archives and failed run remain evidence, not deployment defaults
 for the corrected candidate.
 
