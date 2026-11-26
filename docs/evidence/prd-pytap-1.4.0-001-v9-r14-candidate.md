@@ -1,15 +1,12 @@
 # PRD-PYTAP-1.4.0-001 v9 r14 - Integrated candidate evidence
 
-**Status: the original candidate failed the live restart gate; code-only rollback is complete.**
-The graceful-restart persistence correction and approved automated validation
-gates are complete. The corrected archive is frozen and staged in a new private
-run, but not deployed. A 19:19 UTC snapshot confirmed the same 26-member v7
-configuration but found no current reports and stale energy readings. The live
-Core is now 2026.11.3, and its supplemental strict smoke passed 31/31.
-A fresh energy baseline, corrected deployment and new valid soak remain
-required; rechecks through 19:25 UTC still returned the same stale readings
-and zero reporters. Supplemental strict smoke on the live Core version
-2026.11.3 passed 31/31. This is not release-ready.
+**Status: the corrected candidate failed live energy-continuity checks and was code-only rolled back to exact #39.**
+The graceful-restart code correction and approved automated gates passed, and
+the candidate was deployed on 2026-11-26 after fresh daylight reports matched
+the live v7 membership. Its first settled reports exposed large persistent
+aggregate/member differences and an unexpected cumulative-total increase.
+Exact #39 was restored; HA state was not manually repaired. The production
+energy behavior remains unresolved and the feature is not release-ready.
 The [delivery board](../kanban.md) owns task status.
 
 The original results cover the integrated 1.4.0 candidate, not the historical
@@ -38,6 +35,37 @@ revalidation. Rollback completed at 17:12:32 UTC; native confirmation at
 17:15:08 UTC showed manifest 1.2.0 on the unchanged Core 2026.11.2 and v7 entry.
 Existing inflated stored totals were not repaired. That nighttime confirmation
 did not prove fresh production. No backup was made or restored.
+
+## Corrected-candidate live failure and rollback
+
+The corrected archive was staged in a new private run on 2026-11-25. Daylight
+reports returned on 2026-11-26. At 11:00:52 UTC, exact #39 reported all 26
+configured members; all three aggregate-versus-optimizer daily comparisons
+were 0 Wh, with installation daily energy 1,250.36 Wh and cumulative energy
+2,436,050.30 Wh. Membership fingerprint was
+`e42b73f2bb1d90ade3248ec9a11327b03d3728480e3d5f6135d53a5ed3c63bc1`.
+Core 2026.11.3 had matching native/config versions.
+
+The guarded deployment completed at 11:02 UTC after the helper was updated to
+require the smoke-validated Core 2026.11.3; its focused unit suite passed
+17 tests. The candidate reported manifest 1.4.0 on the same v7 membership.
+At 11:02:42 UTC all 26 members were reporting, but aggregate/member differences
+remained 254.55 Wh for string C, 228.38 Wh for string D and 482.93 Wh for the
+installation, versus the 0.1 Wh acceptance bound. Installation daily energy
+was 1,765.38 Wh, while member daily values summed to 1,282.45 Wh. Cumulative
+installation energy was 3,257,311.31 Wh, up 821,261.01 Wh from the immediate
+pre-deployment baseline. The candidate's first snapshot briefly showed 24/26
+members reporting; this recovered to 26/26, but the energy discrepancies
+persisted. Recent Core logs contained no PyTap ERROR/CRITICAL entries; this
+does not negate the measured accounting failure.
+
+The helper performed a code-only rollback. At 11:03:18 UTC, native diagnostics
+confirmed manifest 1.2.0, Core 2026.11.3, all 26 members reporting and
+unchanged membership. The 254.55/228.38/482.93 Wh differences remained in
+stored state after rollback. No backup restore, energy-state repair, or soak
+restart was performed. Keep the failed candidate and run as evidence. Root
+cause of the live discrepancy is not yet established; do not treat the
+automated pass or rollback as resolution.
 
 Read-only recorder history identifies the trigger: five daily and three
 cumulative optimizer counters restored 0.01 Wh lower, immediately before the
@@ -157,9 +185,12 @@ Corrected candidate source-tree SHA-256 is
 `134f197bd111c90dabba054304a59d34203644b68ea0ae990ff4c32cfd4c08a4`.
 The machine-local metadata now points to this archive and preserves the exact
 PR #39 rollback archive identity. The private control helper's defaults and
-remote candidate hash pin were updated and its 16 unit tests passed. The helper
-staged this candidate and the exact-#39 rollback archive in a new private run;
-the run records source commit `06b5461`. No HA deployment action has been run.
+remote candidate hash pin were updated. Its 17 focused tests passed after
+updating the exact-Core guard for the validated live Core 2026.11.3. The helper
+staged this candidate and exact-#39 rollback archive in a new private run
+recording source commit `06b5461`; it deployed the candidate on 2026-11-26,
+then performed a guarded code-only rollback after live accounting failed.
+Detailed results are in "Corrected-candidate live failure and rollback".
 
 The 2026-11-25 19:19:16 UTC pre-deployment snapshot reports manifest 1.2.0,
 Core 2026.11.3 with matching configuration, and 26 configured entries. Its
@@ -167,15 +198,18 @@ membership fingerprint matches the 17:15 rollback confirmation. However,
 `reporting_count` is zero and both energy and node data are last updated at
 16:28:22 UTC. The three group differences remain 283.60, 432.08 and 715.68 Wh,
 with zero groups within 0.1 Wh. This is a fresh snapshot, not a fresh energy
-baseline; deployment remains gated. Read-only checks at 19:22:21 and
-19:25:43 UTC returned the same latest-report timestamps, zero reporting
-entities and group differences. The stored totals were not repaired.
+baseline; deployment remained gated at that time. Read-only checks at 19:22:21
+and 19:25:43 UTC returned the same latest-report timestamps, zero reporting
+entities and group differences. Daylight reports resumed the next morning;
+the fresh baseline and subsequent candidate failure are recorded above. The
+stored totals were not repaired.
 
 The live host's Core version has advanced from the validated 2026.11.2 to
 2026.11.3. An isolated strict native smoke run using the 2026.11.3 official
 constraints passed 31/31 with zero skips, failures or errors in 144.979 s.
-This additional compatibility result does not change the required
-live-reporting gate.
+This additional compatibility result cleared the current-Core automated test
+gate. The later corrected-candidate deployment nevertheless failed live energy
+acceptance, as detailed above.
 
 ## Candidate validation environments
 
