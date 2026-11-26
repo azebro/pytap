@@ -72,15 +72,21 @@ The current code trace identifies a plausible path, not a confirmed cause:
 when a member value is lower than its saved baseline, preserving legitimate
 counter-reset energy. That behavior can produce a positive aggregate/member
 difference when a lower restored value is stale rather than a real reset, a
-specific accepted accounting risk in the approved PRD. The captured
-pre-deployment snapshots for the Nov 26 attempt contain aggregate sums but not
-each member's pre-deployment daily and lifetime counters, so the available
-evidence cannot establish that this branch caused that live jump. The recorder
-evidence below identifies reset-credit behavior in the separate Nov 25 failure;
-it does not establish the trigger for Nov 26. Do not remove reset credit, mask
-the difference with a tolerance, or infer a correction until a focused
-multi-member restart reproduction or sanitized per-member before/after
-evidence distinguishes the Nov 26 cause within the approved scope.
+specific accepted accounting risk in the approved PRD. The Nov 26 snapshots
+include all 26 per-member daily values: none is lower than its pre-deployment
+value in either the first settled or follow-up sample. At the first sample, the
+member sum had risen by 20.90 Wh while the aggregate had risen by 503.83 Wh;
+the 482.93 Wh gap was already present. At the follow-up, the member sum had
+risen by 32.09 Wh and the aggregate by 515.02 Wh, leaving the same 482.93 Wh
+gap. Thus, the settled samples do not demonstrate a member-counter decrease;
+a transient lower value before the first sample remains possible but
+unobserved. Per-member lifetime totals were not captured, so the separate
+821,261.01 Wh cumulative jump cannot be analyzed from these snapshots. The
+recorder evidence below identifies reset-credit behavior in the separate
+Nov 25 failure; it does not establish the trigger for Nov 26. Do not remove
+reset credit, mask the difference with a tolerance, or infer a correction
+until a focused multi-member restart reproduction or additional private
+per-member evidence distinguishes the Nov 26 cause within the approved scope.
 
 For the Nov 25 failure, read-only recorder history identified the trigger:
 five daily and three cumulative optimizer counters restored 0.01 Wh lower,
