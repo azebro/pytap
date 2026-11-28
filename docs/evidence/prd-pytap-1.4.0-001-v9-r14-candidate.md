@@ -74,19 +74,115 @@ counter-reset energy. That behavior can produce a positive aggregate/member
 difference when a lower restored value is stale rather than a real reset, a
 specific accepted accounting risk in the approved PRD. The Nov 26 snapshots
 include all 26 per-member daily values: none is lower than its pre-deployment
-value in either the first settled or follow-up sample. At the first sample, the
-member sum had risen by 20.90 Wh while the aggregate had risen by 503.83 Wh;
-the 482.93 Wh gap was already present. At the follow-up, the member sum had
-risen by 32.09 Wh and the aggregate by 515.02 Wh, leaving the same 482.93 Wh
-gap. Thus, the settled samples do not demonstrate a member-counter decrease;
-a transient lower value before the first sample remains possible but
-unobserved. Per-member lifetime totals were not captured, so the separate
-821,261.01 Wh cumulative jump cannot be analyzed from these snapshots. The
-recorder evidence below identifies reset-credit behavior in the separate
-Nov 25 failure; it does not establish the trigger for Nov 26. Do not remove
-reset credit, mask the difference with a tolerance, or infer a correction
-until a focused multi-member restart reproduction or additional private
-per-member evidence distinguishes the Nov 26 cause within the approved scope.
+value in either the first settled or follow-up sample. Read-only Recorder
+history fills the transition between those snapshots: at 11:01:56 UTC, ten
+member daily counters fell by a combined 0.86 Wh. Their prior values summed to
+482.93 Wh and their lower values to 482.07 Wh. At that same timestamp the
+string C aggregate moved from 654.48 to 909.94 Wh, string D from 610.27 to
+839.73 Wh, and installation from 1,264.75 to 1,749.67 Wh. The first settled
+sample at 11:02:05 already had the final 482.93 Wh member/aggregate gap. Its
+size exactly matches the sum of the ten prior member values, confirming that
+the aggregate reset-credit path explains the daily overcount.
+
+The same ten lifetime counters fell by a combined 0.81004 Wh; their previous
+Recorder values summed to 737,197.80526 Wh. The installation lifetime
+aggregate jumped from 2,436,064.70 to 3,257,295.65 Wh at 11:01:56
+(+821,230.95 Wh). A direct read-only query of the live HA Recorder on
+2026-11-27 covered all 26 optimizer lifetime entities and the three aggregate
+entities immediately before Core start (11:01:52 UTC) and at their first
+post-start update. It found ten member decreases; all 26 had a recorded pair.
+Using the existing aggregation rule (for a decrease add the post-reset
+reading; otherwise add the positive increment) gives:
+
+| Group | Members | Decreases | Aggregate increase (Wh) | Expected from member states (Wh) | Unexplained excess (Wh) |
+|---|---:|---:|---:|---:|---:|
+| String C | 13 | 5 | 428,585.51000 | 344,554.40522 | 84,031.10478 |
+| String D | 13 | 5 | 392,645.44000 | 392,645.44000 | 0 |
+| Installation | 26 | 10 | 821,230.95000 | 737,199.84522 | 84,031.10478 |
+
+The member total increased by 2.03996 Wh in this interval; ordinary
+non-decreasing readings contributed 2.85000 Wh, while decreased readings
+contributed -0.81004 Wh to the member sum. The prior-decrease-value sum
+(737,197.80526 Wh) subtracted directly from the aggregate jump produced the
+earlier 84,033.14 Wh raw remainder. Accounting for the ordinary member
+increments refines the unexplained aggregate-vs-member excess to
+84,031.10478 Wh, entirely in string C. String D now reconciles to the member
+transitions. The direct query establishes the excess is not caused by an
+unseen member lifetime entity or an omitted decrease in the queried interval;
+it does not identify which persisted aggregate baseline or other state caused
+the string C excess.
+
+The follow-up grouped query on the same Recorder window returned C member
+sums of 1,042,699.09526 → 1,042,700.03522 Wh, against a string C aggregate
+change from 1,210,794.75 → 1,639,380.26 Wh; D member sums were
+1,056,180.79 → 1,056,181.89 Wh, against a string D aggregate change from
+1,225,269.95 → 1,617,915.39 Wh. The `c1` lifetime row was 84.11526 Wh at
+11:01:36 and 84.11522 Wh at 11:01:56 UTC, so that member did not make an
+84,031 Wh jump. These are Recorder states, not the missing persisted
+aggregate baseline map or the original power-report payloads.
+
+**Correction (2026-11-27 19:33 UTC): the string C excess was a unit error in
+this analysis.** A read-only Recorder attribute query shows
+`sensor.tigo_ts4_c1_total_energy` is recorded in **kWh** (a display-unit
+override), while every other member and all aggregates are in Wh. `c1` was
+therefore 84,115.26 → 84,115.22 Wh, a 0.04 Wh decrease. The "unexplained"
+84,031.10478 Wh equals exactly 999 × 84.11522. With `c1` in Wh, string C's
+expected aggregate increase is 428,585.51000 Wh, matching the observed
+increase exactly; the installation also reconciles exactly. **The whole
+Nov 26 daily and lifetime divergence is explained by one mechanism:** ten
+members' lifetime counters restored 0.04–0.16 Wh below their last published
+values at the #39→candidate restart, and the aggregate's reset rule credited each one's
+entire post-decrease value as new energy. The same mechanism explains the
+Nov 25 failure. The historical baseline map is no longer needed for
+attribution. The tables above that list an unexplained excess are superseded
+by this correction.
+
+Per-member Recorder pairs for that transition (last state before 11:01:52 UTC, first state at or after it; read-only query 2026-11-27, unformatted states converted to Wh). These values are the r15 criterion 5a fixture. Replaying the current rule (`v < b` credits `v`) on them reproduces every observed aggregate jump exactly: string C daily +255.46 Wh and lifetime +428,585.51 Wh; string D daily +229.46 Wh and lifetime +392,645.44 Wh. The r15 rule would credit C +1.39/+1.38 Wh and D +1.46/+1.47 Wh (daily/lifetime) instead. The largest dip is 0.16 Wh.
+
+| Member | Daily before (Wh) | Daily after (Wh) | Lifetime before (Wh) | Lifetime after (Wh) |
+|---|---:|---:|---:|---:|
+| c1 (Recorder kWh ×1000) | 48.82 | 48.78 | 84115.26 | 84115.22 |
+| c2 | 53.94 | 54.16 | 94330.9 | 94331.11 |
+| c3 | 54.07 | 54.33 | 93382.21 | 93382.47 |
+| c4 | 54.7 | 54.9 | 90021.26 | 90021.46 |
+| c5 | 48.42 | 48.42 | 83342.74 | 83342.74 |
+| c6 | 47.59 | 47.76 | 85798.26 | 85798.43 |
+| c7 | 56.0 | 55.89 | 95523.24 | 95523.13 |
+| c8 | 53.01 | 53.21 | 90508.67 | 90508.87 |
+| c9 | 52.94 | 53.14 | 89915.78 | 89915.98 |
+| c10 | 53.91 | 53.75 | 88957.5 | 88957.34 |
+| c11 | 48.33 | 48.24 | 83135.2 | 83135.11 |
+| c12 | 35.26 | 35.4 | 70845.81 | 70845.95 |
+| c13 | 47.49 | 47.41 | 76853.41 | 76853.33 |
+| d1 | 47.93 | 48.11 | 83412.79 | 83412.97 |
+| d2 | 36.47 | 36.43 | 76564.82 | 76564.78 |
+| d3 | 47.78 | 48.0 | 84916.17 | 84916.39 |
+| d4 | 49.27 | 49.19 | 83167.46 | 83167.38 |
+| d5 | 46.95 | 47.13 | 76384.98 | 76385.16 |
+| d6 | 48.86 | 49.03 | 86247.5 | 86247.68 |
+| d7 | 47.5 | 47.67 | 84606.72 | 84606.89 |
+| d8 | 38.19 | 38.34 | 78807.27 | 78807.42 |
+| d9 | 39.04 | 38.96 | 78530.9 | 78530.83 |
+| d10 | 47.59 | 47.77 | 76350.17 | 76350.35 |
+| d11 | 47.24 | 47.16 | 68358.76 | 68358.68 |
+| d12 | 56.36 | 56.26 | 86022.4 | 86022.3 |
+| d13 | 57.09 | 57.3 | 92810.85 | 92811.06 |
+
+The Recorder does not retain the aggregate's `extra_restore_state_data`
+baseline map as historical state attributes. The current `.storage` restore
+file reflects later state and no pre-restart baseline snapshot was retained
+in the reviewed evidence. A search of the retained session evidence found no
+`extra_restore_state_data`, `core.restore_state`, or `baselines` payload. The
+Nov 26 cutover record contains aggregate totals/groups and member readings,
+but not the aggregate's persisted per-member baseline map. The history
+confirms the reset-credit path explains
+the daily overcount and most lifetime accounting, but does not prove why the
+string C aggregate credited a further 84,031.10478 Wh. A cross-version
+reproduction with the exact pre-restart aggregate baselines is still needed.
+A synthetic two-member unload/final-save case passes before a native Core
+restart on HA 2026.10.4 and 2026.11.3, but does not reproduce the exact
+#39-to-candidate transition. Do not remove reset credit, mask the difference
+with a tolerance, or repair live statistics.
 
 For the Nov 25 failure, read-only recorder history identified the trigger:
 five daily and three cumulative optimizer counters restored 0.01 Wh lower,
@@ -431,3 +527,67 @@ automated results validate the corrected code, not live deployment or soak
 acceptance. The final run output, helper-unit-test output and live snapshots
 remain machine-local session evidence; the summarized results above are the
 repository record.
+
+## Follow-up two-member unload/restart validation
+
+The focused `test_unload_flushes_pending_multi_member_energy_before_reload`
+case passed on HA 2026.10.4 (1 test, 4.62 s). The native
+`CoreSmoke.test_unload_flushes_multi_member_energy_before_native_restart`
+case unloads a two-member entry with pending energy, waits for the listener
+worker and final save, stops Core, then starts a fresh native Core instance and
+checks restored member totals and aggregate values/baselines.
+
+| Gate | Result |
+|---|---|
+| HA 2026.10.4 strict native smoke, including the new case | 32 tests passed, 129.900 s |
+| HA 2026.11.3 strict native smoke, including the new case | 32 tests passed, 178.985 s |
+| Exact PR #39 unload/restart case on HA 2026.11.3 | 1 test passed, 2.715 s |
+| Ruff: `ruff check custom_components/pytap tests scripts` | Passed |
+| `git diff --check` | Passed |
+
+For the PR #39 check, the two-member test was copied into a detached temporary
+worktree at exact commit `a80698fca67bef4847a3c6ce5217f163fee94c01`; the
+integration source remained exact #39. Explicit config-entry unload joined
+the listener and completed the pending save before native Core stop; a fresh
+HA instance then reloaded the stored state and verified member totals plus
+aggregate values and baselines. Both startup phases used #39, so this is not
+cross-version #39-to-candidate evidence.
+
+This proves the synthetic candidate-to-candidate unload/final-save path, not
+the exact #39-to-candidate transition or live-v7 recovery. The 2026.11.2
+31-test smoke result predates this new case and was not rerun because the
+available legacy environment resolves to HA 2026.2.2. A later read-only live
+Recorder query found the 84,031.10478 Wh lifetime excess is confined to
+string C; the missing pre-restart aggregate baseline map still prevents root
+cause confirmation. No production code, live HA state, or energy statistics
+changed. The exact-#39 test supports explicit unload as a safe-save mechanism
+on that release, but does not establish a safe cross-version upgrade or clear
+the lifetime-accounting blocker. Task 02 stays in progress, live validation
+remains blocked, and no redeployment, soak, or release is authorized.
+
+## Bounded offline upgrade investigation status — 2026-11-27
+
+The user authorized one offline investigation cycle. The already-connected
+dev validation terminal supplied read-only Recorder state pairs for all 26
+member lifetime entities and the three aggregates; the grouped totals and the
+`c1` observation above are now recorded. The historical aggregate baseline map
+and original power-report payloads remain unavailable, so any replay from
+these state pairs must be labeled reconstructed and cannot establish the
+historical root cause.
+
+The local Python launcher did not recognize `-3.14`; the existing
+`.venv-ha-2026.10.4` interpreter was used to create a disposable environment.
+The configured package mirror does not list HA 2026.11.3. Official PyPI
+confirms that release, but direct wheel retrieval failed with a TLS handshake
+error. HA 2026.11.3 was installed from the official Core source archive using
+the verified official constraints (SHA-256
+`cf1de9c4cd9ff73ae2a09e8dce0c1989734eeb81ce5c4f91d022c57a5b81ada7`), and
+`pip check` reported no broken requirements. The approved manifest-dependency
+preparation then stopped because the configured mirror returned HTTP 404 for
+`aioesphomeapi==46.25.0`; therefore the isolated test dependency closure is
+incomplete and no paired experiment or test ran. Do not bypass TLS verification,
+try an alternate package source, or substitute another Core version within
+this bounded cycle; park the release pending a new decision.
+
+No production code, live HA state, energy statistics, PR, or release state
+changed.

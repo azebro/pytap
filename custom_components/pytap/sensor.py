@@ -648,8 +648,13 @@ class PyTapAggregateSensor(
 
     Live values sum current member readings. Energy totals accumulate each
     member's production since its saved baseline; new members start at their
-    first reading, while a nonnegative counter decrease contributes the
-    post-reset value.
+    first reading. A decrease below 50% of its baseline is treated as a reset
+    and contributes the post-reset value; a smaller decrease holds the old
+    baseline, so recovery below it is not counted and the first reading above
+    it contributes only the excess. Held baselines survive restores. Risks:
+    a small genuine reset can be held, while a large restore loss or a skew
+    near a tiny baseline can be treated as a reset and overcount; exact #39
+    rollback from a held baseline can re-credit at most the held gap.
     """
 
     _attr_has_entity_name = True
@@ -850,18 +855,23 @@ class PyTapAggregateSensor(
         if self._energy_total is None:
             # First ever value: start from the members' current totals.
             self._energy_total = sum(values.values()) if values else None
+            if self._energy_total is not None:
+                self._baselines.update(values)
         else:
             for barcode, value in values.items():
                 previous = self._baselines.get(barcode)
                 if previous is None:
+                    self._baselines[barcode] = value
                     continue
-                if value < previous:
-                    self._energy_total += value
-                else:
+                if value >= previous:
                     self._energy_total += value - previous
-        if self._energy_total is not None:
-            self._baselines.update(values)
-        elif not self._is_daily:
+                    self._baselines[barcode] = value
+                elif value >= 0.5 * previous:
+                    continue
+                else:
+                    self._energy_total += value
+                    self._baselines[barcode] = value
+        if self._energy_total is None and not self._is_daily:
             self._baselines = {}
 
     def _members(self) -> list[str]:

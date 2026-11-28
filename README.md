@@ -102,19 +102,25 @@ When automatic discovery is enabled, the installation device also has a
 diagnostic **Module discovery** sensor (see [Step 2](#step-2-add-modules)).
 
 String and installation energy totals add up each member panel's production
-since it was last seen. A counter reset credits its new nonnegative value once;
-new or re-added members establish a baseline without adding their existing
-energy. Temporarily missing members retain their baseline; removed members do
-not. The daily aggregate resets at HA-local midnight and ignores prior-day
-readings, including after restore.
+since its saved baseline. For a tracked baseline `b` and nonnegative reading
+`v`, `v >= b` credits `v - b` and advances the baseline. When
+`0.5 * b <= v < b`, PyTap treats the decrease as restore skew: it credits
+nothing and persists `b` as a held baseline until a later reading exceeds it,
+then credits only the excess. A reading below half the baseline is treated as a
+genuine reset and credits `v` once. New or re-added members establish a
+baseline without adding existing energy; missing members retain theirs and
+removed members are pruned. Daily aggregates clear held baselines at HA-local
+midnight and ignore prior-day readings, including after restore.
 
-Member counters and aggregate baselines are saved separately. After an abrupt
-stop, an older restored member counter can look like a reset and overcount by
-as much as that restored value (potentially its lifetime total for total energy,
-or its current-day total for daily energy). Use graceful restarts to reduce this
-accepted persistence-skew risk. Graceful shutdown uses a bounded listener join
-before flushing final counters; a timed-out stop is not a completed save.
-This does not make the two stores atomic or repair previously affected totals.
+The fixed 50% rule has bounded residual risks. While a baseline is held, the
+member's lost counter skew is not credited until it recovers. Near a tiny
+baseline, skew can be classified as a reset and overcount by the lower reading;
+a loss of more than half is likewise credited as a reset. A genuine reset that
+leaves at least half the old value is instead held. A code-only rollback to
+exact PR #39 from a held baseline can re-credit at most the held gap; it never
+credits the member's full value. The coordinator counters and aggregate
+baselines remain separate stores; graceful shutdown reduces skew but is not
+an atomic save and does not repair previously affected totals.
 
 ---
 

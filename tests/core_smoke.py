@@ -21,7 +21,6 @@ import socket
 import subprocess
 import sys
 import tarfile
-from tempfile import TemporaryDirectory
 import threading
 from types import MappingProxyType
 import unittest
@@ -54,6 +53,7 @@ from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import restore_state
+from homeassistant.helpers.restore_state import RestoreStateData
 from homeassistant.helpers.selector import SerialPortSelector
 from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
@@ -532,7 +532,7 @@ def capture_aggregates(hass, entities):
 
 
 def expected_candidate_extras(current_scenario, day):
-    if current_scenario == "current":
+    if current_scenario in ("current", "held"):
         daily, total = 0.5, 0.5
         baselines = {module_a: 0.5}
     elif current_scenario == "removed":
@@ -579,6 +579,9 @@ def expected_restored_extras(current_scenario, day):
     if current_scenario == "removed":
         for key in expected:
             expected[key]["baselines"].pop(module_b)
+    elif current_scenario == "held":
+        for key in expected:
+            expected[key]["baselines"][module_a] = 0.4
     return expected
 
 
@@ -631,7 +634,7 @@ async def candidate_write():
     scenario_modules = [
         dict(module)
         for module in modules
-        if scenario != "current" or module["barcode"] == module_a
+        if scenario not in ("current", "held") or module["barcode"] == module_a
     ]
     entry = ConfigEntry(
         domain="pytap",
@@ -679,12 +682,31 @@ async def candidate_write():
             await feed(coordinator, clock, module_a, local_at(previous_day, 23, 59, 45))
             await feed(coordinator, clock, module_b, local_at(save_day, 0, 0, 0))
             await feed(coordinator, clock, module_b, local_at(save_day, 0, 0, 30))
-        elif scenario in ("current", "removed"):
-            active = [module_a] if scenario == "current" else [module_a, module_b]
+        elif scenario in ("current", "removed", "held"):
+            active = (
+                [module_a]
+                if scenario in ("current", "held")
+                else [module_a, module_b]
+            )
             for barcode in active:
                 await feed(coordinator, clock, barcode, local_at(save_day, 0, 0, 0))
             for barcode in active:
                 await feed(coordinator, clock, barcode, local_at(save_day, 0, 0, 30))
+            if scenario == "held":
+                accumulator = coordinator._energy_state[module_a]
+                accumulator.daily_energy_wh = 0.4
+                accumulator.total_energy_wh = 0.4
+                with coordinator._state_lock:
+                    node = coordinator._state["nodes"][module_a]
+                    coordinator._state["nodes"][module_a] = {
+                        **node,
+                        "daily_energy_wh": 0.4,
+                        "total_energy_wh": 0.4,
+                    }
+                    coordinator._mark_changed(module_a)
+                coordinator._ha_update_pending = True
+                coordinator._push_live_update(SimpleNamespace(counters={}))
+                await hass.async_block_till_done()
         else:
             raise AssertionError(scenario)
 
@@ -715,7 +737,14 @@ async def candidate_write():
             assert registrations
         if scenario != "stale":
             assert not registrations
+        if scenario == "held":
+            assert nodes[module_a]["daily_energy_wh"] == 0.4
+            assert nodes[module_a]["total_energy_wh"] == 0.4
+            for key in ("daily_energy", "total_energy"):
+                assert aggregates[key]["extra"]["native_value"] == 0.5
+                assert aggregates[key]["extra"]["baselines"] == {module_a: 0.5}
         await RestoreStateData.async_save_persistent_states(hass)
+        await coordinator._async_save_coordinator_state()
         await coordinator.async_stop_listener()
         await hass.async_stop(force=True)
 
@@ -823,9 +852,12 @@ async def baseline_read():
                 parsed_expected["total_energy"]["native_value"] + 1.0,
                 parsed_expected["total_energy"]["native_value"] + 2.0,
             )
+        transitions = []
         for instant, wanted_daily, wanted_total in zip(
             post_times, expected_daily, expected_total, strict=True
         ):
+            before_daily = entities["daily_energy"].native_value
+            before_total = entities["total_energy"].native_value
             await feed(coordinator, clock, module_a, instant)
             daily = entities["daily_energy"]
             total = entities["total_energy"]
@@ -835,6 +867,14 @@ async def baseline_read():
             assert float(hass.states.get(total.entity_id).state) == wanted_total
             assert float(hass.states.get(total.entity_id).state) == total.native_value
             assert total.extra_restore_state_data.as_dict()["native_value"] == wanted_total
+            transitions.append(
+                {
+                    "daily_increment": daily.native_value - before_daily,
+                    "total_increment": total.native_value - before_total,
+                    "member_daily": coordinator.data["nodes"][module_a]["daily_energy_wh"],
+                    "member_total": coordinator.data["nodes"][module_a]["total_energy_wh"],
+                }
+            )
         parsed_after = {
             key: entity.extra_restore_state_data.as_dict()
             for key, entity in entities.items()
@@ -852,6 +892,7 @@ async def baseline_read():
         "restore_utc_clock": restore_utc_clock,
         "aggregates_before": parsed_before,
         "aggregates_after": parsed_after,
+        "transitions": transitions,
         "paths": origins,
     }
 
@@ -958,8 +999,8 @@ def _run_c7_worker(
         raise AssertionError(f"C7 {scenario} {phase} did not emit one JSON report: {result.stdout}")
     report = json.loads(reports[0])
     working_directory = Path(report["working_directory"]).resolve()
-    if working_directory != work.resolve() or working_directory.is_relative_to(REPOSITORY.resolve()):
-        raise AssertionError(f"C7 {phase} must run in its isolated directory outside the repository")
+    if working_directory != work.resolve() or not working_directory.is_relative_to(config_dir):
+        raise AssertionError(f"C7 {phase} must run in its isolated config directory")
     return report
 
 
@@ -1234,6 +1275,370 @@ class CoreSmoke(unittest.IsolatedAsyncioTestCase):
                 self.assertAlmostEqual(
                     entity.extra_restore_state_data.as_dict()["native_value"], 0.02
                 )
+        finally:
+            try:
+                await restarted.async_stop(force=True)
+            finally:
+                dt_util.set_default_time_zone(prior_tz)
+
+    async def test_unload_flushes_multi_member_energy_before_native_restart(self):
+        second_module = {
+            **MODULE,
+            "string": "B",
+            "name": "Panel 2",
+            "barcode": "B-2345678D",
+        }
+        barcodes = (MODULE["barcode"], second_module["barcode"])
+        entered = asyncio.Event()
+        worker_stopped = threading.Event()
+        time_zone = zoneinfo.ZoneInfo("Pacific/Auckland")
+        first_at = datetime(2035, 6, 15, 12, 0, tzinfo=time_zone)
+        prior_at = first_at + timedelta(seconds=30)
+        latest_at = prior_at + timedelta(seconds=30)
+        clock = first_at
+        prior_tz = dt_util.DEFAULT_TIME_ZONE
+
+        def now(time_zone=None):
+            return clock.astimezone(time_zone) if time_zone is not None else clock
+
+        def utcnow():
+            return clock.astimezone(UTC)
+
+        def report(barcode, node_id, at):
+            return PowerReportEvent(
+                gateway_id=1,
+                node_id=node_id,
+                barcode=barcode,
+                voltage_in=30.0,
+                voltage_out=30.0,
+                current_in=0.04,
+                temperature=20.0,
+                dc_dc_duty_cycle=0.5,
+                rssi=100,
+                timestamp=at,
+                high_output_mode=True,
+                status_code=0x64,
+                low_voltage_flag=False,
+            )
+
+        def worker(coordinator):
+            coordinator.hass.loop.call_soon_threadsafe(entered.set)
+            if coordinator._stop_event.wait(5):
+                worker_stopped.set()
+
+        self.hass.config.components.add("usb")
+        restore_state.async_get(self.hass).async_setup_dump()
+        entry = self.entry(
+            version=7,
+            unique_id="unload-multi-member-persistence",
+            data={
+                "connection_type": "tcp",
+                "host": "127.0.0.1",
+                "port": self._available_port(),
+                "modules": [MODULE, second_module],
+                "live_reporting": True,
+            },
+        )
+        try:
+            await self.hass.config.async_update(time_zone="Pacific/Auckland")
+            with (
+                patch("custom_components.pytap.coordinator.dt_util.now", side_effect=now),
+                patch("custom_components.pytap.coordinator.dt_util.utcnow", side_effect=utcnow),
+                patch.object(PyTapDataUpdateCoordinator, "_listen", new=worker),
+            ):
+                await self.hass.config_entries.async_add(entry)
+                self.assertIs(entry.state, ConfigEntryState.LOADED)
+                async with asyncio.timeout(1):
+                    await entered.wait()
+                coordinator = entry.runtime_data
+                member_ids = tuple(enumerate(barcodes, start=1))
+                for node_id, barcode in member_ids:
+                    self.assertTrue(coordinator._process_event(report(barcode, node_id, first_at)))
+                clock = prior_at
+                for node_id, barcode in member_ids:
+                    self.assertTrue(coordinator._process_event(report(barcode, node_id, prior_at)))
+                coordinator._ha_update_pending = True
+                coordinator._push_live_update(MagicMock(counters={}))
+                await self.hass.async_block_till_done()
+                clock = latest_at
+                for node_id, barcode in member_ids:
+                    self.assertTrue(coordinator._process_event(report(barcode, node_id, latest_at)))
+                coordinator._ha_update_pending = True
+                coordinator._push_live_update(MagicMock(counters={}))
+                await self.hass.async_block_till_done()
+
+                for barcode in barcodes:
+                    self.assertAlmostEqual(
+                        coordinator._energy_state[barcode].daily_energy_wh, 0.02
+                    )
+                    self.assertAlmostEqual(
+                        coordinator._energy_state[barcode].total_energy_wh, 0.02
+                    )
+
+                coordinator._cancel_scheduled_save()
+                self.assertTrue(coordinator._unsaved_changes)
+                self.assertTrue(
+                    await self.hass.config_entries.async_unload(entry.entry_id)
+                )
+                self.assertTrue(worker_stopped.is_set())
+                self.assertFalse(coordinator._unsaved_changes)
+        finally:
+            dt_util.set_default_time_zone(prior_tz)
+
+        config_dir = self.hass.config.config_dir
+        await self.hass.async_stop(force=True)
+        restarted = HomeAssistant(config_dir)
+        restarted.config.skip_pip = True
+        loader.async_setup(restarted)
+        restarted.config_entries = ConfigEntries(restarted, {})
+        try:
+            self.assertTrue(await bootstrap.async_load_base_functionality(restarted))
+            if not hasattr(restarted, "auth"):
+                await async_process_ha_core_config(restarted, {})
+            dr.async_get(restarted)
+            er.async_get(restarted)
+            restarted.config.components.add("usb")
+            restored_entry = restarted.config_entries.async_get_entry(entry.entry_id)
+            self.assertIsNotNone(restored_entry)
+            with (
+                patch(
+                    "custom_components.pytap.coordinator.dt_util.now",
+                    return_value=latest_at,
+                ),
+                patch(
+                    "custom_components.pytap.coordinator.dt_util.utcnow",
+                    return_value=latest_at.astimezone(UTC),
+                ),
+                patch.object(
+                    PyTapDataUpdateCoordinator,
+                    "_listen",
+                    return_value=None,
+                ),
+            ):
+                self.assertTrue(
+                    await restarted.config_entries.async_setup(restored_entry.entry_id)
+                )
+                await restarted.async_block_till_done()
+
+            restored_nodes = restored_entry.runtime_data.data["nodes"]
+            for barcode in barcodes:
+                self.assertAlmostEqual(restored_nodes[barcode]["daily_energy_wh"], 0.02)
+                self.assertAlmostEqual(restored_nodes[barcode]["total_energy_wh"], 0.02)
+
+            registry = er.async_get(restarted)
+            component = restarted.data["sensor"]
+            expected_baselines = {barcode: 0.02 for barcode in barcodes}
+            for kind in ("daily_energy", "total_energy"):
+                unique_id = (
+                    f"pytap_{restored_entry.entry_id}_installation_{kind}"
+                )
+                entity_id = registry.async_get_entity_id("sensor", "pytap", unique_id)
+                self.assertIsNotNone(entity_id)
+                entity = component.get_entity(entity_id)
+                saved_state = await entity.async_get_last_state()
+                saved_extra = await entity.async_get_last_extra_data()
+                self.assertIsNotNone(saved_state)
+                self.assertIsNotNone(saved_extra)
+                self.assertAlmostEqual(float(saved_state.state), 0.04)
+                saved_data = saved_extra.as_dict()
+                self.assertAlmostEqual(saved_data["native_value"], 0.04)
+                self.assertEqual(saved_data["baselines"], expected_baselines)
+                self.assertAlmostEqual(entity.native_value, 0.04)
+                self.assertAlmostEqual(
+                    float(restarted.states.get(entity_id).state), 0.04
+                )
+                self.assertEqual(
+                    entity.extra_restore_state_data.as_dict()["baselines"],
+                    expected_baselines,
+                )
+        finally:
+            try:
+                await restarted.async_stop(force=True)
+            finally:
+                dt_util.set_default_time_zone(prior_tz)
+
+    async def test_native_restart_preserves_skew_hold_until_recovery(self):
+        barcode = MODULE["barcode"]
+        time_zone = zoneinfo.ZoneInfo("Pacific/Auckland")
+        first_at = datetime(2035, 6, 15, 12, 0, tzinfo=time_zone)
+        prior_at = first_at + timedelta(seconds=30)
+        recovery_at = prior_at + timedelta(minutes=1)
+        clock = first_at
+        prior_tz = dt_util.DEFAULT_TIME_ZONE
+
+        def now(time_zone=None):
+            return clock.astimezone(time_zone) if time_zone is not None else clock
+
+        def utcnow():
+            return clock.astimezone(UTC)
+
+        def report(at):
+            return PowerReportEvent(
+                gateway_id=1,
+                node_id=1,
+                barcode=barcode,
+                voltage_in=30.0,
+                voltage_out=30.0,
+                current_in=0.04,
+                temperature=20.0,
+                dc_dc_duty_cycle=0.5,
+                rssi=100,
+                timestamp=at,
+                high_output_mode=True,
+                status_code=0x64,
+                low_voltage_flag=False,
+            )
+
+        self.hass.config.components.add("usb")
+        restore_state.async_get(self.hass).async_setup_dump()
+        entry = self.entry(
+            version=7,
+            unique_id="native-skew-hold-restart",
+            data={
+                "connection_type": "tcp",
+                "host": "127.0.0.1",
+                "port": self._available_port(),
+                "modules": [MODULE],
+                "live_reporting": True,
+            },
+        )
+        try:
+            await self.hass.config.async_update(time_zone="Pacific/Auckland")
+            with (
+                patch("custom_components.pytap.coordinator.dt_util.now", side_effect=now),
+                patch(
+                    "custom_components.pytap.coordinator.dt_util.utcnow",
+                    side_effect=utcnow,
+                ),
+                patch.object(
+                    PyTapDataUpdateCoordinator,
+                    "_listen",
+                    return_value=None,
+                ),
+            ):
+                await self.hass.config_entries.async_add(entry)
+                self.assertIs(entry.state, ConfigEntryState.LOADED)
+                coordinator = entry.runtime_data
+                self.assertTrue(coordinator._process_event(report(first_at)))
+                clock = prior_at
+                self.assertTrue(coordinator._process_event(report(prior_at)))
+                coordinator._ha_update_pending = True
+                coordinator._push_live_update(MagicMock(counters={}))
+                await self.hass.async_block_till_done()
+
+                registry = er.async_get(self.hass)
+                component = self.hass.data["sensor"]
+                entities = {}
+                for key in ("daily_energy", "total_energy"):
+                    unique_id = (
+                        f"pytap_{entry.entry_id}_installation_{key}"
+                    )
+                    entity_id = registry.async_get_entity_id(
+                        "sensor", "pytap", unique_id
+                    )
+                    self.assertIsNotNone(entity_id)
+                    entities[key] = component.get_entity(entity_id)
+                    self.assertAlmostEqual(entities[key].native_value, 0.01)
+
+                accumulator = coordinator._energy_state[barcode]
+
+                def set_member(value):
+                    accumulator.daily_energy_wh = value
+                    accumulator.total_energy_wh = value
+                    with coordinator._state_lock:
+                        node = coordinator._state["nodes"][barcode]
+                        coordinator._state["nodes"][barcode] = {
+                            **node,
+                            "daily_energy_wh": value,
+                            "total_energy_wh": value,
+                        }
+                        coordinator._mark_changed(barcode)
+                    coordinator._ha_update_pending = True
+                    coordinator._push_live_update(MagicMock(counters={}))
+
+                set_member(0.10)
+                await self.hass.async_block_till_done()
+                set_member(0.07)
+                await self.hass.async_block_till_done()
+                for entity in entities.values():
+                    self.assertAlmostEqual(entity.native_value, 0.10)
+                    self.assertEqual(entity._baselines, {barcode: 0.10})
+
+                await RestoreStateData.async_save_persistent_states(self.hass)
+                await coordinator._async_save_coordinator_state()
+                await self.hass.async_stop(force=True)
+        finally:
+            dt_util.set_default_time_zone(prior_tz)
+
+        restarted = HomeAssistant(self.hass.config.config_dir)
+        restarted.config.skip_pip = True
+        loader.async_setup(restarted)
+        restarted.config_entries = ConfigEntries(restarted, {})
+        try:
+            self.assertTrue(await bootstrap.async_load_base_functionality(restarted))
+            if not hasattr(restarted, "auth"):
+                await async_process_ha_core_config(restarted, {})
+            dr.async_get(restarted)
+            er.async_get(restarted)
+            restarted.config.components.add("usb")
+            restored_entry = restarted.config_entries.async_get_entry(entry.entry_id)
+            self.assertIsNotNone(restored_entry)
+            clock = recovery_at
+            with (
+                patch("custom_components.pytap.coordinator.dt_util.now", side_effect=now),
+                patch(
+                    "custom_components.pytap.coordinator.dt_util.utcnow",
+                    side_effect=utcnow,
+                ),
+                patch.object(
+                    PyTapDataUpdateCoordinator,
+                    "_listen",
+                    return_value=None,
+                ),
+            ):
+                self.assertTrue(
+                    await restarted.config_entries.async_setup(restored_entry.entry_id)
+                )
+                await restarted.async_block_till_done()
+                coordinator = restored_entry.runtime_data
+                registry = er.async_get(restarted)
+                component = restarted.data["sensor"]
+                entities = {}
+                for key in ("daily_energy", "total_energy"):
+                    unique_id = (
+                        f"pytap_{restored_entry.entry_id}_installation_{key}"
+                    )
+                    entity_id = registry.async_get_entity_id(
+                        "sensor", "pytap", unique_id
+                    )
+                    self.assertIsNotNone(entity_id)
+                    entity = component.get_entity(entity_id)
+                    entities[key] = entity
+                    self.assertAlmostEqual(entity.native_value, 0.10)
+                    self.assertEqual(entity._baselines, {barcode: 0.10})
+                restored_node = coordinator.data["nodes"][barcode]
+                self.assertAlmostEqual(restored_node["daily_energy_wh"], 0.07)
+                self.assertAlmostEqual(restored_node["total_energy_wh"], 0.07)
+
+                # 1.2 W for 60 s adds 0.02 Wh: 0.09 is still below the held baseline.
+                self.assertTrue(coordinator._process_event(report(recovery_at)))
+                coordinator._ha_update_pending = True
+                coordinator._push_live_update(MagicMock(counters={}))
+                await restarted.async_block_till_done()
+                for entity in entities.values():
+                    self.assertAlmostEqual(entity.native_value, 0.10, places=2)
+                    self.assertEqual(entity._baselines, {barcode: 0.10})
+
+                clock = recovery_at + timedelta(minutes=1)
+                self.assertTrue(coordinator._process_event(report(clock)))
+                coordinator._ha_update_pending = True
+                coordinator._push_live_update(MagicMock(counters={}))
+                await restarted.async_block_till_done()
+                for entity in entities.values():
+                    self.assertAlmostEqual(entity.native_value, 0.11, places=2)
+                    self.assertAlmostEqual(
+                        entity._baselines[barcode], 0.11, places=2
+                    )
         finally:
             try:
                 await restarted.async_stop(force=True)
@@ -2517,13 +2922,13 @@ class CoreSmoke(unittest.IsolatedAsyncioTestCase):
         prescribed_clock = prescribed.isoformat()
         prescribed_utc_clock = prescribed.astimezone(UTC).isoformat()
         self.assertNotEqual(prescribed.date(), prescribed.astimezone(UTC).date())
-        for scenario in ("current", "removed", "stale"):
-            with (
-                self.subTest(scenario=scenario),
-                TemporaryDirectory(prefix=f"pytap-c7-{scenario}-") as directory,
-            ):
-                config_dir = Path(directory)
-                self.assertFalse(config_dir.resolve().is_relative_to(REPOSITORY.resolve()))
+        RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
+        for scenario in ("current", "removed", "stale", "held"):
+            with self.subTest(scenario=scenario):
+                config_dir = RUNTIME_ROOT / f"c7-{scenario}-{self._instance_counter}"
+                shutil.rmtree(config_dir, ignore_errors=True)
+                config_dir.mkdir(parents=True)
+                self.assertTrue(config_dir.resolve().is_relative_to(REPOSITORY.resolve()))
                 target = config_dir / "custom_components" / "pytap"
                 shutil.copytree(
                     REPOSITORY / "custom_components" / "pytap",
@@ -2599,6 +3004,46 @@ class CoreSmoke(unittest.IsolatedAsyncioTestCase):
                         daily["native_value"],
                         candidate["aggregates"]["daily_energy"]["extra"]["native_value"],
                     )
+                if scenario == "held":
+                    module_a = "A-1234567B"
+                    held_gap = 0.1
+                    for key, node_key, increment_key, member_key in (
+                        (
+                            "daily_energy",
+                            "daily_energy_wh",
+                            "daily_increment",
+                            "member_daily",
+                        ),
+                        (
+                            "total_energy",
+                            "total_energy_wh",
+                            "total_increment",
+                            "member_total",
+                        ),
+                    ):
+                        self.assertEqual(
+                            candidate["aggregates"][key]["extra"]["baselines"],
+                            {module_a: 0.5},
+                        )
+                        self.assertEqual(
+                            candidate["aggregates"][key]["extra"]["native_value"],
+                            0.5,
+                        )
+                        self.assertEqual(candidate["nodes"][module_a][node_key], 0.4)
+                        self.assertEqual(
+                            baseline["aggregates_before"][key]["baselines"],
+                            {module_a: 0.4},
+                        )
+                        first = baseline["transitions"][0]
+                        self.assertLess(first[increment_key], first[member_key])
+                        overcount = (
+                            baseline["aggregates_after"][key]["native_value"]
+                            - candidate["aggregates"][key]["extra"]["native_value"]
+                            - (candidate["nodes"][module_a][node_key] + 2.0 - 0.5)
+                        )
+                        self.assertLessEqual(overcount, held_gap + 1e-9)
+                        self.assertGreaterEqual(overcount, -1e-9)
+                shutil.rmtree(config_dir, ignore_errors=True)
 
     async def test_c8_config_and_options_accept_supported_urls(self):
         endpoint_names = ["S1c"]
